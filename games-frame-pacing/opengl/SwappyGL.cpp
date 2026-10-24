@@ -92,7 +92,7 @@ bool SwappyGL::swap(EGLDisplay display, EGLSurface surface) {
 bool SwappyGL::lastFrameIsComplete(EGLDisplay display) {
     bool pipelineMode = (mCommonBase.getCurrentPipelineMode() == SwappyCommon::PipelineMode::On);
     if (!getEgl()->lastFrameIsComplete(display, pipelineMode)) {
-        gamesdk::ScopedTrace trace("lastFrameIncomplete");
+        TRACE_SCOPE("lastFrameIncomplete");
         SWAPPY_LOGV("lastFrameIncomplete");
         return false;
     }

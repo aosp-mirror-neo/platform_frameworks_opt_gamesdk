@@ -19,6 +19,7 @@
 #include "ChoreographerThread.h"
 
 #include <android/looper.h>
+#include <dlfcn.h>
 #include <jni.h>
 #include <pthread.h>
 #include <sched.h>

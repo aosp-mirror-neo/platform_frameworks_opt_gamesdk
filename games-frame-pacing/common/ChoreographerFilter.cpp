@@ -203,7 +203,7 @@ void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
             const auto now = mClock.now();
             if (detail::isFilterWorkDue(now, mLastWorkRun, refreshPeriod)) {
                 // Assume we got here first and there's work to do
-                gamesdk::ScopedTrace trace("doWork");
+                TRACE_SCOPE("doWork");
                 mWorkDuration.store(mDoWork(sfToVsyncDelay));
                 mLastWorkRun = now;
             }

@@ -71,7 +71,7 @@ void CPUTracer::threadMain() NO_THREAD_SAFETY_ANALYSIS {
     std::unique_lock<std::mutex> lock(mMutex);
     while (mRunning) {
         if (mTrace) {
-            gamesdk::ScopedTrace trace("Swappy: CPU frame time");
+            TRACE_SCOPE("Swappy: CPU frame time");
             mCond.wait(lock);
         } else {
             mCond.wait(lock);

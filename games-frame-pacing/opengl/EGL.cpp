@@ -286,7 +286,7 @@ void EGL::waitForFenceThreadMain() {
                 sync = mWaitPendingSyncs.front();
             }
 
-            gamesdk::ScopedTrace tracer("Swappy: GPU frame time");
+            TRACE_SCOPE("Swappy: GPU frame time");
             const auto startTime = std::chrono::steady_clock::now();
 
             EGLBoolean result =

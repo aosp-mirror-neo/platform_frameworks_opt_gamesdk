@@ -18,6 +18,8 @@
 
 #include <utility>
 
+#include "Trace.h"
+
 #define LOG_TAG "SwappyVkBase"
 #include "SwappyLog.h"
 
@@ -422,7 +424,7 @@ void SwappyVkBase::waitForFenceThreadMain(ThreadContext& thread) {
                 sync = mWaitingSyncs[thread.queue].front();
             }
 
-            gamesdk::ScopedTrace tracer("Swappy: GPU frame time");
+            TRACE_SCOPE("Swappy: GPU frame time");
             const auto startTime = mClock.now();
             VkResult result = vkWaitForFences(mDevice, 1, &sync.fence, VK_TRUE,
                                               mCommonBase.getFenceTimeout().count());
