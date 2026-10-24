@@ -23,6 +23,7 @@
 
 #define LOG_TAG "SwappyVkGoogleDisplayTiming"
 #include "SwappyLog.h"
+#include "SwappyTrace.h"
 
 using std::chrono::nanoseconds;
 
@@ -99,6 +100,10 @@ VkResult SwappyVkGoogleDisplayTiming::doQueuePresent(VkQueue queue, uint32_t que
     for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
         pPresentTimes[i].presentID = mPresentID;
         pPresentTimes[i].desiredPresentTime = desiredPresentTime;
+    }
+    if (desiredPresentTime != 0) {
+        SWAPPY_TRACE_PRESENT_TARGET(mPresentID, mCommonBase.getPresentationTime(),
+                                    mCommonBase.getAutoSwapInterval(), TraceBackend::Vulkan);
     }
 
     presentTimesInfo.sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE;
@@ -179,6 +184,11 @@ void SwappyVkGoogleDisplayTiming::recordFrameStart(VkQueue queue, uint32_t image
 
             mFrameStatisticsCommon.updateFrameStats(current,
                                                     mCommonBase.getRefreshPeriod().count());
+            SWAPPY_TRACE_PRESENT_ACTUAL(mPastTimes[i].presentID,
+                                        static_cast<int64_t>(mPastTimes[i].actualPresentTime),
+                                        static_cast<int64_t>(mPastTimes[i].desiredPresentTime),
+                                        static_cast<int64_t>(mPastTimes[i].presentMargin),
+                                        TraceBackend::Vulkan);
             i++;
         }
         // If the past timings returned do not match, then the pending frame is

@@ -23,6 +23,7 @@
 
 #include "AndroidSwappyPlatform.h"
 #include "SwappyLog.h"
+#include "SwappyTrace.h"
 #include "Thread.h"
 #include "Trace.h"
 #include "system_utils.h"
@@ -302,6 +303,14 @@ bool SwappyGL::setPresentationTime(EGLDisplay display, EGLSurface surface) {
         (mCommonBase.getRefreshPeriod() - displayTimings.sfOffset)) {
         return EGL_TRUE;
     }
+
+    // Use the EGL frame id so Swappy.Target pairs with Swappy.Actual (FrameStatisticsGL).
+    SWAPPY_TRACE_PRESENT_TARGET(
+            mFrameStatistics
+                    ? mFrameStatistics->traceRequestedPresentTime(display, surface,
+                                                                  mCommonBase.getPresentationTime())
+                    : 0,
+            mCommonBase.getPresentationTime(), mCommonBase.getAutoSwapInterval(), TraceBackend::GL);
     return getEgl()->setPresentationTime(display, surface, mCommonBase.getPresentationTime());
 }
 

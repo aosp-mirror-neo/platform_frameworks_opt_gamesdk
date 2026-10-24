@@ -135,6 +135,11 @@ public:
         mOnVsync = std::move(onVsync);
     }
 
+    void setSleepWakeDelay(std::chrono::nanoseconds delay) {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mSleepWakeDelay = delay;
+    }
+
     [[nodiscard]] bool waitForWorkersSettled() const {
         using namespace std::chrono_literals;
         const auto deadline = std::chrono::steady_clock::now() + 5s;
@@ -211,16 +216,20 @@ public:
             if (mShutdown || current >= target) {
                 return false;
             }
+            time_point earliestSleeper = time_point::max();
             for (const SleepWaiter* waiter : mSleepers) {
                 if (waiter->deadline > current && waiter->deadline < nextTime) {
                     nextTime = waiter->deadline;
+                    earliestSleeper = waiter->deadline;
                     hasEvent = true;
                 }
             }
+            std::optional<time_point> vsyncCandidate;
             if (mNextVsyncAfter) {
-                const auto candidate = mNextVsyncAfter(current);
-                if (candidate.has_value() && *candidate > current && *candidate <= nextTime) {
-                    nextTime = *candidate;
+                vsyncCandidate = mNextVsyncAfter(current);
+                if (vsyncCandidate.has_value() && *vsyncCandidate > current &&
+                    *vsyncCandidate <= nextTime) {
+                    nextTime = *vsyncCandidate;
                     hasEvent = true;
                     fireVsync = true;
                     onVsync = mOnVsync;
@@ -228,6 +237,19 @@ public:
             }
             if (!hasEvent) {
                 return false;
+            }
+            if (!fireVsync && earliestSleeper == nextTime && mSleepWakeDelay > 0ns) {
+                time_point delayed = nextTime + mSleepWakeDelay;
+                if (target != time_point::max() && delayed > target) {
+                    delayed = target;
+                }
+                if (vsyncCandidate.has_value() && *vsyncCandidate > current &&
+                    delayed >= *vsyncCandidate) {
+                    delayed = *vsyncCandidate - 1ns;
+                }
+                if (delayed > nextTime) {
+                    nextTime = delayed;
+                }
             }
 
             mNowNs.store(nextTime.time_since_epoch().count(), std::memory_order_release);
@@ -462,6 +484,7 @@ private:
     mutable std::vector<CvWaiter*> mCvWaiters;
     mutable std::vector<SleepWaiter*> mSleepers;
     mutable bool mShutdown = false;
+    std::chrono::nanoseconds mSleepWakeDelay{0};
     std::function<std::optional<time_point>(time_point)> mNextVsyncAfter;
     std::function<void(time_point)> mOnVsync;
     ThreadHookScope mThreadHooks{*this};

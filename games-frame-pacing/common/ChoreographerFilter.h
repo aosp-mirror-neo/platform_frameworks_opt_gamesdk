@@ -46,7 +46,9 @@ inline bool isFilterWorkDue(std::chrono::steady_clock::time_point now,
 
 class ChoreographerFilter {
 public:
-    using Worker = std::function<std::chrono::nanoseconds(std::optional<std::chrono::nanoseconds>)>;
+    using Worker = std::function<
+            std::chrono::nanoseconds(Clock::time_point wakeDeadline,
+                                     std::optional<std::chrono::nanoseconds> sfToVsyncDelay)>;
 
     explicit ChoreographerFilter(std::chrono::nanoseconds refreshPeriod,
                                  std::chrono::nanoseconds appToSfDelay, Worker doWork,

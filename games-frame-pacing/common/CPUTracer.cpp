@@ -22,7 +22,7 @@
 
 namespace swappy {
 
-CPUTracer::CPUTracer() {}
+CPUTracer::CPUTracer(const Clock& clock) : mClock(clock) {}
 
 CPUTracer::~CPUTracer() {
     joinThread();
@@ -50,6 +50,9 @@ void CPUTracer::startTrace() {
             mRunning = true;
             mThread = std::make_unique<Thread>([this]() { threadMain(); });
         }
+        if (!mTrace) {
+            ++mTraceGeneration;
+        }
         mTrace = true;
         mCond.notify_one();
     } else {
@@ -67,14 +70,17 @@ void CPUTracer::endTrace() {
     }
 }
 
-void CPUTracer::threadMain() NO_THREAD_SAFETY_ANALYSIS {
-    std::unique_lock<std::mutex> lock(mMutex);
+void CPUTracer::threadMain() {
+    std::lock_guard<std::mutex> lock(mMutex);
     while (mRunning) {
         if (mTrace) {
+            const uint64_t generation = mTraceGeneration;
             TRACE_SCOPE("Swappy: CPU frame time");
-            mCond.wait(lock);
+            mClock.wait(mMutex, mCond, [this, generation]() REQUIRES(mMutex) {
+                return !mRunning || !mTrace || mTraceGeneration != generation;
+            });
         } else {
-            mCond.wait(lock);
+            mClock.wait(mMutex, mCond, [this]() REQUIRES(mMutex) { return !mRunning || mTrace; });
         }
     }
 }

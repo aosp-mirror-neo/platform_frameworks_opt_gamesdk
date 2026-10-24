@@ -23,7 +23,7 @@
 
 #include "EGL.h"
 #include "SwappyCommon.h"
-#include "Trace.h"
+#include "SwappyTrace.h"
 
 namespace swappy {
 
@@ -38,6 +38,9 @@ FrameStatisticsGL::ThisFrame FrameStatisticsGL::getThisFrame(EGLDisplay dpy, EGL
     // first get the next frame id
     std::pair<bool, EGLuint64KHR> nextFrameId = mEgl.getNextFrameId(dpy, surface);
     if (nextFrameId.first) {
+#if AGDK_TRACE != 0
+        mTracePresentTargets.observeNextFrame(nextFrameId.second, surface);
+#endif
         mPendingFrames.push_back({dpy, surface, nextFrameId.second, frameStartTime});
     }
 
@@ -59,10 +62,31 @@ FrameStatisticsGL::ThisFrame FrameStatisticsGL::getThisFrame(EGLDisplay dpy, EGL
         return {frame.startFrameTime};
     }
 
+    // frameStats->requested is not the target: EGL reports the queue time
+    // there when Swappy set no present time for the frame.
+    SWAPPY_TRACE_PRESENT_ACTUAL(frame.id, frameStats->presented,
+                                mTracePresentTargets.targetFor(frame.id, frame.surface), -1,
+                                TraceBackend::GL);
+
     mPendingFrames.erase(mPendingFrames.begin());
 
     return {frame.startFrameTime, std::move(frameStats)};
 }
+
+#if AGDK_TRACE != 0
+EGLuint64KHR FrameStatisticsGL::traceRequestedPresentTime(EGLDisplay dpy, EGLSurface surface,
+                                                          TimePoint time) {
+    // The pending frames older than MAX_FRAME_LAG are dropped, so a frame
+    // that still reports timestamps has not lost its slot.
+    static_assert(MAX_FRAME_LAG < TracePresentTargets::kCapacity);
+    const std::pair<bool, EGLuint64KHR> nextFrameId = mEgl.getNextFrameId(dpy, surface);
+    if (!nextFrameId.first) {
+        return 0;
+    }
+    mTracePresentTargets.record(nextFrameId.second, time.time_since_epoch().count(), surface);
+    return nextFrameId.second;
+}
+#endif
 
 // called once per swap
 void FrameStatisticsGL::capture(EGLDisplay dpy, EGLSurface surface) {

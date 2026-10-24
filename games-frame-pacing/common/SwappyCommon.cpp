@@ -44,7 +44,8 @@ SwappyCommon::SwappyCommon(std::unique_ptr<SwappyPlatform> platform, const Clock
         mMeasuredSwapDuration(nanoseconds(0)),
         mAutoSwapInterval(1),
         mPresentationTime(mClock.now()),
-        mValid(false) {
+        mValid(false),
+        mCPUTracer(mClock) {
     if (!mPlatform || !mPlatform->isValid()) {
         mPlatform.reset();
         return;
@@ -55,8 +56,9 @@ SwappyCommon::SwappyCommon(std::unique_ptr<SwappyPlatform> platform, const Clock
     mChoreographerFilter = std::make_unique<ChoreographerFilter>(
             mCommonSettings.refreshPeriod,
             mCommonSettings.sfVsyncOffset - mCommonSettings.appVsyncOffset,
-            [this](std::optional<std::chrono::nanoseconds> sfToVsyncDelay) {
-                return wakeClient(sfToVsyncDelay);
+            [this](Clock::time_point wakeDeadline,
+                   std::optional<std::chrono::nanoseconds> sfToVsyncDelay) {
+                return wakeClient(wakeDeadline, sfToVsyncDelay);
             },
             mClock);
 
@@ -103,9 +105,11 @@ SwappyCommon::~SwappyCommon() {
     Settings::reset();
 }
 
-nanoseconds SwappyCommon::wakeClient(std::optional<std::chrono::nanoseconds> sfToVsyncDelay) {
+nanoseconds SwappyCommon::wakeClient(Clock::time_point wakeDeadline,
+                                     std::optional<std::chrono::nanoseconds> sfToVsyncDelay) {
     std::lock_guard<std::mutex> lock(mWaitingMutex);
     ++mCurrentFrame;
+    mCurrentFrameTargetWakeTime = wakeDeadline;
     // We're attempting to align with SurfaceFlinger's vsync, but it's always
     // better to be a little late than a little early (since a little early
     // could cause our frame to be picked up prematurely), so we pad by an
@@ -220,6 +224,7 @@ bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
         addFrameDuration({cpuTime, gpuTime, frameMissed}, localPipelineMode, previousFrameMissed);
     }
 
+    SWAPPY_TRACE_WORK_TIMES(cpuTime, gpuTime);
     postWaitCallbacks(cpuTime, gpuTime);
 
     return presentationTimeIsNeeded;
@@ -336,9 +341,34 @@ void SwappyCommon::onPostSwap(const SwapHandlers& h) {
     }
 
     updateDisplayTimings();
+    SWAPPY_TRACE_SETTINGS(mTraceSession, buildTraceSettingsSnapshot());
 
     startFrame();
 }
+
+#if AGDK_TRACE != 0
+TraceSettingsSnapshot SwappyCommon::buildTraceSettingsSnapshot() {
+    TraceSettingsSnapshot snap;
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        snap.swapDurationNs = mSwapDuration.count();
+        snap.refreshPeriodNs = mCommonSettings.refreshPeriod.count();
+        snap.targetPeriodNs = static_cast<int64_t>(mAutoSwapInterval) * snap.refreshPeriodNs;
+        snap.autoSwapInterval = mAutoSwapInterval;
+        snap.autoSwapIntervalEnabled = mAutoSwapIntervalEnabled;
+        snap.autoPipelineMode = mPipelineModeAutoMode;
+        snap.pipelineMode = mPipelineMode;
+        snap.framePacingEnabled = mFramePacingEnabled;
+        snap.blockingWaitEnabled = mBlockingWaitEnabled;
+    }
+    snap.autoSwapIntervalThresholdNs =
+            mAutoSwapIntervalThreshold.load(std::memory_order_relaxed).count();
+    snap.fenceTimeoutNs = mFenceTimeout.load(std::memory_order_relaxed).count();
+    snap.bufferStuffingFixWait = mBufferStuffingFixWait;
+    snap.useAffinity = Settings::getInstance()->getUseAffinity();
+    return snap;
+}
+#endif
 
 void SwappyCommon::updateMeasuredSwapDuration(nanoseconds duration) {
     // TODO: The exponential smoothing factor here is arbitrary
@@ -659,8 +689,23 @@ void SwappyCommon::startFrame() {
 
 void SwappyCommon::waitUntil(int32_t target) {
     TRACE_CALL();
-    std::lock_guard<std::mutex> lock(mWaitingMutex);
-    waitUntilLocked(target);
+    bool waited = false;
+    [[maybe_unused]] Clock::time_point latestTickDeadline{};
+    [[maybe_unused]] int32_t currentFrame = 0;
+    {
+        std::lock_guard<std::mutex> lock(mWaitingMutex);
+        waited = mCurrentFrame < target;
+        waitUntilLocked(target);
+        if (waited) {
+            latestTickDeadline = mCurrentFrameTargetWakeTime;
+            currentFrame = mCurrentFrame;
+        }
+    }
+    if (waited && TRACE_ENABLED()) {
+        [[maybe_unused]] const auto wakeTime = mClock.now();
+        SWAPPY_TRACE_WAKE_ERROR(wakeErrorForTarget(wakeTime, latestTickDeadline, currentFrame,
+                                                   target, getRefreshPeriod()));
+    }
 }
 
 void SwappyCommon::waitUntilLocked(int32_t target) {

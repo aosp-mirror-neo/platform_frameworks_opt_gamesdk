@@ -31,10 +31,10 @@ endif()
 
 include_directories("${TEST_DIR}"
         "${TEST_DIR}/../common"
-        "${TEST_DIR}/../../samples/common/include"
         "${TEST_DIR}/../../games-frame-pacing"
         "${TEST_DIR}/../../games-frame-pacing/common"
         "${TEST_DIR}/../../src/common"
+        "${TEST_DIR}/../../samples/common/include"
         )
 
 add_library( ${PROJECT_NAME} SHARED

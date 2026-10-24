@@ -36,6 +36,7 @@
 #include "RefreshPeriodSet.h"
 #include "Settings.h"
 #include "SwappyPlatform.h"
+#include "SwappyTrace.h"
 #include "Thread.h"
 #include "swappy/swappy_common.h"
 
@@ -62,6 +63,11 @@ public:
     ~SwappyCommon();
 
     std::chrono::nanoseconds getSwapDuration() const;
+
+    int32_t getAutoSwapInterval() const {
+        std::lock_guard<std::mutex> lock(mMutex);
+        return mAutoSwapInterval;
+    }
 
     void onChoreographer(int64_t frameTimeNanos);
 
@@ -132,11 +138,16 @@ private:
 
     void addFrameDuration(FrameDuration duration, PipelineMode swapPipelineMode,
                           bool previousFrameMissed);
-    std::chrono::nanoseconds wakeClient(std::optional<std::chrono::nanoseconds> sfToVsyncDelay);
+    std::chrono::nanoseconds wakeClient(Clock::time_point wakeDeadline,
+                                        std::optional<std::chrono::nanoseconds> sfToVsyncDelay);
 
     // The swap interval ladder itself is in SwapIntervalLadder.h; this is the
     // glue that holds the lock, feeds it state and applies its decision.
     bool updateSwapInterval();
+#if AGDK_TRACE != 0
+    // Copies the settings that Swappy.Settings reports. Locks mMutex.
+    TraceSettingsSnapshot buildTraceSettingsSnapshot() EXCLUDES(mMutex);
+#endif
     void preSwapBuffersCallbacks();
     void postSwapBuffersCallbacks();
     void preWaitCallbacks();
@@ -176,6 +187,7 @@ private:
     std::mutex mWaitingMutex;
     std::condition_variable mWaitingCondition;
     Clock::time_point mCurrentFrameTimestamp GUARDED_BY(mWaitingMutex);
+    Clock::time_point mCurrentFrameTargetWakeTime GUARDED_BY(mWaitingMutex){};
     int32_t mCurrentFrame GUARDED_BY(mWaitingMutex) = 0;
     std::optional<std::chrono::nanoseconds> mSfToVsyncDelay GUARDED_BY(mWaitingMutex);
     std::atomic<std::chrono::nanoseconds> mMeasuredSwapDuration;
@@ -269,6 +281,7 @@ private:
 
     std::unique_ptr<PacingImplementation> mPacingImpl GUARDED_BY(mMutex) =
             PacingImplementation::create();
+    TRACE_MEMBER(TraceSession mTraceSession);
 };
 
 } // namespace swappy

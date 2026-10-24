@@ -188,7 +188,8 @@ void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
             timer.addTimestamp(timestamp, sequenceNumber);
         }
 
-        mClock.sleepUntil(timer.wakeTime(-workDuration, mClock.now()));
+        const auto wakeDeadline = timer.wakeTime(-workDuration, mClock.now());
+        mClock.sleepUntil(wakeDeadline);
 
         std::optional<std::chrono::nanoseconds> sfToVsyncDelay;
         {
@@ -204,7 +205,7 @@ void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
             if (detail::isFilterWorkDue(now, mLastWorkRun, refreshPeriod)) {
                 // Assume we got here first and there's work to do
                 TRACE_SCOPE("doWork");
-                mWorkDuration.store(mDoWork(sfToVsyncDelay));
+                mWorkDuration.store(mDoWork(wakeDeadline, sfToVsyncDelay));
                 mLastWorkRun = now;
             }
         }

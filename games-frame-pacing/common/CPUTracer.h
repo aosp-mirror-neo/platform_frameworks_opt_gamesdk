@@ -17,16 +17,18 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 
+#include "Clock.h"
 #include "Thread.h"
 
 namespace swappy {
 
 class CPUTracer {
 public:
-    CPUTracer();
+    explicit CPUTracer(const Clock& clock = SteadyClock::instance());
     ~CPUTracer();
 
     CPUTracer(CPUTracer&) = delete;
@@ -38,11 +40,15 @@ private:
     void threadMain();
     void joinThread();
 
+    const Clock& mClock;
     std::mutex mMutex;
-    std::condition_variable_any mCond GUARDED_BY(mMutex);
+    std::condition_variable mCond;
     std::unique_ptr<Thread> mThread;
     bool mRunning GUARDED_BY(mMutex) = true;
     bool mTrace GUARDED_BY(mMutex) = false;
+    // Counts the false -> true changes of mTrace, so the worker can detect a
+    // new trace when it did not observe the end of the previous one.
+    uint64_t mTraceGeneration GUARDED_BY(mMutex) = 0;
 };
 
 } // namespace swappy

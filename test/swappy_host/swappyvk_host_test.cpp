@@ -23,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -32,6 +33,7 @@
 #include "Settings.h"
 #include "SimulatedClock.h"
 #include "SwappyVk.h"
+#include "TraceTestHelper.h"
 #include "gtest/gtest.h"
 #include "swappy/swappyVk.h"
 
@@ -811,6 +813,63 @@ TEST_F(SwappyVkHostTest, PastPresentationTimingFiveFrameLagPopulatesSwappyStatsH
     SwappyVk_getStats(harness.swapchain(), &stats);
     EXPECT_EQ(stats.totalFrames, 0u);
 }
+
+#if AGDK_TRACE != 0
+
+using gamesdk::test::RecordedTraceCallbacks;
+using gamesdk::test::ScopedMockTrace;
+
+// Returns the recorded slice names that start with prefix, without the " n="
+// field. That field holds a std::chrono::steady_clock reading, which the
+// simulated clock does not control.
+std::vector<std::string> recordedSlicesWithoutNowField(const std::string& prefix) {
+    std::vector<std::string> slices;
+    for (const std::string& event : RecordedTraceCallbacks::eventsSnapshot()) {
+        if (event.rfind(prefix, 0) != 0) {
+            continue;
+        }
+        const size_t fieldBegin = event.find(" n=");
+        const size_t fieldEnd = event.find(' ', fieldBegin + 1);
+        slices.push_back(event.substr(0, fieldBegin) + event.substr(fieldEnd));
+    }
+    return slices;
+}
+
+TEST_F(SwappyVkHostTest, GoogleDisplayTimingEmitsFrameTargetAndActualTraceEvents) {
+    ScopedMockTrace mockTrace(true);
+    SimulatedSwappyVkHarness harness(/*advertiseGoogleDisplayTiming=*/true);
+
+    // The fake loader holds back the 4 newest frames (MIN_FRAME_LAG = 5), so
+    // 7 frames give the past presentation timings of frames 0 and 1.
+    harness.presentFrames(7, 3ms, 3ms, /*swapchainImages=*/3, /*recordStart=*/true);
+
+    const std::vector<std::string> events = RecordedTraceCallbacks::eventsSnapshot();
+    EXPECT_EQ(std::count(events.begin(), events.end(), "B:Swappy::Frame"), 7);
+    EXPECT_EQ(recordedSlicesWithoutNowField("B:Swappy.Target "),
+              (std::vector<std::string>{
+                      "B:Swappy.Target f=0 t=1000000000 si=1 be=vk",
+                      "B:Swappy.Target f=1 t=1033333334 si=1 be=vk",
+                      "B:Swappy.Target f=2 t=1051000001 si=1 be=vk",
+                      "B:Swappy.Target f=3 t=1073000002 si=1 be=vk",
+                      "B:Swappy.Target f=4 t=1089906669 si=1 be=vk",
+                      "B:Swappy.Target f=5 t=1106874136 si=1 be=vk",
+                      "B:Swappy.Target f=6 t=1123887939 si=1 be=vk",
+              }));
+    // The lead is relative to std::chrono::steady_clock, so only the count is
+    // deterministic.
+    EXPECT_EQ(RecordedTraceCallbacks::counterValues("Swappy.TargetLeadUs").size(), 7u);
+    EXPECT_EQ(recordedSlicesWithoutNowField("B:Swappy.Actual "),
+              (std::vector<std::string>{
+                      "B:Swappy.Actual f=0 t=1016666687 d=1000000000 be=vk",
+                      "B:Swappy.Actual f=1 t=1033333354 d=1033333334 be=vk",
+              }));
+    EXPECT_EQ(RecordedTraceCallbacks::counterValues("Swappy.PresentErrorUs"),
+              (std::vector<int64_t>{16666, 0}));
+    EXPECT_EQ(RecordedTraceCallbacks::counterValues("Swappy.PresentMarginUs"),
+              (std::vector<int64_t>{10666, 24333}));
+}
+
+#endif // AGDK_TRACE != 0
 
 TEST_F(SwappyVkHostTest, FallbackBackendPacesWithoutDisplayTimingExtensionAndStepsDownOnGpuLoad) {
     SimulatedSwappyVkHarness harness(/*advertiseGoogleDisplayTiming=*/false);

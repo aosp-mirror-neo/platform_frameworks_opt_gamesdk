@@ -140,7 +140,8 @@ TEST_F(ChoreographerFilterTest, IdlesAfterRepeatedUnchangedCallbacksAndWakesOnNe
 
     ChoreographerFilter filter(
             kRefreshPeriod, 0ns,
-            [&](std::optional<std::chrono::nanoseconds> sfToVsyncDelay) {
+            [&](Clock::time_point /*wakeDeadline*/,
+                std::optional<std::chrono::nanoseconds> sfToVsyncDelay) {
                 if (sfToVsyncDelay.has_value()) {
                     lastObservedDelayNs.store(sfToVsyncDelay->count(), std::memory_order_relaxed);
                 }
@@ -180,6 +181,58 @@ TEST_F(ChoreographerFilterTest, IdlesAfterRepeatedUnchangedCallbacksAndWakesOnNe
               std::chrono::nanoseconds(5ms).count());
 }
 
+TEST_F(ChoreographerFilterTest, PassesWakeDeadlineOffsetByAppliedWorkDuration) {
+    // A frozen clock gives each worker the same vsync base and the same wake
+    // deadline, so the deadline has one exact expected value.
+    constexpr auto kStart = 100 * kRefreshPeriod;
+    constexpr auto kWorkLead = 2ms;
+    AdvancingClock clock(kStart, 0ns);
+    const int32_t expectedWorkers = swappy::getNumCpus() > 2 ? 2 : 1;
+    std::atomic<int32_t> workCalls{0};
+    std::atomic<int64_t> observedDeadlineNs{-1};
+
+    ChoreographerFilter filter(
+            kRefreshPeriod, 0ns,
+            [&](Clock::time_point wakeDeadline,
+                std::optional<std::chrono::nanoseconds> /*sfToVsyncDelay*/) {
+                observedDeadlineNs.store(wakeDeadline.time_since_epoch().count(),
+                                         std::memory_order_relaxed);
+                workCalls.fetch_add(1, std::memory_order_relaxed);
+                return kWorkLead;
+            },
+            clock);
+
+    // Before the first callback, each worker runs 7 wakeups and parks. Work
+    // runs once, with no lead applied yet, and returns kWorkLead.
+    constexpr int64_t kWakeupsPerCallback = 7;
+    ASSERT_TRUE(spinUntil([&] {
+        return clock.sleepCalls() >= expectedWorkers * kWakeupsPerCallback &&
+                clock.waitingThreads() >= expectedWorkers;
+    }));
+    ASSERT_EQ(workCalls.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(observedDeadlineNs.load(std::memory_order_relaxed),
+              (kStart + kRefreshPeriod).count());
+
+    // A callback one refresh period later moves the vsync base to the callback
+    // time. Work is due again and runs once.
+    const auto callbackTime = kStart + kRefreshPeriod;
+    clock.setNow(callbackTime);
+    const int64_t sleepsBefore = clock.sleepCalls();
+    filter.onChoreographer(std::nullopt);
+    ASSERT_TRUE(spinUntil([&] {
+        return clock.sleepCalls() >= sleepsBefore + expectedWorkers * kWakeupsPerCallback &&
+                clock.waitingThreads() >= expectedWorkers;
+    }));
+
+    // The deadline is the next vsync minus the applied work duration. The
+    // workers are parked and each wakeup after the callback had this same
+    // target, so the last sleepUntil() target is stable to read here.
+    const int64_t expectedDeadlineNs = (callbackTime + kRefreshPeriod - kWorkLead).count();
+    EXPECT_EQ(workCalls.load(std::memory_order_relaxed), 2);
+    EXPECT_EQ(observedDeadlineNs.load(std::memory_order_relaxed), expectedDeadlineNs);
+    EXPECT_EQ(clock.lastWakeTargetNs(), expectedDeadlineNs);
+}
+
 TEST(ChoreographerFilterWorkDueTest, RunsWorkAtMostOncePerHalfRefreshPeriod) {
     using swappy::detail::isFilterWorkDue;
     const Clock::time_point lastWorkRun(1s);
@@ -208,7 +261,7 @@ TEST_F(ChoreographerFilterTest, RunsWorkAndWakesOnACallbackOnAClockFrozenAtEpoch
 
     ChoreographerFilter filter(
             kRefreshPeriod, 0ns,
-            [&](std::optional<std::chrono::nanoseconds> sfToVsyncDelay) {
+            [&](Clock::time_point, std::optional<std::chrono::nanoseconds> sfToVsyncDelay) {
                 workCalls.fetch_add(1, std::memory_order_relaxed);
                 if (sfToVsyncDelay.has_value()) {
                     workCallsWithDelay.fetch_add(1, std::memory_order_relaxed);
@@ -247,7 +300,8 @@ TEST_F(ChoreographerFilterTest, SynchronizesShutdownFlag) {
         {
             ChoreographerFilter filter(
                     kRefreshPeriod, 0ns,
-                    [](std::optional<std::chrono::nanoseconds>) { return 0ns; }, clock);
+                    [](Clock::time_point, std::optional<std::chrono::nanoseconds>) { return 0ns; },
+                    clock);
             ASSERT_TRUE(spinUntil([&] { return clock.sleepCalls() != baseSleepCalls; }));
         }
         Settings::reset();
@@ -263,7 +317,8 @@ TEST_F(ChoreographerFilterTest, SynchronizesVsyncDelay) {
     {
         ChoreographerFilter filter(
                 kRefreshPeriod, 0ns,
-                [&](std::optional<std::chrono::nanoseconds> sfToVsyncDelay) {
+                [&](Clock::time_point /*wakeDeadline*/,
+                    std::optional<std::chrono::nanoseconds> sfToVsyncDelay) {
                     if (sfToVsyncDelay.has_value()) {
                         accumulatedDelayNanoseconds.fetch_add(sfToVsyncDelay->count(),
                                                               std::memory_order_relaxed);
@@ -298,7 +353,8 @@ TEST_F(ChoreographerFilterTest, SynchronizesWorkDuration) {
         {
             ChoreographerFilter filter(
                     kRefreshPeriod, 0ns,
-                    [&](std::optional<std::chrono::nanoseconds>) {
+                    [&](Clock::time_point /*wakeDeadline*/,
+                        std::optional<std::chrono::nanoseconds>) {
                         const int callIndex =
                                 completedWorkCalls.fetch_add(1, std::memory_order_relaxed);
                         std::this_thread::yield();
@@ -327,7 +383,7 @@ TEST_F(ChoreographerFilterTest, DisplayTimingUpdateAppliesInPlaceWithoutWakingId
 
     ChoreographerFilter filter(
             16ms, 0ns,
-            [&](std::optional<std::chrono::nanoseconds>) {
+            [&](Clock::time_point, std::optional<std::chrono::nanoseconds>) {
                 workCalls.fetch_add(1, std::memory_order_relaxed);
                 return 1ms;
             },
@@ -369,7 +425,7 @@ TEST_F(ChoreographerFilterTest, DisplayTimingDownshiftDuringSleepUpdatesFilterWo
 
     ChoreographerFilter filter(
             8ms, 0ns,
-            [&](std::optional<std::chrono::nanoseconds>) {
+            [&](Clock::time_point, std::optional<std::chrono::nanoseconds>) {
                 workCalls.fetch_add(1, std::memory_order_relaxed);
                 return 1ms;
             },
@@ -401,8 +457,9 @@ TEST_F(ChoreographerFilterTest,
     const int32_t expectedWorkers = swappy::getNumCpus() > 2 ? 2 : 1;
     constexpr int64_t kWakeupsPerCallback = 7;
 
-    ChoreographerFilter
-            filter(16ms, 10ms, [](std::optional<std::chrono::nanoseconds>) { return 1ms; }, clock);
+    ChoreographerFilter filter(
+            16ms, 10ms,
+            [](Clock::time_point, std::optional<std::chrono::nanoseconds>) { return 1ms; }, clock);
     ASSERT_TRUE(spinUntil([&] {
         return clock.sleepCalls() >= expectedWorkers * kWakeupsPerCallback &&
                 clock.waitingThreads() >= expectedWorkers;
@@ -437,8 +494,9 @@ TEST_F(ChoreographerFilterTest, UseAffinityChangeAppliesDisplayTimingsBeforeRest
     Settings::getInstance()->setUseAffinity(false);
     Settings::getInstance()->setDisplayTimings({10ms, 1ms, 7ms});
 
-    ChoreographerFilter
-            filter(16ms, 0ns, [](std::optional<std::chrono::nanoseconds>) { return 1ms; }, clock);
+    ChoreographerFilter filter(
+            16ms, 0ns,
+            [](Clock::time_point, std::optional<std::chrono::nanoseconds>) { return 1ms; }, clock);
     ASSERT_TRUE(spinUntil([&] {
         return clock.sleepCalls() >= expectedWorkers * kWakeupsPerCallback &&
                 clock.waitingThreads() >= expectedWorkers;

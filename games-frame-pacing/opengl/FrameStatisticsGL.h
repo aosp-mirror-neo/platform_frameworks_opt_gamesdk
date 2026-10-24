@@ -24,6 +24,7 @@
 #include "EGL.h"
 #include "FrameStatistics.h"
 #include "SwappyCommon.h"
+#include "SwappyTrace.h"
 #include "Thread.h"
 
 using TimePoint = std::chrono::steady_clock::time_point;
@@ -42,6 +43,13 @@ public:
     void clearStats();
 
     int32_t lastLatencyRecorded();
+
+#if AGDK_TRACE != 0
+    // Remembers `time` as the present time that Swappy requests for the next
+    // frame, so that Swappy.Actual reports the present error of that frame
+    // against it. Returns the EGL id of that frame, or 0 if querying it fails.
+    EGLuint64KHR traceRequestedPresentTime(EGLDisplay dpy, EGLSurface surface, TimePoint time);
+#endif
 
 protected:
     static constexpr int MAX_FRAME_LAG = 10;
@@ -62,6 +70,7 @@ protected:
     };
     std::vector<EGLFrame> mPendingFrames;
     FrameStatistics mFrameStatsCommon;
+    TRACE_MEMBER(TracePresentTargets mTracePresentTargets);
 };
 
 } // namespace swappy
