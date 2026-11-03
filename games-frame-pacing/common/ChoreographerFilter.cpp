@@ -23,7 +23,6 @@
 
 #include <deque>
 #include <string>
-#include <thread>
 
 #include "ChoreographerTimer.h"
 #include "Settings.h"
@@ -34,8 +33,9 @@
 namespace swappy {
 
 ChoreographerFilter::ChoreographerFilter(std::chrono::nanoseconds refreshPeriod,
-                                         std::chrono::nanoseconds appToSfDelay, Worker doWork)
-      : mRefreshPeriod(refreshPeriod), mAppToSfDelay(appToSfDelay), mDoWork(doWork) {
+                                         std::chrono::nanoseconds appToSfDelay, Worker doWork,
+                                         const Clock& clock)
+      : mRefreshPeriod(refreshPeriod), mAppToSfDelay(appToSfDelay), mDoWork(doWork), mClock(clock) {
     Settings::getInstance()->addListener([this]() { onSettingsChanged(); });
 
     std::lock_guard<std::mutex> lock(mThreadPoolMutex);
@@ -50,7 +50,7 @@ ChoreographerFilter::~ChoreographerFilter() {
 
 void ChoreographerFilter::onChoreographer(std::optional<std::chrono::nanoseconds> sfToVsyncDelay) {
     std::lock_guard<std::mutex> lock(mMutex);
-    mLastTimestamp = std::chrono::steady_clock::now();
+    mLastTimestamp = mClock.now();
     mSfToVsyncDelay = sfToVsyncDelay;
     ++mSequenceNumber;
     mCondition.notify_all();
@@ -102,7 +102,7 @@ void ChoreographerFilter::onSettingsChanged() {
 }
 
 void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
-    ChoreographerTimer timer(mRefreshPeriod, mAppToSfDelay);
+    ChoreographerTimer timer(mRefreshPeriod, mAppToSfDelay, mClock.now());
 
     {
         int cpu = getNumCpus() - 1 - thread;
@@ -112,8 +112,8 @@ void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
     }
 
     std::string threadName = "Filter";
-    threadName += swappy::to_string(thread);
-    pthread_setname_np(pthread_self(), threadName.c_str());
+    threadName += std::to_string(thread);
+    setThreadName(threadName.c_str());
 
     std::unique_lock<std::mutex> lock(mMutex);
     while (true) {
@@ -128,7 +128,8 @@ void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
         // background.
         if (!timer.addTimestamp(timestamp)) {
             lock.lock();
-            mCondition.wait(lock, [=]() { return !mIsRunning || (mLastTimestamp != timestamp); });
+            mClock.wait(lock, mCondition,
+                        [=]() { return !mIsRunning || (mLastTimestamp != timestamp); });
             timestamp = mLastTimestamp;
             lock.unlock();
             timer.addTimestamp(timestamp);
@@ -136,10 +137,10 @@ void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
 
         if (!mIsRunning) break;
 
-        timer.sleep(-workDuration);
+        mClock.sleepUntil(timer.wakeTime(-workDuration, mClock.now()));
         {
             std::unique_lock<std::mutex> workLock(mWorkMutex);
-            const auto now = std::chrono::steady_clock::now();
+            const auto now = mClock.now();
             if (now - mLastWorkRun > mRefreshPeriod / 2) {
                 // Assume we got here first and there's work to do
                 gamesdk::ScopedTrace trace("doWork");

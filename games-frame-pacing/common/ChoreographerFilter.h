@@ -21,6 +21,7 @@
 #include <optional>
 #include <vector>
 
+#include "Clock.h"
 #include "Settings.h"
 #include "Thread.h"
 
@@ -31,7 +32,8 @@ public:
     using Worker = std::function<std::chrono::nanoseconds(std::optional<std::chrono::nanoseconds>)>;
 
     explicit ChoreographerFilter(std::chrono::nanoseconds refreshPeriod,
-                                 std::chrono::nanoseconds appToSfDelay, Worker doWork);
+                                 std::chrono::nanoseconds appToSfDelay, Worker doWork,
+                                 const Clock& clock = SteadyClock::instance());
     ~ChoreographerFilter();
 
     void onChoreographer(std::optional<std::chrono::nanoseconds> sfToVsyncDelay);
@@ -62,6 +64,7 @@ private:
     std::chrono::nanoseconds mRefreshPeriod;
     std::chrono::nanoseconds mAppToSfDelay;
     const Worker mDoWork;
+    const Clock& mClock;
 };
 
 } // namespace swappy

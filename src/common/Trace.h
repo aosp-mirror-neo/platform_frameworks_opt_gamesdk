@@ -16,10 +16,12 @@
 
 #pragma once
 
+#ifdef __ANDROID__
 #include <android/log.h>
-#include <android/trace.h>
+#endif
 #include <dlfcn.h>
 
+#include <cstdint>
 #include <memory>
 
 namespace gamesdk {
@@ -35,7 +37,9 @@ public:
     using ATrace_setCounter_type = void (*)(const char* counterName, int64_t counterValue);
 
     Trace() {
+#ifdef __ANDROID__
         __android_log_print(ANDROID_LOG_INFO, "Trace", "Unable to load NDK tracing APIs");
+#endif
     }
 
     Trace(ATrace_beginSection_type beginSection, ATrace_endSection_type endSection,

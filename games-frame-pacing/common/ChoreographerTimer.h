@@ -18,20 +18,24 @@
 
 #include <chrono>
 #include <cstdint>
-#include <optional>
-#include <thread>
 
 namespace swappy {
 
-// Estimates display vsync times from Choreographer callback timestamps and
-// sleeps a ChoreographerFilter worker thread until the next vsync.
+// Estimates display vsync times from Choreographer callback timestamps: when a
+// filter loop should wake up next, and whether callbacks have stopped arriving.
+// The caller supplies all timestamps, so the timer runs the same way on the
+// steady clock and on a test clock.
 class ChoreographerTimer {
 public:
     using time_point = std::chrono::steady_clock::time_point;
+    using duration = std::chrono::nanoseconds;
 
-    ChoreographerTimer(std::chrono::nanoseconds refreshPeriod,
-                       std::chrono::nanoseconds appToSfDelay)
-          : mRefreshPeriod(refreshPeriod), mAppToSfDelay(appToSfDelay) {}
+    // Uses now as the initial vsync base until callbacks arrive.
+    ChoreographerTimer(duration refreshPeriod, duration appToSfDelay, time_point now)
+          : mRefreshPeriod(refreshPeriod),
+            mAppToSfDelay(appToSfDelay),
+            mBaseTime(now),
+            mLastTimestamp(now) {}
 
     // Returns false if we have detected that we have received the same
     // timestamp multiple times so that the caller can wait for fresh timestamps
@@ -74,27 +78,27 @@ public:
         return true;
     }
 
-    void sleep(std::chrono::nanoseconds offset) {
+    // Returns when to wake up: offset from the next vsync, moved on by whole
+    // refresh periods until it is no earlier than now. Offsets exceeding half a
+    // refresh period in either direction count as zero.
+    [[nodiscard]] time_point wakeTime(duration offset, time_point now) const {
         if (offset < -(mRefreshPeriod / 2) || offset > mRefreshPeriod / 2) {
-            offset = std::chrono::nanoseconds::zero();
+            offset = duration::zero();
         }
 
-        const auto now = std::chrono::steady_clock::now();
         auto targetTime = mBaseTime + mRefreshPeriod + offset;
         while (targetTime < now) {
             targetTime += mRefreshPeriod;
         }
-
-        std::this_thread::sleep_until(targetTime);
+        return targetTime;
     }
 
 private:
-    std::chrono::nanoseconds mRefreshPeriod;
-    const std::chrono::nanoseconds mAppToSfDelay;
-    time_point mBaseTime = std::chrono::steady_clock::now();
+    duration mRefreshPeriod;
+    const duration mAppToSfDelay;
+    time_point mBaseTime;
 
-    time_point mLastTimestamp = std::chrono::steady_clock::now();
-    std::optional<std::chrono::nanoseconds> mSfToVsyncDelay;
+    time_point mLastTimestamp;
     int32_t mRepeatCount = 0;
 };
 

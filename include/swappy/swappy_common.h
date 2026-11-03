@@ -22,8 +22,10 @@
 
 #pragma once
 
-#include <android/native_window.h>
 #include <stdint.h>
+#ifdef __ANDROID__
+#include <android/native_window.h>
+#endif
 
 #include "common/gamesdk_common.h"
 
