@@ -4,7 +4,7 @@
 
     <uses-sdk android:minSdkVersion="21" />
 
-    <application>
+    <application android:enableOnBackInvokedCallback="true">
         <activity android:name="com.google.androidgamesdk.TestGameActivity"
                   android:exported="true"
                   android:theme="@style/Theme.AppCompat">

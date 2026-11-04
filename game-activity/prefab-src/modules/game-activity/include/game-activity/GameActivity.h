@@ -304,6 +304,10 @@ typedef struct GameActivityCallbacks {
      * Callback called for every key down event on the GameActivity SurfaceView.
      * Ownership of `event` is maintained by the library and it is only valid
      * during the callback.
+     *
+     * Back gestures and back presses, including predictive back, arrive as an
+     * AKEYCODE_BACK down and up pair. If this callback returns false for the
+     * down event, the system default back behavior runs.
      */
     bool (*onKeyDown)(GameActivity* activity, const GameActivityKeyEvent* event);
 

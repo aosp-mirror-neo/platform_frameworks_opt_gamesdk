@@ -18,16 +18,20 @@ package com.google.androidgamesdk;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 
 import android.app.Activity;
 import android.content.ComponentCallbacks2;
 import android.os.SystemClock;
 import android.util.Log;
+import android.view.KeyEvent;
 import androidx.lifecycle.Lifecycle;
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.rules.ActivityScenarioRule;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
+import androidx.test.platform.app.InstrumentationRegistry;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
@@ -126,6 +130,47 @@ public class GameActivityTest {
                 ComponentCallbacks2.TRIM_MEMORY_COMPLETE,
         };
         assertArrayEquals(expected, TestGameActivity.getTrimMemoryLevels());
+    }
+
+    @Test
+    public void back_sendsBackKeyToNative() {
+        ActivityScenario<TestGameActivity> scenario = rule.getScenario();
+
+        // On API 33+ the test app enables predictive back, so this goes to OnBackInvokedCallback.
+        InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK);
+
+        assertEquals(KeyEvent.KEYCODE_BACK, waitForLastKeyCode(KeyEvent.KEYCODE_BACK));
+        scenario.onActivity(activity -> assertFalse(activity.isFinishing()));
+    }
+
+    @Test
+    public void back_whenNativeRejectsBackKey_leavesActivity() {
+        ActivityScenario<TestGameActivity> scenario = rule.getScenario();
+        TestGameActivity.setRejectBackKey(true);
+        try {
+            InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK);
+            // The default back behavior finishes the activity or, for a task root on API 31+,
+            // moves the task to the back.
+            long deadline = SystemClock.uptimeMillis() + 5000;
+            while (scenario.getState() == Lifecycle.State.RESUMED
+                    && SystemClock.uptimeMillis() < deadline) {
+                SystemClock.sleep(10);
+            }
+            assertNotEquals(Lifecycle.State.RESUMED, scenario.getState());
+        } finally {
+            TestGameActivity.setRejectBackKey(false);
+        }
+    }
+
+    /** Waits up to 5 seconds for the native thread to see a key event with keyCode. */
+    private static int waitForLastKeyCode(int keyCode) {
+        long deadline = SystemClock.uptimeMillis() + 5000;
+        int lastKeyCode = TestGameActivity.getLastKeyCode();
+        while (lastKeyCode != keyCode && SystemClock.uptimeMillis() < deadline) {
+            SystemClock.sleep(10);
+            lastKeyCode = TestGameActivity.getLastKeyCode();
+        }
+        return lastKeyCode;
     }
 
     /** Waits up to 5 seconds for the native thread to handle APP_CMD_LOW_MEMORY. */

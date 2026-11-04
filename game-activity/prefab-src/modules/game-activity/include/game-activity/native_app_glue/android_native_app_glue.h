@@ -505,6 +505,9 @@ extern void android_main(struct android_app* app);
  * android_native_app_glue. If filter is set to NULL, no filtering is done.
  *
  * The default key filter will filter out volume and camera button presses.
+ *
+ * Back gestures arrive as AKEYCODE_BACK key events. If the filter returns false
+ * for AKEYCODE_BACK, the system default back behavior runs.
  */
 void android_app_set_key_event_filter(struct android_app* app, android_key_event_filter filter);
 

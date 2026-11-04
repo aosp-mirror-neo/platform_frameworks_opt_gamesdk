@@ -11,7 +11,7 @@ apply from: '../robolectric.gradle'
 
 android {
     namespace "com.google.androidgamesdk.gameactivity"
-    compileSdk 31
+    compileSdk 35
     ndkVersion agdkNdkVersion
 
     defaultConfig {

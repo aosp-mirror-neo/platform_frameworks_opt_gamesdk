@@ -27,8 +27,11 @@ import android.os.Build;
 import android.os.Build.VERSION;
 import android.os.Build.VERSION_CODES;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.text.InputType;
 import android.util.Log;
+import android.view.InputDevice;
+import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Surface;
@@ -39,6 +42,7 @@ import android.view.ViewTreeObserver.OnGlobalLayoutListener;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.widget.FrameLayout;
+import android.window.OnBackInvokedDispatcher;
 import androidx.annotation.Keep;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.graphics.Insets;
@@ -119,6 +123,34 @@ public class GameActivity extends AppCompatActivity implements SurfaceHolder.Cal
             return true;
         } else {
             return super.onKeyDown(keyCode, event);
+        }
+    }
+
+    /**
+     * Sends a KEYCODE_BACK down and up event pair to native code. Returns true if native code
+     * consumed the down event.
+     */
+    private boolean sendBackKeyToNative() {
+        long now = SystemClock.uptimeMillis();
+        KeyEvent down = new KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK, 0, 0,
+                KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, InputDevice.SOURCE_KEYBOARD);
+        if (!onKeyDownNative(nativeHandle, down)) {
+            return false;
+        }
+        onKeyUpNative(nativeHandle, KeyEvent.changeAction(down, KeyEvent.ACTION_UP));
+        return true;
+    }
+
+    /**
+     * Handles a back gesture or back press when predictive back is enabled (API 33+ with
+     * enableOnBackInvokedCallback, or targetSdk 36 on Android 16). The system then does not
+     * dispatch KEYCODE_BACK to onKeyDown and onKeyUp, so native code gets a synthesized
+     * KEYCODE_BACK down and up pair. If native code does not consume the down event, the default
+     * back behavior runs.
+     */
+    private void onBackInvoked() {
+        if (isNativeDestroyed() || !sendBackKeyToNative()) {
+            onBackPressed();
         }
     }
 
@@ -415,6 +447,11 @@ public class GameActivity extends AppCompatActivity implements SurfaceHolder.Cal
         }
 
         super.onCreate(savedInstanceState);
+
+        if (VERSION.SDK_INT >= VERSION_CODES.TIRAMISU) {
+            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_DEFAULT, this::onBackInvoked);
+        }
     }
 
     private static String getAbsolutePath(File file) {

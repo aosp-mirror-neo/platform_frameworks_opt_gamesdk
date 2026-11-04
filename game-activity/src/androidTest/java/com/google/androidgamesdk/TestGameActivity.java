@@ -30,4 +30,10 @@ public class TestGameActivity extends GameActivity {
 
     /** Returns the GameActivityTrimMemoryLevel values, from RUNNING_MODERATE to COMPLETE. */
     public static native int[] getTrimMemoryLevels();
+
+    /** Returns the key code of the last key event seen by the native thread, or -1. */
+    public static native int getLastKeyCode();
+
+    /** Makes the native key event filter reject AKEYCODE_BACK when reject is true. */
+    public static native void setRejectBackKey(boolean reject);
 }

@@ -13,6 +13,22 @@
 namespace {
 int on_pause_sleep_duration_ms = 0;
 std::atomic<int> last_trim_memory_level{-1};
+std::atomic<int> last_key_code{-1};
+std::atomic<bool> reject_back_key{false};
+
+bool key_event_filter(const GameActivityKeyEvent* event) {
+    return !(reject_back_key && event->keyCode == AKEYCODE_BACK);
+}
+
+void record_key_events(struct android_app* app) {
+    android_input_buffer* input_buffer = android_app_swap_input_buffers(app);
+    if (input_buffer == nullptr) return;
+    for (uint64_t i = 0; i < input_buffer->keyEventsCount; ++i) {
+        last_key_code = input_buffer->keyEvents[i].keyCode;
+    }
+    android_app_clear_key_events(input_buffer);
+    android_app_clear_motion_events(input_buffer);
+}
 } // namespace
 
 void handle_cmd(struct android_app* app, int32_t cmd) {
@@ -57,8 +73,19 @@ Java_com_google_androidgamesdk_TestGameActivity_getTrimMemoryLevels(JNIEnv* env,
     return result;
 }
 
+JNIEXPORT jint JNICALL
+Java_com_google_androidgamesdk_TestGameActivity_getLastKeyCode(JNIEnv* env, jclass clazz) {
+    return last_key_code;
+}
+
+JNIEXPORT void JNICALL Java_com_google_androidgamesdk_TestGameActivity_setRejectBackKey(
+        JNIEnv* env, jclass clazz, jboolean reject) {
+    reject_back_key = reject;
+}
+
 void android_main(struct android_app* app) {
     app->onAppCmd = handle_cmd;
+    android_app_set_key_event_filter(app, key_event_filter);
 
     while (true) {
         int events;
@@ -66,6 +93,7 @@ void android_main(struct android_app* app) {
 
         while (ALooper_pollOnce(0, nullptr, &events, (void**)&source) >= 0) {
             if (source) source->process(app, source);
+            record_key_events(app);
             if (app->destroyRequested) {
 #ifdef AGDK_COVERAGE
                 agdk::testing::FlushGcovCounters();
