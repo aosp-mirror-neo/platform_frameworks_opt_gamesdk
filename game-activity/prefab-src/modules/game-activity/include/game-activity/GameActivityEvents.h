@@ -37,10 +37,11 @@ extern "C" {
 #endif
 
 /**
- * The maximum number of axes supported in an Android MotionEvent.
+ * The maximum number of axes supported in an Android MotionEvent:
+ * AMOTION_EVENT_MAXIMUM_VALID_AXIS_VALUE + 1.
  * See https://developer.android.com/ndk/reference/group/input.
  */
-#define GAME_ACTIVITY_POINTER_INFO_AXIS_COUNT 48
+#define GAME_ACTIVITY_POINTER_INFO_AXIS_COUNT 54
 
 /**
  * \brief Describe information about a pointer, found in a

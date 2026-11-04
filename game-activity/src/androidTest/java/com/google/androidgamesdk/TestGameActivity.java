@@ -36,4 +36,10 @@ public class TestGameActivity extends GameActivity {
 
     /** Makes the native key event filter reject AKEYCODE_BACK when reject is true. */
     public static native void setRejectBackKey(boolean reject);
+
+    /**
+     * Enables AMOTION_EVENT_AXIS_GESTURE_PINCH_SCALE_FACTOR, reads it from a pointer that holds
+     * value on that axis, disables the axis and returns the value read.
+     */
+    public static native float getPinchScaleFactorAxisValue(float value);
 }

@@ -83,6 +83,20 @@ JNIEXPORT void JNICALL Java_com_google_androidgamesdk_TestGameActivity_setReject
     reject_back_key = reject;
 }
 
+JNIEXPORT jfloat JNICALL
+Java_com_google_androidgamesdk_TestGameActivity_getPinchScaleFactorAxisValue(JNIEnv* env,
+                                                                             jclass clazz,
+                                                                             jfloat value) {
+    GameActivityPointerAxes pointer = {};
+    pointer.axisValues[AMOTION_EVENT_AXIS_GESTURE_PINCH_SCALE_FACTOR] = value;
+    GameActivityPointerAxes_enableAxis(AMOTION_EVENT_AXIS_GESTURE_PINCH_SCALE_FACTOR);
+    float result =
+            GameActivityPointerAxes_getAxisValue(&pointer,
+                                                 AMOTION_EVENT_AXIS_GESTURE_PINCH_SCALE_FACTOR);
+    GameActivityPointerAxes_disableAxis(AMOTION_EVENT_AXIS_GESTURE_PINCH_SCALE_FACTOR);
+    return result;
+}
+
 void android_main(struct android_app* app) {
     app->onAppCmd = handle_cmd;
     android_app_set_key_event_filter(app, key_event_filter);

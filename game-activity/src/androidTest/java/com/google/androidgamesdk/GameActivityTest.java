@@ -162,6 +162,11 @@ public class GameActivityTest {
         }
     }
 
+    @Test
+    public void gestureAxis_canBeEnabledAndRead() {
+        assertEquals(2.5f, TestGameActivity.getPinchScaleFactorAxisValue(2.5f), 0f);
+    }
+
     /** Waits up to 5 seconds for the native thread to see a key event with keyCode. */
     private static int waitForLastKeyCode(int keyCode) {
         long deadline = SystemClock.uptimeMillis() + 5000;
