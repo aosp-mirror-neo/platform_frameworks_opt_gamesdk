@@ -116,9 +116,10 @@ void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
     setThreadName(threadName.c_str());
 
     std::unique_lock<std::mutex> lock(mMutex);
-    while (true) {
+    while (mIsRunning) {
+        int64_t sequenceNumber = mSequenceNumber;
         auto timestamp = mLastTimestamp;
-        auto workDuration = mWorkDuration;
+        const auto workDuration = mWorkDuration.load();
         lock.unlock();
 
         // If we have received the same timestamp multiple times, it probably
@@ -126,25 +127,32 @@ void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
         // indicate that it's no longer running. If we detect that, we stop
         // until we see a fresh timestamp to avoid spinning forever in the
         // background.
-        if (!timer.addTimestamp(timestamp)) {
+        if (!timer.addTimestamp(timestamp, sequenceNumber)) {
             lock.lock();
-            mClock.wait(lock, mCondition,
-                        [=]() { return !mIsRunning || (mLastTimestamp != timestamp); });
+            mClock.wait(lock, mCondition, [this, sequenceNumber]() NO_THREAD_SAFETY_ANALYSIS {
+                return !mIsRunning || (mSequenceNumber != sequenceNumber);
+            });
+            if (!mIsRunning) break;
+            sequenceNumber = mSequenceNumber;
             timestamp = mLastTimestamp;
             lock.unlock();
-            timer.addTimestamp(timestamp);
+            timer.addTimestamp(timestamp, sequenceNumber);
         }
 
-        if (!mIsRunning) break;
-
         mClock.sleepUntil(timer.wakeTime(-workDuration, mClock.now()));
+
+        lock.lock();
+        if (!mIsRunning) break;
+        const auto sfToVsyncDelay = mSfToVsyncDelay;
+        lock.unlock();
+
         {
-            std::unique_lock<std::mutex> workLock(mWorkMutex);
+            std::lock_guard<std::mutex> workLock(mWorkMutex);
             const auto now = mClock.now();
-            if (now - mLastWorkRun > mRefreshPeriod / 2) {
+            if (detail::isFilterWorkDue(now, mLastWorkRun, mRefreshPeriod)) {
                 // Assume we got here first and there's work to do
                 gamesdk::ScopedTrace trace("doWork");
-                mWorkDuration = mDoWork(mSfToVsyncDelay);
+                mWorkDuration.store(mDoWork(sfToVsyncDelay));
                 mLastWorkRun = now;
             }
         }

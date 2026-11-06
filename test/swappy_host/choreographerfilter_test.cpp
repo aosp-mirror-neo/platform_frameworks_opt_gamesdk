@@ -147,4 +147,104 @@ TEST_F(ChoreographerFilterTest, IdlesAfterRepeatedUnchangedCallbacksAndWakesOnNe
               std::chrono::nanoseconds(5ms).count());
 }
 
+TEST(ChoreographerFilterWorkDueTest, RunsWorkAtMostOncePerHalfRefreshPeriod) {
+    using swappy::detail::isFilterWorkDue;
+    const Clock::time_point lastWorkRun(1s);
+
+    // A second wake-up within half a refresh period skips work, and a wake-up
+    // after half a refresh period runs work again.
+    EXPECT_FALSE(isFilterWorkDue(lastWorkRun, lastWorkRun, kRefreshPeriod));
+    EXPECT_FALSE(isFilterWorkDue(lastWorkRun + 8ms, lastWorkRun, kRefreshPeriod));
+    EXPECT_FALSE(isFilterWorkDue(lastWorkRun + kRefreshPeriod / 2, lastWorkRun, kRefreshPeriod));
+    EXPECT_TRUE(
+            isFilterWorkDue(lastWorkRun + kRefreshPeriod / 2 + 1ns, lastWorkRun, kRefreshPeriod));
+    EXPECT_TRUE(isFilterWorkDue(lastWorkRun + 9ms, lastWorkRun, kRefreshPeriod));
+}
+
+TEST(ChoreographerFilterWorkDueTest, RunsWorkOnFirstWakeUp) {
+    // Before the first work run, the last work run is the clock epoch.
+    EXPECT_TRUE(swappy::detail::isFilterWorkDue(Clock::time_point(kRefreshPeriod),
+                                                Clock::time_point(), kRefreshPeriod));
+}
+
+TEST_F(ChoreographerFilterTest, SynchronizesShutdownFlag) {
+    AdvancingClock clock;
+
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        const int64_t baseSleepCalls = clock.sleepCalls();
+        {
+            ChoreographerFilter filter(
+                    kRefreshPeriod, 0ns,
+                    [](std::optional<std::chrono::nanoseconds>) { return 0ns; }, clock);
+            ASSERT_TRUE(spinUntil([&] { return clock.sleepCalls() != baseSleepCalls; }));
+        }
+        Settings::reset();
+    }
+
+    EXPECT_GT(clock.sleepCalls(), 0);
+}
+
+TEST_F(ChoreographerFilterTest, SynchronizesVsyncDelay) {
+    AdvancingClock clock;
+    std::atomic<int64_t> accumulatedDelayNanoseconds{0};
+
+    {
+        ChoreographerFilter filter(
+                kRefreshPeriod, 0ns,
+                [&](std::optional<std::chrono::nanoseconds> sfToVsyncDelay) {
+                    if (sfToVsyncDelay.has_value()) {
+                        accumulatedDelayNanoseconds.fetch_add(sfToVsyncDelay->count(),
+                                                              std::memory_order_relaxed);
+                    }
+                    std::this_thread::yield();
+                    return 0ns;
+                },
+                clock);
+        ASSERT_TRUE(spinUntil([&] { return clock.sleepCalls() > 0; }));
+        // Writes at least 128 delays, and more until a worker has read one, so
+        // the check below holds regardless of thread scheduling.
+        int64_t delayNanoseconds = 0;
+        ASSERT_TRUE(spinUntil([&] {
+            if (delayNanoseconds >= 128 &&
+                accumulatedDelayNanoseconds.load(std::memory_order_relaxed) > 0) {
+                return true;
+            }
+            filter.onChoreographer(std::chrono::nanoseconds(++delayNanoseconds));
+            return false;
+        }));
+    }
+
+    EXPECT_GT(accumulatedDelayNanoseconds.load(std::memory_order_relaxed), 0);
+}
+
+TEST_F(ChoreographerFilterTest, SynchronizesWorkDuration) {
+    AdvancingClock clock;
+    std::atomic<int> completedWorkCalls{0};
+
+    for (int iteration = 0; iteration < 16; ++iteration) {
+        const int64_t targetSleepCalls = clock.sleepCalls() + 12;
+        {
+            ChoreographerFilter filter(
+                    kRefreshPeriod, 0ns,
+                    [&](std::optional<std::chrono::nanoseconds>) {
+                        const int callIndex =
+                                completedWorkCalls.fetch_add(1, std::memory_order_relaxed);
+                        std::this_thread::yield();
+                        return (callIndex % 2 == 0) ? 1ms : 2ms;
+                    },
+                    clock);
+            ASSERT_TRUE(spinUntil([&] {
+                if (clock.sleepCalls() >= targetSleepCalls) {
+                    return true;
+                }
+                filter.onChoreographer(0ns);
+                return false;
+            }));
+        }
+        Settings::reset();
+    }
+
+    EXPECT_GT(completedWorkCalls.load(std::memory_order_relaxed), 0);
+}
+
 } // namespace

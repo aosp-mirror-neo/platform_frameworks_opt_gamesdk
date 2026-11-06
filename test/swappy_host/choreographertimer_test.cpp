@@ -37,10 +37,11 @@ int64_t nanosSinceEpoch(ChoreographerTimer::time_point time) {
     return time.time_since_epoch().count();
 }
 
-int repeatsUntilStopped(ChoreographerTimer& timer, ChoreographerTimer::time_point timestamp) {
+int repeatsUntilStopped(ChoreographerTimer& timer, ChoreographerTimer::time_point timestamp,
+                        int64_t sequenceNumber = 0) {
     constexpr int kMaxRepeats = 100;
     int repeats = 0;
-    while (repeats < kMaxRepeats && timer.addTimestamp(timestamp)) {
+    while (repeats < kMaxRepeats && timer.addTimestamp(timestamp, sequenceNumber)) {
         ++repeats;
     }
     return repeats;
@@ -127,6 +128,15 @@ TEST(ChoreographerTimerTest, ReportsThatCallbacksStoppedAfterSixRepeats) {
     EXPECT_EQ(repeatsUntilStopped(timer, at(1'016'666'667ns)), 6);
     // A new callback resets the repeat count.
     EXPECT_TRUE(timer.addTimestamp(at(1'033'333'334ns)));
+}
+
+TEST(ChoreographerTimerTest, ResetsRepeatsWhenSequenceNumberAdvancesAtSameTimestamp) {
+    ChoreographerTimer timer(k60Hz, 0ns, at(1s));
+    timer.addTimestamp(at(1'016'666'667ns), 1);
+    ASSERT_EQ(repeatsUntilStopped(timer, at(1'016'666'667ns), 1), 6);
+
+    EXPECT_TRUE(timer.addTimestamp(at(1'016'666'667ns), 2));
+    EXPECT_EQ(repeatsUntilStopped(timer, at(1'016'666'667ns), 2), 6);
 }
 
 } // namespace

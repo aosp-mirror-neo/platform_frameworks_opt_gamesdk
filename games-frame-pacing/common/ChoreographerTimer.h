@@ -39,12 +39,12 @@ public:
 
     // Returns false if we have detected that we have received the same
     // timestamp multiple times so that the caller can wait for fresh timestamps
-    bool addTimestamp(time_point point) {
+    bool addTimestamp(time_point point, int64_t sequenceNumber = 0) {
         // Keep track of the previous timestamp and how many times we've seen it
         // to determine if we've stopped receiving Choreographer callbacks,
         // which would indicate that we should probably stop until we see them
         // again (e.g., if the app has been moved to the background)
-        if (point == mLastTimestamp) {
+        if (point == mLastTimestamp && sequenceNumber == mLastSequenceNumber) {
             if (mRepeatCount++ > 5) {
                 return false;
             }
@@ -52,6 +52,7 @@ public:
             mRepeatCount = 0;
         }
         mLastTimestamp = point;
+        mLastSequenceNumber = sequenceNumber;
 
         point += mAppToSfDelay;
 
@@ -99,6 +100,7 @@ private:
     time_point mBaseTime;
 
     time_point mLastTimestamp;
+    int64_t mLastSequenceNumber = 0;
     int32_t mRepeatCount = 0;
 };
 

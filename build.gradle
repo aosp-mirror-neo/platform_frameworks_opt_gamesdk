@@ -851,6 +851,14 @@ task hostUnitTests {
             workingDir buildInfo.outputFolder
             commandLine "./swappy_host_trace_off_test"
         }
+        def enableCoverage = project.findProperty("enableCoverage")
+            ?.toString()?.toBoolean() == true
+        if (!enableCoverage && new File(buildInfo.outputFolder, "swappy_host_tsan_test").exists()) {
+            exec {
+                workingDir buildInfo.outputFolder
+                commandLine "./swappy_host_tsan_test"
+            }
+        }
     }
 }
 

@@ -118,3 +118,22 @@ target_compile_options(swappy_host_trace_off_test PRIVATE ${SWAPPY_HOST_TEST_COM
 target_compile_definitions(swappy_host_trace_off_test PRIVATE ${SWAPPY_HOST_TEST_COMPILE_DEFINITIONS} TRACE=0)
 target_link_libraries(swappy_host_trace_off_test ${SWAPPY_HOST_TEST_LIBS})
 gtest_discover_tests(swappy_host_trace_off_test TEST_PREFIX "trace_off." PROPERTIES TIMEOUT 10)
+
+if(UNIX AND NOT AGDK_ENABLE_COVERAGE)
+  cmake_push_check_state(RESET)
+  set(CMAKE_REQUIRED_FLAGS "-fsanitize=thread")
+  set(CMAKE_REQUIRED_LINK_OPTIONS "-fsanitize=thread")
+  check_cxx_source_compiles("int main() { return 0; }" SWAPPY_HAS_TSAN)
+  cmake_pop_check_state()
+
+  if(SWAPPY_HAS_TSAN)
+    add_executable(swappy_host_tsan_test ${SWAPPY_HOST_TEST_SOURCES})
+    target_compile_options(swappy_host_tsan_test PRIVATE
+      ${SWAPPY_HOST_TEST_COMPILE_OPTIONS} -fsanitize=thread -g -O1)
+    target_compile_definitions(swappy_host_tsan_test PRIVATE
+      ${SWAPPY_HOST_TEST_COMPILE_DEFINITIONS})
+    target_link_options(swappy_host_tsan_test PRIVATE -fsanitize=thread)
+    target_link_libraries(swappy_host_tsan_test ${SWAPPY_HOST_TEST_LIBS})
+    gtest_discover_tests(swappy_host_tsan_test TEST_PREFIX "tsan." PROPERTIES TIMEOUT 10)
+  endif()
+endif()

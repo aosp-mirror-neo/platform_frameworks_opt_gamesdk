@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <optional>
@@ -26,6 +28,19 @@
 #include "Thread.h"
 
 namespace swappy {
+
+namespace detail {
+
+// Returns true if a filter worker that wakes at `now` must run the work
+// callback. Work runs at most once per half refresh period, so only the first
+// worker that wakes for a vsync runs it.
+inline bool isFilterWorkDue(std::chrono::steady_clock::time_point now,
+                            std::chrono::steady_clock::time_point lastWorkRun,
+                            std::chrono::nanoseconds refreshPeriod) {
+    return now - lastWorkRun > refreshPeriod / 2;
+}
+
+} // namespace detail
 
 class ChoreographerFilter {
 public:
@@ -44,7 +59,9 @@ private:
 
     void onSettingsChanged();
 
-    void threadMain(bool useAffinity, int32_t thread);
+    // Thread-safety analysis cannot track the std::unique_lock unlock and lock
+    // calls in this method.
+    void threadMain(bool useAffinity, int32_t thread) NO_THREAD_SAFETY_ANALYSIS;
 
     std::mutex mThreadPoolMutex;
     bool mUseAffinity = true;
@@ -52,14 +69,16 @@ private:
 
     std::mutex mMutex;
     std::condition_variable mCondition;
-    bool mIsRunning = true;
-    int64_t mSequenceNumber = 0;
-    std::chrono::steady_clock::time_point mLastTimestamp;
-    std::optional<std::chrono::nanoseconds> mSfToVsyncDelay;
+    bool mIsRunning GUARDED_BY(mMutex) = true;
+    int64_t mSequenceNumber GUARDED_BY(mMutex) = 0;
+    std::chrono::steady_clock::time_point mLastTimestamp GUARDED_BY(mMutex);
+    std::optional<std::chrono::nanoseconds> mSfToVsyncDelay GUARDED_BY(mMutex);
 
     std::mutex mWorkMutex;
-    std::chrono::steady_clock::time_point mLastWorkRun;
-    std::chrono::nanoseconds mWorkDuration;
+    std::chrono::steady_clock::time_point mLastWorkRun GUARDED_BY(mWorkMutex);
+    // Lead duration of the last work run. It is lock-free because workers
+    // read it before sleeping without the work mutex.
+    std::atomic<std::chrono::nanoseconds> mWorkDuration{};
 
     std::chrono::nanoseconds mRefreshPeriod;
     std::chrono::nanoseconds mAppToSfDelay;
