@@ -25,15 +25,19 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../external/googletest")
   set(ANDROID_GTEST_DIR "../../../external/googletest")
 elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../external/googletest")
   set(ANDROID_GTEST_DIR "../../../../../external/googletest")
-else()
-  message(FATAL_ERROR "googletest directory not found")
 endif()
-set(BUILD_GMOCK OFF)
-set(INSTALL_GTEST OFF)
 
 find_package(Threads REQUIRED)
 
-add_subdirectory("${ANDROID_GTEST_DIR}" googletest-build)
+if(ANDROID_GTEST_DIR)
+  set(BUILD_GMOCK OFF)
+  set(INSTALL_GTEST OFF)
+  add_subdirectory("${ANDROID_GTEST_DIR}" googletest-build)
+else()
+  # Without the AOSP checkout around gamesdk, use an installed googletest,
+  # such as the one from `brew install googletest`.
+  find_package(GTest REQUIRED)
+endif()
 
 if(AGDK_ENABLE_COVERAGE)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --coverage -O0 -g -Wno-error")
@@ -42,20 +46,31 @@ if(AGDK_ENABLE_COVERAGE)
 endif()
 
 include_directories(
-  "${ANDROID_GTEST_DIR}/googletest/include"
   ../../games-frame-pacing/common
+  ../../include
+  ../../src/common
 )
 
 add_executable(swappy_host_test
   swappy_host_test.cpp
+  choreographerfilter_test.cpp
+  choreographertimer_test.cpp
   classicpacingimpl_test.cpp
+  clock_test.cpp
   framedurations_test.cpp
   swapintervalladder_test.cpp
+  ../../games-frame-pacing/common/ChoreographerFilter.cpp
   ../../games-frame-pacing/common/Settings.cpp
+  ../../games-frame-pacing/common/Thread.cpp
 )
 
 target_link_libraries(swappy_host_test
-  gtest
-  gtest_main
+  GTest::gtest
+  GTest::gtest_main
   Threads::Threads
+  ${CMAKE_DL_LIBS}
 )
+
+enable_testing()
+include(GoogleTest)
+gtest_discover_tests(swappy_host_test PROPERTIES TIMEOUT 10)

@@ -51,6 +51,7 @@ enum class Affinity { None, Even, Odd };
 int32_t getNumCpus();
 void setAffinity(int32_t cpu);
 void setAffinity(Affinity affinity);
+void setThreadName(const char* name);
 
 struct ThreadImpl;
 

@@ -16,6 +16,7 @@
 
 #include "Thread.h"
 
+#include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
 
@@ -28,12 +29,17 @@
 
 namespace swappy {
 
+// Android and Linux pin threads to CPUs with sched_setaffinity(). Other hosts
+// that run the unit tests, such as macOS, cannot: there, getNumCpus() counts
+// every CPU and setAffinity() does nothing.
+#if defined(__linux__)
+
 int32_t getNumCpus() {
     static int32_t sNumCpus = []() {
-        pid_t pid = gettid();
         cpu_set_t cpuSet;
         CPU_ZERO(&cpuSet);
-        sched_getaffinity(pid, sizeof(cpuSet), &cpuSet);
+        // 0 means the current calling thread.
+        sched_getaffinity(0, sizeof(cpuSet), &cpuSet);
 
         int32_t numCpus = 0;
         while (CPU_ISSET(numCpus, &cpuSet)) {
@@ -50,7 +56,8 @@ void setAffinity(int32_t cpu) {
     cpu_set_t cpuSet;
     CPU_ZERO(&cpuSet);
     CPU_SET(cpu, &cpuSet);
-    sched_setaffinity(gettid(), sizeof(cpuSet), &cpuSet);
+    // 0 means the current calling thread.
+    sched_setaffinity(0, sizeof(cpuSet), &cpuSet);
 }
 
 void setAffinity(Affinity affinity) {
@@ -72,7 +79,29 @@ void setAffinity(Affinity affinity) {
         }
     }
 
-    sched_setaffinity(gettid(), sizeof(cpuSet), &cpuSet);
+    // 0 means the current calling thread.
+    sched_setaffinity(0, sizeof(cpuSet), &cpuSet);
+}
+
+#else
+
+int32_t getNumCpus() {
+    static const int32_t sNumCpus = static_cast<int32_t>(std::thread::hardware_concurrency());
+    return sNumCpus;
+}
+
+void setAffinity(int32_t /*cpu*/) {}
+
+void setAffinity(Affinity /*affinity*/) {}
+
+#endif
+
+void setThreadName(const char* name) {
+#if defined(__APPLE__)
+    pthread_setname_np(name);
+#else
+    pthread_setname_np(pthread_self(), name);
+#endif
 }
 
 static const SwappyThreadFunctions* s_ext_thread_manager = nullptr;
