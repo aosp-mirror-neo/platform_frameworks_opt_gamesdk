@@ -59,9 +59,7 @@ private:
 
     void onSettingsChanged();
 
-    // Thread-safety analysis cannot track the std::unique_lock unlock and lock
-    // calls in this method.
-    void threadMain(bool useAffinity, int32_t thread) NO_THREAD_SAFETY_ANALYSIS;
+    void threadMain(bool useAffinity, int32_t thread) EXCLUDES(mMutex, mWorkMutex);
 
     std::mutex mThreadPoolMutex;
     bool mUseAffinity = true;

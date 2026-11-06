@@ -50,8 +50,9 @@ public:
         std::this_thread::yield();
     }
 
-    void wait(std::unique_lock<std::mutex>& lock, std::condition_variable& condition,
-              const std::function<bool()>& predicate) const override {
+protected:
+    void waitLocked(std::unique_lock<std::mutex>& lock, std::condition_variable& condition,
+                    const std::function<bool()>& predicate) const override {
         if (predicate()) {
             return;
         }
@@ -60,6 +61,7 @@ public:
         mWaitingThreads.fetch_sub(1, std::memory_order_relaxed);
     }
 
+public:
     [[nodiscard]] int64_t sleepCalls() const {
         return mSleepCalls.load(std::memory_order_relaxed);
     }

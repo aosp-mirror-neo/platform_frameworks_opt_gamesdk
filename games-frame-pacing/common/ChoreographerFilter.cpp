@@ -115,12 +115,16 @@ void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
     threadName += std::to_string(thread);
     setThreadName(threadName.c_str());
 
-    std::unique_lock<std::mutex> lock(mMutex);
-    while (mIsRunning) {
-        int64_t sequenceNumber = mSequenceNumber;
-        auto timestamp = mLastTimestamp;
+    while (true) {
+        int64_t sequenceNumber;
+        std::chrono::steady_clock::time_point timestamp;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            if (!mIsRunning) break;
+            sequenceNumber = mSequenceNumber;
+            timestamp = mLastTimestamp;
+        }
         const auto workDuration = mWorkDuration.load();
-        lock.unlock();
 
         // If we have received the same timestamp multiple times, it probably
         // means that the app has stopped sending them to us, which could
@@ -128,23 +132,26 @@ void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
         // until we see a fresh timestamp to avoid spinning forever in the
         // background.
         if (!timer.addTimestamp(timestamp, sequenceNumber)) {
-            lock.lock();
-            mClock.wait(lock, mCondition, [this, sequenceNumber]() NO_THREAD_SAFETY_ANALYSIS {
-                return !mIsRunning || (mSequenceNumber != sequenceNumber);
-            });
-            if (!mIsRunning) break;
-            sequenceNumber = mSequenceNumber;
-            timestamp = mLastTimestamp;
-            lock.unlock();
+            {
+                std::lock_guard<std::mutex> lock(mMutex);
+                mClock.wait(mMutex, mCondition, [this, sequenceNumber]() REQUIRES(mMutex) {
+                    return !mIsRunning || (mSequenceNumber != sequenceNumber);
+                });
+                if (!mIsRunning) break;
+                sequenceNumber = mSequenceNumber;
+                timestamp = mLastTimestamp;
+            }
             timer.addTimestamp(timestamp, sequenceNumber);
         }
 
         mClock.sleepUntil(timer.wakeTime(-workDuration, mClock.now()));
 
-        lock.lock();
-        if (!mIsRunning) break;
-        const auto sfToVsyncDelay = mSfToVsyncDelay;
-        lock.unlock();
+        std::optional<std::chrono::nanoseconds> sfToVsyncDelay;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            if (!mIsRunning) break;
+            sfToVsyncDelay = mSfToVsyncDelay;
+        }
 
         {
             std::lock_guard<std::mutex> workLock(mWorkMutex);
@@ -156,7 +163,6 @@ void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
                 mLastWorkRun = now;
             }
         }
-        lock.lock();
     }
 }
 

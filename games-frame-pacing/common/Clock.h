@@ -22,6 +22,8 @@
 #include <mutex>
 #include <thread>
 
+#include "Thread.h"
+
 namespace swappy {
 
 // Time source for frame pacing, and the only way frame pacing blocks on time
@@ -41,17 +43,29 @@ public:
     // if deadline has already passed.
     virtual void sleepUntil(time_point deadline) const = 0;
 
-    // Blocks the calling thread until predicate() returns true, like
-    // std::condition_variable::wait(lock, predicate). lock must own the mutex
-    // guarding the state predicate reads, and every change to that state must
-    // be followed by a notification of condition. Returns with lock owned and
-    // predicate() true.
-    virtual void wait(std::unique_lock<std::mutex>& lock, std::condition_variable& condition,
-                      const std::function<bool()>& predicate) const = 0;
+    // Blocks the calling thread until predicate() returns true. The caller
+    // holds mutex in a scope lock such as std::lock_guard, which thread-safety
+    // analysis can track. mutex must guard the state predicate reads, and
+    // every change to that state must be followed by a notification of
+    // condition. Returns with mutex held and predicate() true. Adopts mutex
+    // into a std::unique_lock for waitLocked() and releases it without
+    // unlocking, so the caller's lock keeps ownership.
+    void wait(std::mutex& mutex, std::condition_variable& condition,
+              const std::function<bool()>& predicate) const REQUIRES(mutex) {
+        std::unique_lock<std::mutex> lock(mutex, std::adopt_lock);
+        waitLocked(lock, condition, predicate);
+        lock.release();
+    }
 
 protected:
     Clock() = default;
     ~Clock() = default;
+
+    // Implements wait() like std::condition_variable::wait(lock, predicate).
+    // lock owns the mutex guarding the state predicate reads. Returns with
+    // lock owned and predicate() true.
+    virtual void waitLocked(std::unique_lock<std::mutex>& lock, std::condition_variable& condition,
+                            const std::function<bool()>& predicate) const = 0;
 };
 
 // Clock backed by std::chrono::steady_clock and standard library waits.
@@ -71,13 +85,13 @@ public:
         std::this_thread::sleep_until(deadline);
     }
 
-    void wait(std::unique_lock<std::mutex>& lock, std::condition_variable& condition,
-              const std::function<bool()>& predicate) const override {
-        condition.wait(lock, predicate);
-    }
-
 private:
     SteadyClock() = default;
+
+    void waitLocked(std::unique_lock<std::mutex>& lock, std::condition_variable& condition,
+                    const std::function<bool()>& predicate) const override {
+        condition.wait(lock, predicate);
+    }
 };
 
 } // namespace swappy

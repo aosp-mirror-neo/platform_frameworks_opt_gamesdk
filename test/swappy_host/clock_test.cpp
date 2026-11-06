@@ -28,6 +28,18 @@ using swappy::Clock;
 using swappy::SteadyClock;
 using swappy::Thread;
 
+// Returns true if another thread can lock mutex, that is, the caller does not
+// hold it.
+bool otherThreadCanLock(std::mutex& mutex) {
+    bool locked = false;
+    Thread checker([&] {
+        std::unique_lock<std::mutex> probe(mutex, std::try_to_lock);
+        locked = probe.owns_lock();
+    });
+    checker.join();
+    return locked;
+}
+
 TEST(SteadyClockTest, SleepUntilPastOrCurrentDeadlineReturnsWithMonotonicNow) {
     const Clock& clock = SteadyClock::instance();
     const Clock::time_point before = clock.now();
@@ -44,17 +56,17 @@ TEST(SteadyClockTest, WaitReturnsImmediatelyWhenPredicateAlreadyHolds) {
     std::condition_variable condition;
     int predicateEvaluations = 0;
 
-    std::unique_lock<std::mutex> lock(mutex);
-    clock.wait(lock, condition, [&] {
+    std::lock_guard<std::mutex> lock(mutex);
+    clock.wait(mutex, condition, [&] {
         ++predicateEvaluations;
         return true;
     });
 
-    EXPECT_TRUE(lock.owns_lock());
+    EXPECT_FALSE(otherThreadCanLock(mutex));
     EXPECT_EQ(predicateEvaluations, 1);
 }
 
-TEST(SteadyClockTest, WaitBlocksUntilNotifiedAndReturnsWithLockOwned) {
+TEST(SteadyClockTest, WaitBlocksUntilNotifiedAndReturnsWithMutexHeld) {
     const Clock& clock = SteadyClock::instance();
     std::mutex mutex;
     std::condition_variable condition;
@@ -62,20 +74,20 @@ TEST(SteadyClockTest, WaitBlocksUntilNotifiedAndReturnsWithLockOwned) {
     int predicateEvaluations = 0;
     int evaluationsBeforeNotify = 0;
 
-    std::unique_lock<std::mutex> lock(mutex);
+    std::lock_guard<std::mutex> lock(mutex);
     Thread notifier([&] {
         std::lock_guard<std::mutex> notifierLock(mutex);
         evaluationsBeforeNotify = predicateEvaluations;
         ready = true;
         condition.notify_one();
     });
-    clock.wait(lock, condition, [&] {
+    clock.wait(mutex, condition, [&] {
         ++predicateEvaluations;
         return ready;
     });
     notifier.join();
 
-    EXPECT_TRUE(lock.owns_lock());
+    EXPECT_FALSE(otherThreadCanLock(mutex));
     EXPECT_TRUE(ready);
     EXPECT_GE(evaluationsBeforeNotify, 1);
     EXPECT_GT(predicateEvaluations, evaluationsBeforeNotify);
