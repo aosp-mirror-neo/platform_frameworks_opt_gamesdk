@@ -82,14 +82,39 @@ set(SWAPPY_HOST_TEST_LIBS
   ${CMAKE_DL_LIBS}
 )
 
+include(CheckCXXSourceCompiles)
+include(CMakePushCheckState)
+
+cmake_push_check_state(RESET)
+set(CMAKE_REQUIRED_FLAGS "-Wthread-safety -Werror=thread-safety -D_LIBCPP_ENABLE_THREAD_SAFETY_ANNOTATIONS")
+check_cxx_source_compiles("
+  #include <mutex>
+  struct S { std::mutex m; int x __attribute__((guarded_by(m))) = 0; };
+  int main() { S s; std::lock_guard<std::mutex> l(s.m); return s.x; }
+" SWAPPY_HAS_THREAD_SAFETY)
+cmake_pop_check_state()
+
+set(SWAPPY_HOST_TEST_COMPILE_OPTIONS)
+set(SWAPPY_HOST_TEST_COMPILE_DEFINITIONS)
+if(SWAPPY_HAS_THREAD_SAFETY)
+  list(APPEND SWAPPY_HOST_TEST_COMPILE_OPTIONS -Wthread-safety)
+  if(NOT AGDK_ENABLE_COVERAGE)
+    list(APPEND SWAPPY_HOST_TEST_COMPILE_OPTIONS -Werror=thread-safety)
+  endif()
+  list(APPEND SWAPPY_HOST_TEST_COMPILE_DEFINITIONS _LIBCPP_ENABLE_THREAD_SAFETY_ANNOTATIONS)
+endif()
+
 enable_testing()
 include(GoogleTest)
 
 add_executable(swappy_host_test ${SWAPPY_HOST_TEST_SOURCES})
+target_compile_options(swappy_host_test PRIVATE ${SWAPPY_HOST_TEST_COMPILE_OPTIONS})
+target_compile_definitions(swappy_host_test PRIVATE ${SWAPPY_HOST_TEST_COMPILE_DEFINITIONS})
 target_link_libraries(swappy_host_test ${SWAPPY_HOST_TEST_LIBS})
 gtest_discover_tests(swappy_host_test PROPERTIES TIMEOUT 10)
 
 add_executable(swappy_host_trace_off_test ${SWAPPY_HOST_TRACE_OFF_TEST_SOURCES})
-target_compile_definitions(swappy_host_trace_off_test PRIVATE TRACE=0)
+target_compile_options(swappy_host_trace_off_test PRIVATE ${SWAPPY_HOST_TEST_COMPILE_OPTIONS})
+target_compile_definitions(swappy_host_trace_off_test PRIVATE ${SWAPPY_HOST_TEST_COMPILE_DEFINITIONS} TRACE=0)
 target_link_libraries(swappy_host_trace_off_test ${SWAPPY_HOST_TEST_LIBS})
 gtest_discover_tests(swappy_host_trace_off_test TEST_PREFIX "trace_off." PROPERTIES TIMEOUT 10)
