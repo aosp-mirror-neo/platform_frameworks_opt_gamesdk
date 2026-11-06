@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <optional>
 
 using namespace swappy;
 using namespace std::chrono_literals;
@@ -37,7 +38,8 @@ int64_t nanosSinceEpoch(ChoreographerTimer::time_point time) {
     return time.time_since_epoch().count();
 }
 
-int repeatsUntilStopped(ChoreographerTimer& timer, ChoreographerTimer::time_point timestamp,
+int repeatsUntilStopped(ChoreographerTimer& timer,
+                        std::optional<ChoreographerTimer::time_point> timestamp,
                         int64_t sequenceNumber = 0) {
     constexpr int kMaxRepeats = 100;
     int repeats = 0;
@@ -113,12 +115,13 @@ TEST(ChoreographerTimerTest, SnapsToTheNearestVsyncAfterAGapWithoutAdjustingTheP
     EXPECT_EQ(nanosSinceEpoch(timer.wakeTime(0ns, at(1'066'666'668ns))), 1'083'333'335);
 }
 
-TEST(ChoreographerTimerTest, WakesUpAtTheFirstVsyncNotBeforeNow) {
+TEST(ChoreographerTimerTest, WakesUpAtTheFirstVsyncStrictlyAfterNow) {
     ChoreographerTimer timer(k60Hz, 0ns, at(1s));
 
     EXPECT_EQ(nanosSinceEpoch(timer.wakeTime(0ns, at(1'040'000'000ns))), 1'050'000'001);
-    // When now equals a vsync without a new callback, wakeTime returns now.
-    EXPECT_EQ(nanosSinceEpoch(timer.wakeTime(0ns, at(1'016'666'667ns))), 1'016'666'667);
+    // When now equals a vsync without a new callback, wakeTime advances to the
+    // next refresh boundary instead of returning now.
+    EXPECT_EQ(nanosSinceEpoch(timer.wakeTime(0ns, at(1'016'666'667ns))), 1'033'333'334);
 }
 
 TEST(ChoreographerTimerTest, ReportsThatCallbacksStoppedAfterSixRepeats) {
@@ -137,6 +140,26 @@ TEST(ChoreographerTimerTest, ResetsRepeatsWhenSequenceNumberAdvancesAtSameTimest
 
     EXPECT_TRUE(timer.addTimestamp(at(1'016'666'667ns), 2));
     EXPECT_EQ(repeatsUntilStopped(timer, at(1'016'666'667ns), 2), 6);
+}
+
+TEST(ChoreographerTimerTest, DistinguishesMissingCallbacksFromCallbackAtEpochZero) {
+    ChoreographerTimer timer(k60Hz, 10ms, at(0ns));
+
+    // Initial check + six repeats without any callback keep mBaseTime at 0ns
+    // without letting mAppToSfDelay shift the period, then stop.
+    EXPECT_TRUE(timer.addTimestamp(std::nullopt));
+    EXPECT_EQ(nanosSinceEpoch(timer.wakeTime(0ns, at(0ns))), 16'666'667);
+    EXPECT_EQ(repeatsUntilStopped(timer, std::nullopt), 6);
+
+    // A real callback arriving at time_point{} (0ns) counts as a fresh
+    // callback rather than a repeat of an empty timestamp.
+    EXPECT_TRUE(timer.addTimestamp(at(0ns)));
+    EXPECT_EQ(repeatsUntilStopped(timer, at(0ns)), 6);
+
+    // An immediate callback at 0ns on a fresh 0ns timer also counts as fresh.
+    ChoreographerTimer immediateTimer(k60Hz, 10ms, at(0ns));
+    EXPECT_TRUE(immediateTimer.addTimestamp(at(0ns)));
+    EXPECT_EQ(repeatsUntilStopped(immediateTimer, at(0ns)), 6);
 }
 
 } // namespace

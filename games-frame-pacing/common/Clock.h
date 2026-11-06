@@ -28,7 +28,9 @@ namespace swappy {
 
 // Time source for frame pacing, and the only way frame pacing blocks on time
 // or on another thread. Implementations must be thread-safe and never go
-// backwards. now() neither blocks nor calls back into its caller.
+// backwards. Simulated clocks may start at time_point{}, so callers must not
+// treat time_point{} as an uninitialized sentinel. now() neither blocks nor
+// calls back into its caller.
 class Clock {
 public:
     using time_point = std::chrono::steady_clock::time_point;

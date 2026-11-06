@@ -18,13 +18,15 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 
 namespace swappy {
 
 // Estimates display vsync times from Choreographer callback timestamps: when a
 // filter loop should wake up next, and whether callbacks have stopped arriving.
 // The caller supplies all timestamps, so the timer runs the same way on the
-// steady clock and on a test clock.
+// steady clock and on a test clock, including one that starts at time_point{}
+// (epoch 0).
 class ChoreographerTimer {
 public:
     using time_point = std::chrono::steady_clock::time_point;
@@ -32,29 +34,33 @@ public:
 
     // Uses now as the initial vsync base until callbacks arrive.
     ChoreographerTimer(duration refreshPeriod, duration appToSfDelay, time_point now)
-          : mRefreshPeriod(refreshPeriod),
-            mAppToSfDelay(appToSfDelay),
-            mBaseTime(now),
-            mLastTimestamp(now) {}
+          : mRefreshPeriod(refreshPeriod), mAppToSfDelay(appToSfDelay), mBaseTime(now) {}
 
-    // Returns false if we have detected that we have received the same
-    // timestamp multiple times so that the caller can wait for fresh timestamps
-    bool addTimestamp(time_point point, int64_t sequenceNumber = 0) {
+    // Records the latest callback timestamp, or std::nullopt when no callback
+    // has arrived yet, with the callback sequence number. Returns false after
+    // six repeats of the same timestamp and sequence number so the caller can
+    // wait for a fresh callback. A new sequence number at the same timestamp,
+    // as on a coarse or frozen clock, counts as a fresh callback.
+    bool addTimestamp(std::optional<time_point> timestamp, int64_t sequenceNumber = 0) {
         // Keep track of the previous timestamp and how many times we've seen it
         // to determine if we've stopped receiving Choreographer callbacks,
         // which would indicate that we should probably stop until we see them
         // again (e.g., if the app has been moved to the background)
-        if (point == mLastTimestamp && sequenceNumber == mLastSequenceNumber) {
-            if (mRepeatCount++ > 5) {
+        if (mLastTimestamp == timestamp && mLastSequenceNumber == sequenceNumber) {
+            if (mSameTimestampCount > 6) {
                 return false;
             }
+            ++mSameTimestampCount;
         } else {
-            mRepeatCount = 0;
+            mLastTimestamp = timestamp;
+            mLastSequenceNumber = sequenceNumber;
+            mSameTimestampCount = 1;
         }
-        mLastTimestamp = point;
-        mLastSequenceNumber = sequenceNumber;
+        if (!timestamp.has_value()) {
+            return true;
+        }
 
-        point += mAppToSfDelay;
+        const time_point point = *timestamp + mAppToSfDelay;
 
         bool moreThanOneRefreshPeriodElapsed = mBaseTime + mRefreshPeriod * 1.5 < point;
         if (moreThanOneRefreshPeriodElapsed) {
@@ -80,15 +86,17 @@ public:
     }
 
     // Returns when to wake up: offset from the next vsync, moved on by whole
-    // refresh periods until it is no earlier than now. Offsets exceeding half a
-    // refresh period in either direction count as zero.
+    // refresh periods until it lies strictly after now, so a loop that wakes
+    // exactly at its target, as on a simulated clock, does not wake again at
+    // the same instant. Offsets exceeding half a refresh period in either
+    // direction count as zero.
     [[nodiscard]] time_point wakeTime(duration offset, time_point now) const {
         if (offset < -(mRefreshPeriod / 2) || offset > mRefreshPeriod / 2) {
             offset = duration::zero();
         }
 
         auto targetTime = mBaseTime + mRefreshPeriod + offset;
-        while (targetTime < now) {
+        while (targetTime <= now) {
             targetTime += mRefreshPeriod;
         }
         return targetTime;
@@ -99,9 +107,9 @@ private:
     const duration mAppToSfDelay;
     time_point mBaseTime;
 
-    time_point mLastTimestamp;
+    std::optional<time_point> mLastTimestamp;
     int64_t mLastSequenceNumber = 0;
-    int32_t mRepeatCount = 0;
+    int32_t mSameTimestampCount = 0;
 };
 
 } // namespace swappy

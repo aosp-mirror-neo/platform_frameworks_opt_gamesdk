@@ -117,7 +117,7 @@ void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
 
     while (true) {
         int64_t sequenceNumber;
-        std::chrono::steady_clock::time_point timestamp;
+        std::optional<std::chrono::steady_clock::time_point> timestamp;
         {
             std::lock_guard<std::mutex> lock(mMutex);
             if (!mIsRunning) break;

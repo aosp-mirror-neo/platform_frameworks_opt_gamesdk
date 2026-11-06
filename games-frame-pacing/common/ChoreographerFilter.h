@@ -33,11 +33,12 @@ namespace detail {
 
 // Returns true if a filter worker that wakes at `now` must run the work
 // callback. Work runs at most once per half refresh period, so only the first
-// worker that wakes for a vsync runs it.
+// worker that wakes for a vsync runs it. lastWorkRun is std::nullopt before
+// the first work run.
 inline bool isFilterWorkDue(std::chrono::steady_clock::time_point now,
-                            std::chrono::steady_clock::time_point lastWorkRun,
+                            std::optional<std::chrono::steady_clock::time_point> lastWorkRun,
                             std::chrono::nanoseconds refreshPeriod) {
-    return now - lastWorkRun > refreshPeriod / 2;
+    return !lastWorkRun || now - *lastWorkRun > refreshPeriod / 2;
 }
 
 } // namespace detail
@@ -69,11 +70,13 @@ private:
     std::condition_variable mCondition;
     bool mIsRunning GUARDED_BY(mMutex) = true;
     int64_t mSequenceNumber GUARDED_BY(mMutex) = 0;
-    std::chrono::steady_clock::time_point mLastTimestamp GUARDED_BY(mMutex);
+    // Time of the latest callback, or std::nullopt before the first one.
+    std::optional<std::chrono::steady_clock::time_point> mLastTimestamp GUARDED_BY(mMutex);
     std::optional<std::chrono::nanoseconds> mSfToVsyncDelay GUARDED_BY(mMutex);
 
     std::mutex mWorkMutex;
-    std::chrono::steady_clock::time_point mLastWorkRun GUARDED_BY(mWorkMutex);
+    // Time of the latest work run, or std::nullopt before the first one.
+    std::optional<std::chrono::steady_clock::time_point> mLastWorkRun GUARDED_BY(mWorkMutex);
     // Lead duration of the last work run. It is lock-free because workers
     // read it before sleeping without the work mutex.
     std::atomic<std::chrono::nanoseconds> mWorkDuration{};

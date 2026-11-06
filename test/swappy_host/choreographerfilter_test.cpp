@@ -40,9 +40,15 @@ constexpr auto kRefreshPeriod = std::chrono::nanoseconds(16'666'667);
 
 class AdvancingClock final : public Clock {
 public:
+    // Starts at start and moves on by step at each now() call. A zero step
+    // freezes the clock.
+    explicit AdvancingClock(std::chrono::nanoseconds start = kRefreshPeriod,
+                            std::chrono::nanoseconds step = kRefreshPeriod)
+          : mNanoseconds(start.count()), mStepNanoseconds(step.count()) {}
+
     [[nodiscard]] time_point now() const override {
         return time_point(std::chrono::nanoseconds(
-                mNanoseconds.fetch_add(kRefreshPeriod.count(), std::memory_order_relaxed)));
+                mNanoseconds.fetch_add(mStepNanoseconds, std::memory_order_relaxed)));
     }
 
     void sleepUntil(time_point) const override {
@@ -71,7 +77,8 @@ public:
     }
 
 private:
-    mutable std::atomic<int64_t> mNanoseconds{kRefreshPeriod.count()};
+    mutable std::atomic<int64_t> mNanoseconds;
+    const int64_t mStepNanoseconds;
     mutable std::atomic<int64_t> mSleepCalls{0};
     mutable std::atomic<int32_t> mWaitingThreads{0};
 };
@@ -164,9 +171,48 @@ TEST(ChoreographerFilterWorkDueTest, RunsWorkAtMostOncePerHalfRefreshPeriod) {
 }
 
 TEST(ChoreographerFilterWorkDueTest, RunsWorkOnFirstWakeUp) {
-    // Before the first work run, the last work run is the clock epoch.
-    EXPECT_TRUE(swappy::detail::isFilterWorkDue(Clock::time_point(kRefreshPeriod),
-                                                Clock::time_point(), kRefreshPeriod));
+    // The first work run is due even at epoch 0.
+    EXPECT_TRUE(swappy::detail::isFilterWorkDue(Clock::time_point(), std::nullopt, kRefreshPeriod));
+}
+
+TEST_F(ChoreographerFilterTest, RunsWorkAndWakesOnACallbackOnAClockFrozenAtEpochZero) {
+    // A simulated clock that stays at time_point{} (epoch 0).
+    AdvancingClock clock(0ns, 0ns);
+    std::atomic<int32_t> workCalls{0};
+    std::atomic<int32_t> workCallsWithDelay{0};
+    const int32_t expectedWorkers = swappy::getNumCpus() > 2 ? 2 : 1;
+
+    ChoreographerFilter filter(
+            kRefreshPeriod, 0ns,
+            [&](std::optional<std::chrono::nanoseconds> sfToVsyncDelay) {
+                workCalls.fetch_add(1, std::memory_order_relaxed);
+                if (sfToVsyncDelay.has_value()) {
+                    workCallsWithDelay.fetch_add(1, std::memory_order_relaxed);
+                }
+                return 0ns;
+            },
+            clock);
+
+    // Before the first callback, each worker runs 7 wakeups and parks. Work
+    // runs once at epoch 0, without a sfToVsyncDelay.
+    constexpr int64_t kWakeupsPerCallback = 7;
+    ASSERT_TRUE(spinUntil([&] {
+        return clock.sleepCalls() >= expectedWorkers * kWakeupsPerCallback &&
+                clock.waitingThreads() >= expectedWorkers;
+    }));
+    EXPECT_EQ(clock.sleepCalls(), expectedWorkers * kWakeupsPerCallback);
+    EXPECT_EQ(workCalls.load(std::memory_order_relaxed), 1);
+    EXPECT_EQ(workCallsWithDelay.load(std::memory_order_relaxed), 0);
+
+    // A callback at epoch 0 is a fresh callback, not a repeat of the missing
+    // one, so each worker runs all 7 wakeups again before it parks.
+    const int64_t sleepsBeforeCallback = clock.sleepCalls();
+    filter.onChoreographer(3ms);
+    ASSERT_TRUE(spinUntil([&] {
+        return clock.sleepCalls() >= sleepsBeforeCallback + expectedWorkers * kWakeupsPerCallback &&
+                clock.waitingThreads() >= expectedWorkers;
+    }));
+    EXPECT_EQ(clock.sleepCalls(), sleepsBeforeCallback + expectedWorkers * kWakeupsPerCallback);
 }
 
 TEST_F(ChoreographerFilterTest, SynchronizesShutdownFlag) {
