@@ -23,6 +23,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <utility>
 
 #include "Clock.h"
 #include "Settings.h"
@@ -51,8 +52,16 @@ public:
                 mNanoseconds.fetch_add(mStepNanoseconds, std::memory_order_relaxed)));
     }
 
-    void sleepUntil(time_point) const override {
+    void sleepUntil(time_point target) const override {
+        mLastWakeTargetNs.store(target.time_since_epoch().count(), std::memory_order_relaxed);
         mSleepCalls.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(mHookMutex);
+            if (mOnNextSleep) {
+                auto callback = std::exchange(mOnNextSleep, nullptr);
+                callback();
+            }
+        }
         std::this_thread::yield();
     }
 
@@ -68,8 +77,20 @@ protected:
     }
 
 public:
+    void setNow(std::chrono::nanoseconds now) {
+        mNanoseconds.store(now.count(), std::memory_order_relaxed);
+    }
+
+    void setOnNextSleep(std::function<void()> callback) {
+        std::lock_guard<std::mutex> lock(mHookMutex);
+        mOnNextSleep = std::move(callback);
+    }
     [[nodiscard]] int64_t sleepCalls() const {
         return mSleepCalls.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] int64_t lastWakeTargetNs() const {
+        return mLastWakeTargetNs.load(std::memory_order_relaxed);
     }
 
     [[nodiscard]] int32_t waitingThreads() const {
@@ -80,7 +101,10 @@ private:
     mutable std::atomic<int64_t> mNanoseconds;
     const int64_t mStepNanoseconds;
     mutable std::atomic<int64_t> mSleepCalls{0};
+    mutable std::atomic<int64_t> mLastWakeTargetNs{0};
     mutable std::atomic<int32_t> mWaitingThreads{0};
+    mutable std::mutex mHookMutex;
+    mutable std::function<void()> mOnNextSleep;
 };
 
 class ChoreographerFilterTest : public ::testing::Test {
@@ -293,6 +317,152 @@ TEST_F(ChoreographerFilterTest, SynchronizesWorkDuration) {
     }
 
     EXPECT_GT(completedWorkCalls.load(std::memory_order_relaxed), 0);
+}
+
+TEST_F(ChoreographerFilterTest, DisplayTimingUpdateAppliesInPlaceWithoutWakingIdleWorkers) {
+    AdvancingClock clock(1'000ms, 0ns);
+    std::atomic<int64_t> workCalls{0};
+    const int32_t expectedWorkers = swappy::getNumCpus() > 2 ? 2 : 1;
+    constexpr int64_t kWakeupsPerCallback = 7;
+
+    ChoreographerFilter filter(
+            16ms, 0ns,
+            [&](std::optional<std::chrono::nanoseconds>) {
+                workCalls.fetch_add(1, std::memory_order_relaxed);
+                return 1ms;
+            },
+            clock);
+
+    ASSERT_TRUE(spinUntil([&] {
+        return clock.sleepCalls() >= expectedWorkers * kWakeupsPerCallback &&
+                clock.waitingThreads() >= expectedWorkers;
+    }));
+    const int64_t sleepsWhenParked = clock.sleepCalls();
+    const int64_t workCallsWhenParked = workCalls.load(std::memory_order_relaxed);
+    EXPECT_EQ(clock.lastWakeTargetNs(), 1'015'000'000);
+
+    // Non-display settings changes before setDisplayTimings (refreshPeriod == 0ns) and
+    // in-place refresh-period switches must not tear down or wake parked workers.
+    Settings::getInstance()->setSwapDuration(33'333'333);
+    Settings::getInstance()->setDisplayTimings({10ms, 1ms, 3ms});
+    EXPECT_EQ(clock.sleepCalls(), sleepsWhenParked);
+    EXPECT_EQ(clock.waitingThreads(), expectedWorkers);
+
+    // Callback at 1'020ms + 2ms appToSfDelay rebases to 1'022ms and schedules wake at
+    // 1'022ms + 10ms - 1ms = 1'031'000'000ns while running due work once.
+    clock.setNow(1'020ms);
+    filter.onChoreographer(2ms);
+    ASSERT_TRUE(spinUntil([&] {
+        return clock.sleepCalls() >= sleepsWhenParked + expectedWorkers * kWakeupsPerCallback &&
+                clock.waitingThreads() >= expectedWorkers;
+    }));
+    EXPECT_EQ(clock.sleepCalls(), sleepsWhenParked + expectedWorkers * kWakeupsPerCallback);
+    EXPECT_EQ(clock.lastWakeTargetNs(), 1'031'000'000);
+    EXPECT_EQ(workCalls.load(std::memory_order_relaxed), workCallsWhenParked + 1);
+}
+
+TEST_F(ChoreographerFilterTest, DisplayTimingDownshiftDuringSleepUpdatesFilterWorkDuePeriod) {
+    AdvancingClock clock(1'000ms, 0ns);
+    std::atomic<int64_t> workCalls{0};
+    const int32_t expectedWorkers = swappy::getNumCpus() > 2 ? 2 : 1;
+    constexpr int64_t kWakeupsPerCallback = 7;
+
+    ChoreographerFilter filter(
+            8ms, 0ns,
+            [&](std::optional<std::chrono::nanoseconds>) {
+                workCalls.fetch_add(1, std::memory_order_relaxed);
+                return 1ms;
+            },
+            clock);
+    ASSERT_TRUE(spinUntil([&] {
+        return clock.sleepCalls() >= expectedWorkers * kWakeupsPerCallback &&
+                clock.waitingThreads() >= expectedWorkers;
+    }));
+    const int64_t sleepsWhenParked = clock.sleepCalls();
+    const int64_t workCallsWhenParked = workCalls.load(std::memory_order_relaxed);
+
+    // Downshift from 8ms to 40ms while workers are inside sleepUntil at 1'008ms: syncing
+    // refreshPeriod upon waking sees 8ms <= 20ms (half of 40ms) in isFilterWorkDue and suppresses
+    // early work.
+    clock.setOnNextSleep([&] { Settings::getInstance()->setDisplayTimings({40ms, 0ns, 0ns}); });
+    clock.setNow(1'008ms);
+    filter.onChoreographer(0ns);
+
+    ASSERT_TRUE(spinUntil([&] {
+        return clock.sleepCalls() >= sleepsWhenParked + expectedWorkers * kWakeupsPerCallback &&
+                clock.waitingThreads() >= expectedWorkers;
+    }));
+    EXPECT_EQ(workCalls.load(std::memory_order_relaxed), workCallsWhenParked);
+}
+
+TEST_F(ChoreographerFilterTest,
+       UseAffinityChangeWithoutDisplayTimingsRestartsWorkersPreservingInitialTimings) {
+    AdvancingClock clock(1'000ms, 0ns);
+    const int32_t expectedWorkers = swappy::getNumCpus() > 2 ? 2 : 1;
+    constexpr int64_t kWakeupsPerCallback = 7;
+
+    ChoreographerFilter
+            filter(16ms, 10ms, [](std::optional<std::chrono::nanoseconds>) { return 1ms; }, clock);
+    ASSERT_TRUE(spinUntil([&] {
+        return clock.sleepCalls() >= expectedWorkers * kWakeupsPerCallback &&
+                clock.waitingThreads() >= expectedWorkers;
+    }));
+
+    clock.setNow(2'000ms);
+    filter.onChoreographer(0ns);
+    ASSERT_TRUE(spinUntil([&] {
+        return clock.sleepCalls() >= 2 * expectedWorkers * kWakeupsPerCallback &&
+                clock.waitingThreads() >= expectedWorkers;
+    }));
+    const int64_t sleepsBeforeRestart = clock.sleepCalls();
+
+    // With unset Settings display timings (refreshPeriod == 0ns), disabling affinity restarts
+    // workers with constructor timings (16ms period, 10ms appToSfDelay): delta = -6ms smooths
+    // period to 15'760'000ns, base to 2'015'760'000ns, and wake target (-1ms) to 2'030'520'000ns.
+    Settings::getInstance()->setUseAffinity(false);
+
+    ASSERT_TRUE(spinUntil([&] {
+        return clock.sleepCalls() >= sleepsBeforeRestart + expectedWorkers * kWakeupsPerCallback &&
+                clock.waitingThreads() >= expectedWorkers;
+    }));
+    EXPECT_EQ(clock.sleepCalls(), sleepsBeforeRestart + expectedWorkers * kWakeupsPerCallback);
+    EXPECT_EQ(clock.lastWakeTargetNs(), 2'030'520'000);
+}
+
+TEST_F(ChoreographerFilterTest, UseAffinityChangeAppliesDisplayTimingsBeforeRestartingWorkers) {
+    AdvancingClock clock(1'000ms, 0ns);
+    const int32_t expectedWorkers = swappy::getNumCpus() > 2 ? 2 : 1;
+    constexpr int64_t kWakeupsPerCallback = 7;
+
+    Settings::getInstance()->setUseAffinity(false);
+    Settings::getInstance()->setDisplayTimings({10ms, 1ms, 7ms});
+
+    ChoreographerFilter
+            filter(16ms, 0ns, [](std::optional<std::chrono::nanoseconds>) { return 1ms; }, clock);
+    ASSERT_TRUE(spinUntil([&] {
+        return clock.sleepCalls() >= expectedWorkers * kWakeupsPerCallback &&
+                clock.waitingThreads() >= expectedWorkers;
+    }));
+
+    clock.setNow(2'000ms);
+    filter.onChoreographer(0ns);
+    ASSERT_TRUE(spinUntil([&] {
+        return clock.sleepCalls() >= 2 * expectedWorkers * kWakeupsPerCallback &&
+                clock.waitingThreads() >= expectedWorkers;
+    }));
+    const int64_t sleepsBeforeRestart = clock.sleepCalls();
+
+    // Enabling affinity applies Settings display timings (10ms period, 6ms appToSfDelay) before
+    // launching replacement workers: delta = -4ms smooths period to 9'840'000ns, base to
+    // 2'009'840'000ns, and wake target (-1ms) to 2'018'680'000ns.
+    Settings::getInstance()->setUseAffinity(true);
+
+    ASSERT_TRUE(spinUntil([&] {
+        return clock.sleepCalls() >= sleepsBeforeRestart + expectedWorkers * kWakeupsPerCallback &&
+                clock.waitingThreads() >= expectedWorkers;
+    }));
+    EXPECT_EQ(clock.sleepCalls(), sleepsBeforeRestart + expectedWorkers * kWakeupsPerCallback);
+    EXPECT_EQ(clock.lastWakeTargetNs(), 2'018'680'000);
 }
 
 } // namespace

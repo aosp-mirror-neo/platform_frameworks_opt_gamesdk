@@ -162,4 +162,50 @@ TEST(ChoreographerTimerTest, DistinguishesMissingCallbacksFromCallbackAtEpochZer
     EXPECT_EQ(repeatsUntilStopped(immediateTimer, at(0ns)), 6);
 }
 
+TEST(ChoreographerTimerTest, SetDisplayTimingsUpdatesPeriodAndOffsetInPlace) {
+    ChoreographerTimer timer(k60Hz, 0ns, at(1s));
+    timer.addTimestamp(at(1'016'666'667ns));
+
+    // Switch to 120Hz (8'333'333ns) with a 2ms app-to-SF delay.
+    timer.setDisplayTimings(8'333'333ns, 2ms);
+    EXPECT_EQ(nanosSinceEpoch(timer.wakeTime(0ns, at(1'016'666'667ns))), 1'025'000'000);
+
+    // Ignore non-positive refresh periods.
+    timer.setDisplayTimings(0ns, 5ms);
+    EXPECT_EQ(nanosSinceEpoch(timer.wakeTime(0ns, at(1'016'666'667ns))), 1'025'000'000);
+
+    // Next callback arriving 2ms before the 120Hz SF vsync lands cleanly on grid.
+    EXPECT_TRUE(timer.addTimestamp(at(1'023'000'000ns)));
+    EXPECT_EQ(nanosSinceEpoch(timer.wakeTime(0ns, at(1'023'000'000ns))), 1'033'333'333);
+
+    // Repeating an already-seen callback after a large offset increase must not
+    // re-apply the new offset or advance mBaseTime.
+    timer.setDisplayTimings(8'333'333ns, 7ms);
+    EXPECT_TRUE(timer.addTimestamp(at(1'023'000'000ns)));
+    EXPECT_EQ(nanosSinceEpoch(timer.wakeTime(0ns, at(1'023'000'000ns))), 1'033'333'333);
+}
+
+TEST(ChoreographerTimerTest, SetDisplayTimingsRebasesPhaseOnDownshift) {
+    ChoreographerTimer timer(8'333'333ns, 2ms, at(1s));
+    EXPECT_TRUE(timer.addTimestamp(at(1'006'333'333ns), 1));
+
+    // Downshift from 120Hz (8.33ms) to 24Hz (41.67ms); a callback arriving one
+    // old period later re-anchors mBaseTime to the new vsync grid instead of
+    // being dropped as a short interval or skewing mRefreshPeriod.
+    timer.setDisplayTimings(41'666'667ns, 2ms);
+    EXPECT_TRUE(timer.addTimestamp(at(1'014'666'666ns), 2));
+    EXPECT_EQ(nanosSinceEpoch(timer.wakeTime(0ns, at(1'016'666'666ns))), 1'058'333'333);
+
+    // Subsequent 24Hz callback advances by the exact un-skewed 41'666'667ns period.
+    EXPECT_TRUE(timer.addTimestamp(at(1'056'333'333ns), 3));
+    EXPECT_EQ(nanosSinceEpoch(timer.wakeTime(0ns, at(1'058'333'333ns))), 1'100'000'000);
+}
+
+TEST(ChoreographerTimerTest, ZeroRefreshPeriodReturnsNowWithoutLooping) {
+    ChoreographerTimer timer(0ns, 0ns, at(1s));
+
+    EXPECT_TRUE(timer.addTimestamp(at(1'050'000'000ns)));
+    EXPECT_EQ(nanosSinceEpoch(timer.wakeTime(-2ms, at(1'100'000'000ns))), 1'100'000'000);
+}
+
 } // namespace

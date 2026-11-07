@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -73,6 +74,9 @@ private:
     // Time of the latest callback, or std::nullopt before the first one.
     std::optional<std::chrono::steady_clock::time_point> mLastTimestamp GUARDED_BY(mMutex);
     std::optional<std::chrono::nanoseconds> mSfToVsyncDelay GUARDED_BY(mMutex);
+    uint64_t mSettingsGeneration GUARDED_BY(mMutex) = 0;
+    std::chrono::nanoseconds mRefreshPeriod GUARDED_BY(mMutex);
+    std::chrono::nanoseconds mAppToSfDelay GUARDED_BY(mMutex);
 
     std::mutex mWorkMutex;
     // Time of the latest work run, or std::nullopt before the first one.
@@ -81,8 +85,6 @@ private:
     // read it before sleeping without the work mutex.
     std::atomic<std::chrono::nanoseconds> mWorkDuration{};
 
-    std::chrono::nanoseconds mRefreshPeriod;
-    std::chrono::nanoseconds mAppToSfDelay;
     const Worker mDoWork;
     const Clock& mClock;
 };

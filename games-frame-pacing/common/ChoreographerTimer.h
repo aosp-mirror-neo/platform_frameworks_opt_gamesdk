@@ -36,6 +36,17 @@ public:
     ChoreographerTimer(duration refreshPeriod, duration appToSfDelay, time_point now)
           : mRefreshPeriod(refreshPeriod), mAppToSfDelay(appToSfDelay), mBaseTime(now) {}
 
+    void setDisplayTimings(duration refreshPeriod, duration appToSfDelay) {
+        if (refreshPeriod <= duration::zero()) {
+            return;
+        }
+        if (mRefreshPeriod != refreshPeriod || mAppToSfDelay != appToSfDelay) {
+            mRefreshPeriod = refreshPeriod;
+            mAppToSfDelay = appToSfDelay;
+            mRebaseOnNextTimestamp = true;
+        }
+    }
+
     // Records the latest callback timestamp, or std::nullopt when no callback
     // has arrived yet, with the callback sequence number. Returns false after
     // six repeats of the same timestamp and sequence number so the caller can
@@ -51,16 +62,26 @@ public:
                 return false;
             }
             ++mSameTimestampCount;
-        } else {
-            mLastTimestamp = timestamp;
-            mLastSequenceNumber = sequenceNumber;
-            mSameTimestampCount = 1;
+            return true;
         }
+        mLastTimestamp = timestamp;
+        mLastSequenceNumber = sequenceNumber;
+        mSameTimestampCount = 1;
         if (!timestamp.has_value()) {
             return true;
         }
 
+        if (mRefreshPeriod <= duration::zero()) {
+            mBaseTime = *timestamp;
+            return true;
+        }
+
         const time_point point = *timestamp + mAppToSfDelay;
+        if (mRebaseOnNextTimestamp) {
+            mBaseTime = point;
+            mRebaseOnNextTimestamp = false;
+            return true;
+        }
 
         bool moreThanOneRefreshPeriodElapsed = mBaseTime + mRefreshPeriod * 1.5 < point;
         if (moreThanOneRefreshPeriodElapsed) {
@@ -91,6 +112,9 @@ public:
     // the same instant. Offsets exceeding half a refresh period in either
     // direction count as zero.
     [[nodiscard]] time_point wakeTime(duration offset, time_point now) const {
+        if (mRefreshPeriod <= duration::zero()) {
+            return now;
+        }
         if (offset < -(mRefreshPeriod / 2) || offset > mRefreshPeriod / 2) {
             offset = duration::zero();
         }
@@ -104,12 +128,13 @@ public:
 
 private:
     duration mRefreshPeriod;
-    const duration mAppToSfDelay;
+    duration mAppToSfDelay;
     time_point mBaseTime;
 
     std::optional<time_point> mLastTimestamp;
     int64_t mLastSequenceNumber = 0;
     int32_t mSameTimestampCount = 0;
+    bool mRebaseOnNextTimestamp = false;
 };
 
 } // namespace swappy

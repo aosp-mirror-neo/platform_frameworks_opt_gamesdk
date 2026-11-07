@@ -84,27 +84,47 @@ void ChoreographerFilter::terminateThreadsLocked() {
 void ChoreographerFilter::onSettingsChanged() {
     const bool useAffinity = Settings::getInstance()->getUseAffinity();
     const Settings::DisplayTimings displayTimings = Settings::getInstance()->getDisplayTimings();
-    std::lock_guard<std::mutex> lock(mThreadPoolMutex);
-    if (useAffinity == mUseAffinity && mRefreshPeriod == displayTimings.refreshPeriod) {
+    const bool hasDisplayTimings = displayTimings.refreshPeriod > std::chrono::nanoseconds::zero();
+    const std::chrono::nanoseconds appToSfDelay =
+            displayTimings.sfOffset - displayTimings.appOffset;
+
+    std::lock_guard<std::mutex> poolLock(mThreadPoolMutex);
+    if (useAffinity != mUseAffinity) {
+        terminateThreadsLocked();
+        mUseAffinity = useAffinity;
+        if (hasDisplayTimings) {
+            std::lock_guard<std::mutex> lock(mMutex);
+            mRefreshPeriod = displayTimings.refreshPeriod;
+            mAppToSfDelay = appToSfDelay;
+            ++mSettingsGeneration;
+        }
+        launchThreadsLocked();
         return;
     }
 
-    terminateThreadsLocked();
-    mUseAffinity = useAffinity;
-    mRefreshPeriod = displayTimings.refreshPeriod;
-    mAppToSfDelay = displayTimings.sfOffset - displayTimings.appOffset;
+    if (!hasDisplayTimings) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        if (mRefreshPeriod == displayTimings.refreshPeriod && mAppToSfDelay == appToSfDelay) {
+            return;
+        }
+        mRefreshPeriod = displayTimings.refreshPeriod;
+        mAppToSfDelay = appToSfDelay;
+        ++mSettingsGeneration;
+    }
+
     SWAPPY_LOGV("onSettingsChanged(): refreshPeriod=%lld, appOffset=%lld, "
                 "sfOffset=%lld",
                 (long long)displayTimings.refreshPeriod.count(),
                 (long long)displayTimings.appOffset.count(),
                 (long long)displayTimings.sfOffset.count());
-    launchThreadsLocked();
 }
 
 void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
-    ChoreographerTimer timer(mRefreshPeriod, mAppToSfDelay, mClock.now());
-
-    {
+    if (useAffinity) {
         int cpu = getNumCpus() - 1 - thread;
         if (cpu >= 0) {
             setAffinity(cpu);
@@ -115,16 +135,38 @@ void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
     threadName += std::to_string(thread);
     setThreadName(threadName.c_str());
 
+    const auto initialNow = mClock.now();
+    std::chrono::nanoseconds refreshPeriod;
+    std::chrono::nanoseconds appToSfDelay;
+    uint64_t settingsGeneration;
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        refreshPeriod = mRefreshPeriod;
+        appToSfDelay = mAppToSfDelay;
+        settingsGeneration = mSettingsGeneration;
+    }
+    ChoreographerTimer timer(refreshPeriod, appToSfDelay, initialNow);
+
+    auto syncSettingsLocked = [&]() REQUIRES(mMutex) {
+        if (settingsGeneration != mSettingsGeneration) {
+            refreshPeriod = mRefreshPeriod;
+            appToSfDelay = mAppToSfDelay;
+            settingsGeneration = mSettingsGeneration;
+            timer.setDisplayTimings(refreshPeriod, appToSfDelay);
+        }
+    };
+
     while (true) {
         int64_t sequenceNumber;
         std::optional<std::chrono::steady_clock::time_point> timestamp;
         {
             std::lock_guard<std::mutex> lock(mMutex);
             if (!mIsRunning) break;
+            syncSettingsLocked();
             sequenceNumber = mSequenceNumber;
             timestamp = mLastTimestamp;
         }
-        const auto workDuration = mWorkDuration.load();
+        auto workDuration = mWorkDuration.load();
 
         // If we have received the same timestamp multiple times, it probably
         // means that the app has stopped sending them to us, which could
@@ -138,9 +180,11 @@ void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
                     return !mIsRunning || (mSequenceNumber != sequenceNumber);
                 });
                 if (!mIsRunning) break;
+                syncSettingsLocked();
                 sequenceNumber = mSequenceNumber;
                 timestamp = mLastTimestamp;
             }
+            workDuration = mWorkDuration.load();
             timer.addTimestamp(timestamp, sequenceNumber);
         }
 
@@ -150,13 +194,14 @@ void ChoreographerFilter::threadMain(bool useAffinity, int32_t thread) {
         {
             std::lock_guard<std::mutex> lock(mMutex);
             if (!mIsRunning) break;
+            syncSettingsLocked();
             sfToVsyncDelay = mSfToVsyncDelay;
         }
 
         {
             std::lock_guard<std::mutex> workLock(mWorkMutex);
             const auto now = mClock.now();
-            if (detail::isFilterWorkDue(now, mLastWorkRun, mRefreshPeriod)) {
+            if (detail::isFilterWorkDue(now, mLastWorkRun, refreshPeriod)) {
                 // Assume we got here first and there's work to do
                 gamesdk::ScopedTrace trace("doWork");
                 mWorkDuration.store(mDoWork(sfToVsyncDelay));
