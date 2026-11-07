@@ -59,6 +59,7 @@ set(SWAPPY_HOST_COMMON_SOURCES
   classicpacingimpl_test.cpp
   clock_test.cpp
   framedurations_test.cpp
+  refreshperiodset_test.cpp
   swapintervalladder_test.cpp
   ../../games-frame-pacing/common/ChoreographerFilter.cpp
   ../../games-frame-pacing/common/Settings.cpp

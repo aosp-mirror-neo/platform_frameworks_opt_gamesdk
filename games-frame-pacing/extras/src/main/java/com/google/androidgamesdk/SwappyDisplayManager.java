@@ -15,6 +15,8 @@ import android.util.Log;
 import android.view.Display;
 import android.view.Window;
 import android.view.WindowManager;
+import java.lang.reflect.Method;
+import java.util.Arrays;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -24,14 +26,58 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
     final private boolean DEBUG = false;
     final private long ONE_MS_IN_NS = 1000000;
     final private long ONE_S_IN_NS = ONE_MS_IN_NS * 1000;
+    private static final int NO_MODE_ID = -1;
+    private static final int ANDROID_16_SDK_INT = 36;
+    private static final Method sHasArrSupportMethod = resolveHasArrSupportMethod();
 
     private long mCookie;
     private Activity mActivity;
     private DisplayManager mDisplayManager;
     private WindowManager mWindowManager;
     private Display.Mode mCurrentMode;
+    private float mCurrentRefreshRate;
+    private boolean mForwardRefreshCallbacks;
 
     private LooperThread mLooper;
+
+    private static Method resolveHasArrSupportMethod() {
+        if (Build.VERSION.SDK_INT < ANDROID_16_SDK_INT) {
+            return null;
+        }
+        try {
+            return Display.class.getMethod("hasArrSupport");
+        } catch (NoSuchMethodException e) {
+            return null;
+        }
+    }
+
+    private static boolean hasArrSupport(Display display) {
+        if (sHasArrSupportMethod == null) {
+            return false;
+        }
+        try {
+            Object result = sHasArrSupportMethod.invoke(display);
+            return (result instanceof Boolean) && (Boolean) result;
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            return false;
+        }
+    }
+
+    // Mirrors native SwappyDisplayManager::useSwappyDisplayManager: on API 31+
+    // (and API 30 S preview), NDKChoreographerThread owns refresh-rate callbacks.
+    private static boolean shouldForwardRefreshCallbacks() {
+        return !(Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                || (Build.VERSION.SDK_INT == Build.VERSION_CODES.R
+                        && Build.VERSION.PREVIEW_SDK_INT == 1));
+    }
+
+    private static boolean isValidRefreshRate(float refreshRate) {
+        return refreshRate > 0.0f && !Float.isNaN(refreshRate) && !Float.isInfinite(refreshRate);
+    }
+
+    private long toPeriodNanos(float refreshRate) {
+        return Math.round((double) ONE_S_IN_NS / (double) refreshRate);
+    }
 
     private class LooperThread extends Thread {
         public Handler mHandler;
@@ -90,11 +136,13 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
 
         mCookie = cookie;
         mActivity = activity;
+        mForwardRefreshCallbacks = shouldForwardRefreshCallbacks();
 
         mDisplayManager = mActivity.getSystemService(DisplayManager.class);
         mWindowManager = mActivity.getSystemService(WindowManager.class);
         Display display = mWindowManager.getDefaultDisplay();
         mCurrentMode = display.getMode();
+        mCurrentRefreshRate = display.getRefreshRate();
         updateSupportedRefreshRates(display);
 
         // Register display listener callbacks
@@ -105,30 +153,74 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
         }
     }
 
-    private void updateSupportedRefreshRates(Display display) {
-        Display.Mode[] supportedModes = display.getSupportedModes();
-        int totalModes = 0;
-        for (int i = 0; i < supportedModes.length; i++) {
-            if (!modeMatchesCurrentResolution(supportedModes[i])) {
-                continue;
-            }
-            totalModes++;
+    private static final class RefreshRateList {
+        long[] mPeriods;
+        int[] mModeIds;
+        int mSize;
+
+        RefreshRateList(int initialCapacity) {
+            int capacity = Math.max(8, initialCapacity);
+            mPeriods = new long[capacity];
+            mModeIds = new int[capacity];
         }
 
-        long[] supportedRefreshPeriods = new long[totalModes];
-        int[] supportedDisplayModeIds = new int[totalModes];
-        totalModes = 0;
+        void add(long periodNanos, int modeId) {
+            if (mSize == mPeriods.length) {
+                mPeriods = Arrays.copyOf(mPeriods, mPeriods.length * 2);
+                mModeIds = Arrays.copyOf(mModeIds, mModeIds.length * 2);
+            }
+            mPeriods[mSize] = periodNanos;
+            mModeIds[mSize] = modeId;
+            mSize++;
+        }
+    }
+
+    private void updateSupportedRefreshRates(Display display) {
+        Display.Mode[] supportedModes = display.getSupportedModes();
+        if (supportedModes == null) {
+            supportedModes = new Display.Mode[0];
+        }
+
+        RefreshRateList rates = new RefreshRateList(supportedModes.length * 2);
         for (int i = 0; i < supportedModes.length; i++) {
-            if (!modeMatchesCurrentResolution(supportedModes[i])) {
+            Display.Mode mode = supportedModes[i];
+            if (!modeMatchesCurrentResolution(mode)) {
                 continue;
             }
-            supportedRefreshPeriods[totalModes] =
-                    (long) (ONE_S_IN_NS / supportedModes[i].getRefreshRate());
-            supportedDisplayModeIds[totalModes] = supportedModes[i].getModeId();
-            totalModes++;
+            float modeRate = mode.getRefreshRate();
+            if (isValidRefreshRate(modeRate)) {
+                rates.add(toPeriodNanos(modeRate), mode.getModeId());
+            }
+
+            // API 31 (S) adds Mode.getAlternativeRefreshRates() for rates that
+            // switch without a mode reset, covering devices where
+            // Display.hasArrSupport() is false or unavailable.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                float[] altRates = mode.getAlternativeRefreshRates();
+                if (altRates != null) {
+                    for (int j = 0; j < altRates.length; j++) {
+                        if (isValidRefreshRate(altRates[j])) {
+                            rates.add(toPeriodNanos(altRates[j]), NO_MODE_ID);
+                        }
+                    }
+                }
+            }
         }
+
+        if (hasArrSupport(display)) {
+            float[] arrRates = display.getSupportedRefreshRates();
+            if (arrRates != null) {
+                for (int i = 0; i < arrRates.length; i++) {
+                    if (isValidRefreshRate(arrRates[i])) {
+                        rates.add(toPeriodNanos(arrRates[i]), NO_MODE_ID);
+                    }
+                }
+            }
+        }
+
         // Call down to native to set the supported refresh rates
-        nSetSupportedRefreshPeriods(mCookie, supportedRefreshPeriods, supportedDisplayModeIds);
+        nSetSupportedRefreshPeriods(mCookie, Arrays.copyOf(rates.mPeriods, rates.mSize),
+                Arrays.copyOf(rates.mModeIds, rates.mSize));
     }
 
     // Called from native SwappyDisplayManager.cpp
@@ -149,6 +241,11 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
     }
 
     // Called from native SwappyDisplayManager.cpp
+    public synchronized void enableRefreshCallbackForwarding() {
+        mForwardRefreshCallbacks = true;
+    }
+
+    // Called from native SwappyDisplayManager.cpp
     public void terminate() {
         mDisplayManager.unregisterDisplayListener(this);
         mLooper.mHandler.getLooper().quit();
@@ -166,22 +263,24 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
             Display display = mWindowManager.getDefaultDisplay();
             float newRefreshRate = display.getRefreshRate();
             Display.Mode newMode = display.getMode();
+            boolean modeChanged = newMode.getModeId() != mCurrentMode.getModeId();
             boolean resolutionChanged =
                     (newMode.getPhysicalWidth() != mCurrentMode.getPhysicalWidth())
-                    | (newMode.getPhysicalHeight() != mCurrentMode.getPhysicalHeight());
-            boolean refreshRateChanged = (newRefreshRate != mCurrentMode.getRefreshRate());
+                    || (newMode.getPhysicalHeight() != mCurrentMode.getPhysicalHeight());
+            boolean refreshRateChanged = (newRefreshRate != mCurrentRefreshRate);
             mCurrentMode = newMode;
+            mCurrentRefreshRate = newRefreshRate;
 
-            if (resolutionChanged) {
+            if (resolutionChanged || (modeChanged && hasArrSupport(display))) {
                 updateSupportedRefreshRates(display);
             }
 
-            if (refreshRateChanged) {
+            if (mForwardRefreshCallbacks && refreshRateChanged
+                    && isValidRefreshRate(newRefreshRate)) {
                 final long appVsyncOffsetNanos = display.getAppVsyncOffsetNanos();
-                final long vsyncPresentationDeadlineNanos =
-                        mWindowManager.getDefaultDisplay().getPresentationDeadlineNanos();
+                final long vsyncPresentationDeadlineNanos = display.getPresentationDeadlineNanos();
 
-                final long vsyncPeriodNanos = (long) (ONE_S_IN_NS / newRefreshRate);
+                final long vsyncPeriodNanos = toPeriodNanos(newRefreshRate);
                 final long sfVsyncOffsetNanos =
                         vsyncPeriodNanos - (vsyncPresentationDeadlineNanos - ONE_MS_IN_NS);
 

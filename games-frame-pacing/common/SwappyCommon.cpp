@@ -276,6 +276,9 @@ void SwappyCommon::onChoreographer(int64_t frameTimeNanos) {
 
     if (!mUsingExternalChoreographer) {
         mUsingExternalChoreographer = true;
+        if (mDisplayManager) {
+            mDisplayManager->enableRefreshCallbackForwarding();
+        }
         mChoreographerThread = ChoreographerThread::createChoreographerThread(
                 ChoreographerThread::Type::App, nullptr, nullptr,
                 [this](std::optional<std::chrono::nanoseconds> sfToVsyncDelay) {
@@ -638,9 +641,12 @@ void SwappyCommon::setPreferredRefreshPeriod(nanoseconds frameTime) {
         //      Shortest swap period that can still accommodate the frame time
         //      and that has the longest refresh period possible to optimize
         //      power consumption.
-        std::pair<nanoseconds, int> bestRefreshConfig;
+        std::pair<nanoseconds, int> bestRefreshConfig{0ns, -1};
         nanoseconds minSwapDuration = 1s;
         for (const auto& refreshConfig : *mSupportedRefreshPeriods) {
+            if (refreshConfig.second < 0) {
+                continue;
+            }
             const auto period = refreshConfig.first;
             const int swapIntervalForPeriod = calculateSwapInterval(frameTime, period);
             const nanoseconds swapDuration = period * swapIntervalForPeriod;
@@ -906,16 +912,7 @@ int SwappyCommon::getSupportedRefreshPeriodsNS(uint64_t* out_refreshrates, int a
         mSupportedRefreshPeriods = mDisplayManager->getSupportedRefreshPeriods();
     }
 
-    if (!mSupportedRefreshPeriods) return 0;
-    if (!out_refreshrates) return (*mSupportedRefreshPeriods).size();
-
-    int counter = 0;
-    for (const auto& pair : *mSupportedRefreshPeriods) {
-        out_refreshrates[counter] = pair.first.count();
-        ++counter;
-    }
-
-    return (*mSupportedRefreshPeriods).size();
+    return copyRefreshPeriods(mSupportedRefreshPeriods.get(), out_refreshrates, allocated_entries);
 }
 
 void SwappyCommon::resetFramePacing() {
@@ -961,4 +958,4 @@ extern "C" __attribute__((used, visibility("default"))) void Swappy_flushCoverag
         __gcov_flush();
     }
 }
-#endif  // AGDK_COVERAGE
+#endif // AGDK_COVERAGE
