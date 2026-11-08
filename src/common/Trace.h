@@ -16,12 +16,74 @@
 
 #pragma once
 
-#ifdef __ANDROID__
-#include <android/log.h>
+#ifndef TRACE
+#define TRACE 1
 #endif
-#include <dlfcn.h>
+
+#if TRACE == 0
 
 #include <cstdint>
+#include <memory>
+
+namespace gamesdk {
+
+class Trace {
+public:
+    static std::unique_ptr<Trace> create() {
+        return std::make_unique<Trace>();
+    }
+    static Trace* getInstance() {
+        static Trace trace;
+        return &trace;
+    }
+    bool isAvailable() const {
+        return false;
+    }
+    bool isEnabled() const {
+        return false;
+    }
+    void beginSection(const char*) const {}
+    void endSection() const {}
+    void beginAsyncSection(const char*, int64_t) {}
+    void endAsyncSection(const char*, int64_t) {}
+    void setCounter(const char*, int64_t) {}
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((format(printf, 2, 3)))
+#endif
+    void instant(const char*, ...) const {
+    }
+    bool supportsBasicATrace() const {
+        return false;
+    }
+    bool supportsFullATrace() const {
+        return false;
+    }
+};
+
+struct ScopedTrace {
+    explicit ScopedTrace(const char*) {}
+};
+
+} // namespace gamesdk
+
+#define TRACE_CALL() ((void)0)
+#define TRACE_SCOPE(name) ((void)0)
+#define TRACE_INT(name, value) ((void)0)
+#define TRACE_INSTANT(...) ((void)0)
+#define TRACE_ENABLED() false
+// Declares a member that exists only when tracing is compiled in.
+#define TRACE_MEMBER(type, name) static_assert(true, "")
+
+#else // TRACE != 0
+
+#ifdef __ANDROID__
+#include <android/log.h>
+#include <dlfcn.h>
+#endif
+
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
 #include <memory>
 
 namespace gamesdk {
@@ -53,6 +115,7 @@ public:
             ATrace_setCounter(setCounter) {}
 
     static std::unique_ptr<Trace> create() {
+#ifdef __ANDROID__
         void* libandroid = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
         if (!libandroid) {
             return std::make_unique<Trace>();
@@ -93,6 +156,9 @@ public:
 
         return std::make_unique<Trace>(beginSection, endSection, isEnabled, beginAsyncSection,
                                        endAsyncSection, setCounter);
+#else
+        return std::make_unique<Trace>();
+#endif
     }
 
     bool isAvailable() const {
@@ -143,6 +209,29 @@ public:
         ATrace_setCounter(name, value);
     }
 
+    // Emits a zero-length trace section with a printf-formatted name.
+    // Does nothing when tracing is disabled or unavailable.
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((format(printf, 2, 3)))
+#endif
+    void instant(const char* format, ...) const {
+        if (!isAvailable() || !isEnabled()) {
+            return;
+        }
+
+        char name[256];
+        va_list args;
+        va_start(args, format);
+        const int written = vsnprintf(name, sizeof(name), format, args);
+        va_end(args);
+        if (written < 0) {
+            return;
+        }
+
+        beginSection(name);
+        endSection();
+    }
+
     bool supportsBasicATrace() const {
         return ATrace_beginSection && ATrace_endSection;
     }
@@ -153,11 +242,17 @@ public:
     }
 
     static Trace* getInstance() {
-        static std::unique_ptr<Trace> trace = Trace::create();
-        return trace.get();
-    };
+        return instanceStorage().get();
+    }
 
 private:
+    friend struct TraceTestPeer;
+
+    static std::unique_ptr<Trace>& instanceStorage() {
+        static std::unique_ptr<Trace> trace = Trace::create();
+        return trace;
+    }
+
     const ATrace_beginSection_type ATrace_beginSection = nullptr;
     const ATrace_endSection_type ATrace_endSection = nullptr;
     const ATrace_isEnabled_type ATrace_isEnabled = nullptr;
@@ -168,7 +263,10 @@ private:
 };
 
 struct ScopedTrace {
-    ScopedTrace(const char* name) {
+    explicit ScopedTrace(const char* name) {
+        if (!name) {
+            return;
+        }
         Trace* trace = Trace::getInstance();
         if (!trace->isAvailable() || !trace->isEnabled()) {
             return;
@@ -196,5 +294,22 @@ private:
 #define PASTE_HELPER_HELPER(a, b) a##b
 #define PASTE_HELPER(a, b) PASTE_HELPER_HELPER(a, b)
 #define TRACE_CALL() gamesdk::ScopedTrace PASTE_HELPER(scopedTrace, __LINE__)(__PRETTY_FUNCTION__)
-#define TRACE_INT(name, value) gamesdk::Trace::getInstance()->setCounter(name, value)
+#define TRACE_SCOPE(name) \
+    gamesdk::ScopedTrace PASTE_HELPER(scopedTrace, __LINE__)(TRACE_ENABLED() ? (name) : nullptr)
+#define TRACE_INT(name, value)                                          \
+    do {                                                                \
+        if (TRACE_ENABLED()) {                                          \
+            gamesdk::Trace::getInstance()->setCounter((name), (value)); \
+        }                                                               \
+    } while (0)
+#define TRACE_INSTANT(...)                                       \
+    do {                                                         \
+        if (TRACE_ENABLED()) {                                   \
+            gamesdk::Trace::getInstance()->instant(__VA_ARGS__); \
+        }                                                        \
+    } while (0)
 #define TRACE_ENABLED() gamesdk::Trace::getInstance()->isEnabled()
+// Declares a member that exists only when tracing is compiled in.
+#define TRACE_MEMBER(type, name) type name
+
+#endif // TRACE != 0

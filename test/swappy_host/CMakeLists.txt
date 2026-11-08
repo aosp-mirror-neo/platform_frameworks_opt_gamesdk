@@ -49,9 +49,10 @@ include_directories(
   ../../games-frame-pacing/common
   ../../include
   ../../src/common
+  ../../test/common
 )
 
-add_executable(swappy_host_test
+set(SWAPPY_HOST_COMMON_SOURCES
   swappy_host_test.cpp
   choreographerfilter_test.cpp
   choreographertimer_test.cpp
@@ -64,7 +65,17 @@ add_executable(swappy_host_test
   ../../games-frame-pacing/common/Thread.cpp
 )
 
-target_link_libraries(swappy_host_test
+set(SWAPPY_HOST_TEST_SOURCES
+  ${SWAPPY_HOST_COMMON_SOURCES}
+  ../common/trace_test.cpp
+)
+
+set(SWAPPY_HOST_TRACE_OFF_TEST_SOURCES
+  ${SWAPPY_HOST_COMMON_SOURCES}
+  ../common/trace_off_test.cpp
+)
+
+set(SWAPPY_HOST_TEST_LIBS
   GTest::gtest
   GTest::gtest_main
   Threads::Threads
@@ -73,4 +84,12 @@ target_link_libraries(swappy_host_test
 
 enable_testing()
 include(GoogleTest)
+
+add_executable(swappy_host_test ${SWAPPY_HOST_TEST_SOURCES})
+target_link_libraries(swappy_host_test ${SWAPPY_HOST_TEST_LIBS})
 gtest_discover_tests(swappy_host_test PROPERTIES TIMEOUT 10)
+
+add_executable(swappy_host_trace_off_test ${SWAPPY_HOST_TRACE_OFF_TEST_SOURCES})
+target_compile_definitions(swappy_host_trace_off_test PRIVATE TRACE=0)
+target_link_libraries(swappy_host_trace_off_test ${SWAPPY_HOST_TEST_LIBS})
+gtest_discover_tests(swappy_host_trace_off_test TEST_PREFIX "trace_off." PROPERTIES TIMEOUT 10)

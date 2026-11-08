@@ -847,6 +847,10 @@ task hostUnitTests {
             workingDir buildInfo.outputFolder
             commandLine "./swappy_host_test"
         }
+        exec {
+            workingDir buildInfo.outputFolder
+            commandLine "./swappy_host_trace_off_test"
+        }
     }
 }
 
