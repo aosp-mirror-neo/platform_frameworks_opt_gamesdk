@@ -27,6 +27,7 @@
 #include "CPUTracer.h"
 #include "ChoreographerFilter.h"
 #include "ChoreographerThread.h"
+#include "DisplayRateController.h"
 #include "FrameDurations.h"
 #include "PacingImplementation.h"
 #include "SwappyDisplayManager.h"
@@ -169,7 +170,7 @@ private:
     void waitUntil(int32_t target);
     void waitUntilTargetFrame();
     void waitOneFrame();
-    void setPreferredDisplayModeId(int index);
+    void setPreferredDisplayModeId(int index) REQUIRES(mMutex);
     void setPreferredRefreshPeriod(std::chrono::nanoseconds frameTime) REQUIRES(mMutex);
     void updateDisplayTimings();
 
@@ -236,7 +237,6 @@ private:
 
     constexpr static bool USE_DISPLAY_MANAGER = true;
     std::unique_ptr<SwappyDisplayManager> mDisplayManager;
-    int mNextModeId = -1;
 
     std::shared_ptr<SwappyDisplayManager::RefreshPeriodMap> mSupportedRefreshPeriods;
 
@@ -267,8 +267,7 @@ private:
 
     ANativeWindow* mWindow GUARDED_BY(mMutex) = nullptr;
     bool mWindowChanged GUARDED_BY(mMutex) = false;
-    float mLatestFrameRateVote GUARDED_BY(mMutex) = 0.f;
-    static constexpr float FRAME_RATE_VOTE_MARGIN = 1.f; // 1Hz
+    DisplayRateController mDisplayRateController GUARDED_BY(mMutex);
 
     // Callback for last latency recorded - used for buffer stuffing fix.
     // Latency is returned in number of V-syncs

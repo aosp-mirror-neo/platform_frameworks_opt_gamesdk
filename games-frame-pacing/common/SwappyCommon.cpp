@@ -406,7 +406,7 @@ void SwappyCommon::updateDisplayTimings() {
         setPreferredRefreshPeriod(mSwapDuration);
     }
 
-    if (mNextModeId == -1 && mLatestFrameRateVote == 0) {
+    if (!mDisplayRateController.hasVoted()) {
         setPreferredRefreshPeriod(mSwapDuration);
     }
 
@@ -610,66 +610,35 @@ void SwappyCommon::setAutoPipelineMode(bool enabled) {
 }
 
 void SwappyCommon::setPreferredDisplayModeId(int modeId) {
-    if (!mDisplayManager || modeId < 0 || mNextModeId == modeId) {
+    if (!mDisplayManager || modeId < 0) {
         return;
     }
 
-    mNextModeId = modeId;
     mDisplayManager->setPreferredDisplayModeId(modeId);
     SWAPPY_LOGV("setPreferredDisplayModeId set to %d", modeId);
 }
 
 void SwappyCommon::setPreferredRefreshPeriod(nanoseconds frameTime) {
     if (mANativeWindow_setFrameRate && mWindow) {
-        auto frameRate = 1e9f / frameTime.count();
-
-        frameRate = std::min(frameRate, 1e9f / (mSwapDuration).count());
-        if (std::abs(mLatestFrameRateVote - frameRate) > FRAME_RATE_VOTE_MARGIN) {
-            mLatestFrameRateVote = frameRate;
-            SWAPPY_LOGV("ANativeWindow_setFrameRate(%.2f)", frameRate);
-            mANativeWindow_setFrameRate(mWindow, frameRate,
+        const auto votedHz = mDisplayRateController.voteFrameRateHz(frameTime, mSwapDuration);
+        if (votedHz.has_value()) {
+            SWAPPY_LOGV("ANativeWindow_setFrameRate(%.2f)", *votedHz);
+            mANativeWindow_setFrameRate(mWindow, *votedHz,
                                         ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT);
         }
 
+        const auto frameRate = std::min(1e9f / frameTime.count(), 1e9f / mSwapDuration.count());
         TRACE_INT("preferredRefreshPeriod", (int)frameRate);
     } else {
         if (!mDisplayManager || !mSupportedRefreshPeriods) {
             return;
         }
-        // Loop across all supported refresh periods to find the best refresh
-        // period. Best refresh period means:
-        //      Shortest swap period that can still accommodate the frame time
-        //      and that has the longest refresh period possible to optimize
-        //      power consumption.
-        std::pair<nanoseconds, int> bestRefreshConfig{0ns, -1};
-        nanoseconds minSwapDuration = 1s;
-        for (const auto& refreshConfig : *mSupportedRefreshPeriods) {
-            if (refreshConfig.second < 0) {
-                continue;
-            }
-            const auto period = refreshConfig.first;
-            const int swapIntervalForPeriod = calculateSwapInterval(frameTime, period);
-            const nanoseconds swapDuration = period * swapIntervalForPeriod;
-
-            // Don't allow swapping faster than mSwapDuration (see public
-            // header)
-            if (swapDuration + FRAME_MARGIN < mSwapDuration) {
-                continue;
-            }
-
-            // We iterate in ascending order of refresh period, so accepting any
-            // better or equal-within-margin duration here chooses the longest
-            // refresh period possible.
-            if (swapDuration < minSwapDuration + FRAME_MARGIN) {
-                minSwapDuration = swapDuration;
-                bestRefreshConfig = refreshConfig;
-            }
-        }
-
-        // Switch if we have a potentially better refresh rate
-        {
-            TRACE_INT("preferredRefreshPeriod", bestRefreshConfig.first.count());
-            setPreferredDisplayModeId(bestRefreshConfig.second);
+        const auto selection =
+                mDisplayRateController.selectDisplayMode(mSupportedRefreshPeriods.get(), frameTime,
+                                                         mSwapDuration);
+        TRACE_INT("preferredRefreshPeriod", selection.refreshPeriod.count());
+        if (selection.changed) {
+            setPreferredDisplayModeId(selection.modeId);
         }
     }
 }
@@ -828,7 +797,7 @@ void SwappyCommon::setANativeWindow(ANativeWindow* window) {
     if (mWindow != nullptr) {
         ANativeWindow_acquire(mWindow);
         mWindowChanged = true;
-        mLatestFrameRateVote = 0;
+        mDisplayRateController.onWindowChanged();
     }
 }
 
