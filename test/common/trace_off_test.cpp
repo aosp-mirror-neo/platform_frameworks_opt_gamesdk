@@ -16,31 +16,33 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <type_traits>
 
 #include "Trace.h"
 
-#if !defined(TRACE) || TRACE != 0
-#error "trace_off_test.cpp must be compiled with -DTRACE=0"
+#if !defined(AGDK_TRACE) || AGDK_TRACE != 0
+#error "trace_off_test.cpp must be compiled with -DAGDK_TRACE=0"
 #endif
 
 namespace {
 
 static_assert(std::is_trivially_destructible_v<gamesdk::ScopedTrace>,
-              "ScopedTrace stub must be trivially destructible when TRACE == 0");
+              "ScopedTrace stub must be trivially destructible when AGDK_TRACE == 0");
 
 struct MockTraceOffLayout {
     uint64_t baselineField = 0;
-    TRACE_MEMBER(uint64_t, traceField);
+    TRACE_MEMBER(uint64_t traceField = 42);
+    TRACE_MEMBER(std::array<uint64_t, 2> tracePair = {1, 2});
 };
 
 static_assert(sizeof(MockTraceOffLayout) == sizeof(uint64_t),
-              "TRACE_MEMBER must add 0 bytes when TRACE == 0");
+              "TRACE_MEMBER must add 0 bytes when AGDK_TRACE == 0");
 
 TEST(TraceOffHostTest, MacrosCompileOutWithoutEvaluatingArguments) {
-    static_assert(!TRACE_ENABLED(), "TRACE_ENABLED() must be false when TRACE == 0");
+    static_assert(!TRACE_ENABLED(), "TRACE_ENABLED() must be false when AGDK_TRACE == 0");
     EXPECT_FALSE(TRACE_ENABLED());
 
     MockTraceOffLayout holder;
