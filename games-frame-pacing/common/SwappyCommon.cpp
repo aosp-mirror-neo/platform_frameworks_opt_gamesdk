@@ -38,10 +38,13 @@ std::unique_ptr<PacingImplementation> PacingImplementation::create() {
     return std::make_unique<ClassicPacingImplementation>();
 }
 
-SwappyCommon::SwappyCommon(std::unique_ptr<SwappyPlatform> platform)
+SwappyCommon::SwappyCommon(std::unique_ptr<SwappyPlatform> platform, const Clock& clock)
       : mPlatform(std::move(platform)),
+        mClock(clock),
+        mCurrentFrameTimestamp(mClock.now()),
         mMeasuredSwapDuration(nanoseconds(0)),
         mAutoSwapInterval(1),
+        mPresentationTime(mClock.now()),
         mValid(false) {
     if (!mPlatform || !mPlatform->isValid()) {
         mPlatform.reset();
@@ -50,12 +53,13 @@ SwappyCommon::SwappyCommon(std::unique_ptr<SwappyPlatform> platform)
 
     mCommonSettings = mPlatform->getInitialSettings();
 
-    mChoreographerFilter = std::make_unique<
-            ChoreographerFilter>(mCommonSettings.refreshPeriod,
-                                 mCommonSettings.sfVsyncOffset - mCommonSettings.appVsyncOffset,
-                                 [this](std::optional<std::chrono::nanoseconds> sfToVsyncDelay) {
-                                     return wakeClient(sfToVsyncDelay);
-                                 });
+    mChoreographerFilter = std::make_unique<ChoreographerFilter>(
+            mCommonSettings.refreshPeriod,
+            mCommonSettings.sfVsyncOffset - mCommonSettings.appVsyncOffset,
+            [this](std::optional<std::chrono::nanoseconds> sfToVsyncDelay) {
+                return wakeClient(sfToVsyncDelay);
+            },
+            mClock);
 
     mUsingExternalChoreographer = mPlatform->startsWithExternalChoreographer();
 
@@ -106,7 +110,7 @@ nanoseconds SwappyCommon::wakeClient(std::optional<std::chrono::nanoseconds> sfT
     // better to be a little late than a little early (since a little early
     // could cause our frame to be picked up prematurely), so we pad by an
     // additional millisecond.
-    mCurrentFrameTimestamp = std::chrono::steady_clock::now() + mMeasuredSwapDuration.load() + 1ms;
+    mCurrentFrameTimestamp = mClock.now() + mMeasuredSwapDuration.load() + 1ms;
 
     mSfToVsyncDelay = sfToVsyncDelay;
     mWaitingCondition.notify_all();
@@ -146,9 +150,8 @@ bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
     bool localBlockingWaitEnabled = mBlockingWaitEnabled || mFramePacingEnabled;
     mMutex.unlock();
 
-    const nanoseconds cpuTime = (mStartFrameTime.time_since_epoch().count() == 0)
-            ? 0ns
-            : std::chrono::steady_clock::now() - mStartFrameTime;
+    const nanoseconds cpuTime =
+            mStartFrameTime.has_value() ? (mClock.now() - *mStartFrameTime) : 0ns;
     mCPUTracer.endTrace();
 
     preWaitCallbacks();
@@ -178,7 +181,14 @@ bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
     const nanoseconds gpuTime = (h.lastFrameIsComplete()) ? h.getPrevFrameGpuTime() : -1ns;
 
     // Keep track of durations only if frame pacing is enabled.
-    if (localFramePacingEnabled) addFrameDuration({cpuTime, gpuTime, mCurrentFrame > mTargetFrame});
+    if (localFramePacingEnabled) {
+        bool frameMissed = false;
+        {
+            std::lock_guard<std::mutex> lock(mWaitingMutex);
+            frameMissed = mCurrentFrame > mTargetFrame;
+        }
+        addFrameDuration({cpuTime, gpuTime, frameMissed});
+    }
 
     postWaitCallbacks(cpuTime, gpuTime);
 
@@ -273,14 +283,14 @@ void SwappyCommon::onPreSwap(const SwapHandlers& h) {
                                    mAutoSwapIntervalThreshold.load());
     }
 
-    mSwapTime = std::chrono::steady_clock::now();
+    mSwapTime = mClock.now();
     preSwapBuffersCallbacks();
 }
 
 void SwappyCommon::onPostSwap(const SwapHandlers& h) {
     postSwapBuffersCallbacks();
 
-    updateMeasuredSwapDuration(std::chrono::steady_clock::now() - mSwapTime);
+    updateMeasuredSwapDuration(mClock.now() - mSwapTime);
 
     if (mPipelineMode == PipelineMode::Off) {
         waitForNextFrame(h);
@@ -323,7 +333,7 @@ void SwappyCommon::addFrameDuration(FrameDuration duration) {
     SWAPPY_LOGV("frame %s", duration.frameMiss() ? "MISS" : "on time");
 
     std::lock_guard<std::mutex> lock(mMutex);
-    mFrameDurations.add(duration, std::chrono::steady_clock::now());
+    mFrameDurations.add(duration, mClock.now());
 }
 
 bool SwappyCommon::updateSwapInterval() {
@@ -420,8 +430,8 @@ void SwappyCommon::postWaitCallbacks(nanoseconds cpuTime, nanoseconds gpuTime) {
     executeTracers(mInjectedTracers.postWait, cpuTime.count(), gpuTime.count());
 }
 
-void SwappyCommon::startFrameCallbacks() {
-    executeTracers(mInjectedTracers.startFrame, mCurrentFrame,
+void SwappyCommon::startFrameCallbacks(int32_t currentFrame) {
+    executeTracers(mInjectedTracers.startFrame, currentFrame,
                    (int64_t)mPresentationTime.time_since_epoch().count());
 }
 
@@ -498,10 +508,10 @@ void SwappyCommon::startFrame() {
     TRACE_CALL();
 
     int32_t currentFrame;
-    std::chrono::steady_clock::time_point currentFrameTimestamp;
+    Clock::time_point currentFrameTimestamp;
     std::optional<std::chrono::nanoseconds> sfToVsyncDelay;
     {
-        std::unique_lock<std::mutex> lock(mWaitingMutex);
+        std::lock_guard<std::mutex> lock(mWaitingMutex);
         currentFrame = mCurrentFrame;
         currentFrameTimestamp = mCurrentFrameTimestamp;
         sfToVsyncDelay = mSfToVsyncDelay;
@@ -552,16 +562,20 @@ void SwappyCommon::startFrame() {
     mPresentationTime =
             currentFrameTimestamp + (mAutoSwapInterval * intervals) * mCommonSettings.refreshPeriod;
 
-    mStartFrameTime = std::chrono::steady_clock::now();
+    mStartFrameTime = mClock.now();
     mCPUTracer.startTrace();
 
-    startFrameCallbacks();
+    startFrameCallbacks(currentFrame);
 }
 
 void SwappyCommon::waitUntil(int32_t target) {
     TRACE_CALL();
-    std::unique_lock<std::mutex> lock(mWaitingMutex);
-    mWaitingCondition.wait(lock, [&]() {
+    std::lock_guard<std::mutex> lock(mWaitingMutex);
+    waitUntilLocked(target);
+}
+
+void SwappyCommon::waitUntilLocked(int32_t target) {
+    mClock.wait(mWaitingMutex, mWaitingCondition, [&]() REQUIRES(mWaitingMutex) {
         if (mCurrentFrame < target) {
             if (!mUsingExternalChoreographer && mPlatform) {
                 mPlatform->postFrameCallbacks();
@@ -577,7 +591,9 @@ void SwappyCommon::waitUntilTargetFrame() {
 }
 
 void SwappyCommon::waitOneFrame() {
-    waitUntil(mCurrentFrame + 1);
+    TRACE_CALL();
+    std::lock_guard<std::mutex> lock(mWaitingMutex);
+    waitUntilLocked(mCurrentFrame + 1);
 }
 
 void SwappyCommon::setANativeWindow(ANativeWindow* window) {

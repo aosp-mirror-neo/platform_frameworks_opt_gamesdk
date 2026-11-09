@@ -16,18 +16,24 @@
 
 #include "SwappyCommon.h"
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 
+#include "Clock.h"
 #include "RefreshPeriodSet.h"
 #include "SdkVersion.h"
 #include "Settings.h"
 #include "SwappyPlatform.h"
+#include "Thread.h"
 #include "gtest/gtest.h"
 #include "swappy/swappy_common.h"
 
@@ -38,7 +44,10 @@ struct ANativeWindow {
 namespace {
 
 using namespace std::chrono_literals;
+using swappy::Clock;
+using swappy::getNumCpus;
 using swappy::insertRefreshPeriod;
+using swappy::PipelineMode;
 using swappy::RefreshPeriodMap;
 using swappy::SdkVersion;
 using swappy::Settings;
@@ -47,6 +56,7 @@ using swappy::SwappyCommonSettings;
 using swappy::SwappyPlatform;
 
 constexpr auto k60HzPeriod = 16'666'667ns;
+constexpr auto k30HzPeriod = 33'333'334ns;
 constexpr auto k120HzPeriod = 8'333'333ns;
 constexpr auto kFastTickPeriod = 1ms;
 
@@ -84,6 +94,7 @@ struct PlatformSharedState {
     std::vector<int> preferredModeIds;
     int postFrameCallbacksCount = 0;
     int switchToExternalChoreographerCount = 0;
+    bool choreographerCallbackArmed = false;
 };
 
 struct PlatformSnapshot {
@@ -166,6 +177,7 @@ public:
     void postFrameCallbacks() override {
         std::lock_guard<std::mutex> lock(mState->mutex);
         ++mState->postFrameCallbacksCount;
+        mState->choreographerCallbackArmed = true;
     }
 
     void switchToExternalChoreographer(ChoreographerCallback onChoreographer) override {
@@ -475,6 +487,473 @@ TEST_F(SwappyCommonHostTest, TracerCallbacksInvokeAndRemoveCleanly) {
     EXPECT_EQ(counts.preSwap, 1);
     EXPECT_EQ(counts.postSwap, 1);
     EXPECT_EQ(counts.startFrame, 1);
+}
+
+// Deterministic discrete-event clock coordinating SwappyCommon (on the test
+// driver thread) and ChoreographerFilter worker threads without sleeps.
+class SimulatedClock final : public Clock {
+public:
+    explicit SimulatedClock(time_point initialTime = time_point{},
+                            int32_t filterWorkers = getNumCpus() > 2 ? 2 : 1)
+          : mNowNs(initialTime.time_since_epoch().count()), mActiveWorkers(filterWorkers) {}
+
+    [[nodiscard]] time_point now() const override {
+        return time_point(std::chrono::nanoseconds(mNowNs.load(std::memory_order_acquire)));
+    }
+
+    void sleepUntil(time_point deadline) const override {
+        std::unique_lock<std::mutex> lock(mMutex);
+        if (mShutdown || now() >= deadline) {
+            return;
+        }
+        SleepWaiter waiter{deadline, false};
+        --mActiveWorkers;
+        mSleepers.push_back(&waiter);
+        mCv.notify_all();
+        mCv.wait(lock, [&] { return mShutdown || waiter.woken; });
+    }
+
+protected:
+    void waitLocked(std::unique_lock<std::mutex>& callerLock, std::condition_variable& condition,
+                    const std::function<bool()>& predicate) const override {
+        if (std::this_thread::get_id() == mDriverThreadId) {
+            while (!predicate()) {
+                {
+                    std::lock_guard<std::mutex> lock(mMutex);
+                    if (mShutdown) {
+                        return;
+                    }
+                }
+                callerLock.unlock();
+                const bool progressed = advanceStepUpTo(time_point::max());
+                callerLock.lock();
+                if (!progressed) {
+                    ADD_FAILURE() << "SimulatedClock stalled waiting on predicate";
+                    return;
+                }
+            }
+            return;
+        }
+
+        while (!predicate()) {
+            {
+                std::lock_guard<std::mutex> lock(mMutex);
+                if (mShutdown) {
+                    return;
+                }
+                --mActiveWorkers;
+                ++mWaitingInCv;
+                mCv.notify_all();
+            }
+            condition.wait(callerLock);
+            {
+                std::lock_guard<std::mutex> lock(mMutex);
+                --mWaitingInCv;
+                ++mActiveWorkers;
+                mCv.notify_all();
+            }
+        }
+    }
+
+public:
+    void setVsyncCallbacks(std::function<std::optional<time_point>(time_point)> nextVsyncAfter,
+                           std::function<void(time_point)> onVsync) {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mNextVsyncAfter = std::move(nextVsyncAfter);
+        mOnVsync = std::move(onVsync);
+    }
+
+    [[nodiscard]] bool waitForWorkersSettled() const {
+        std::unique_lock<std::mutex> lock(mMutex);
+        return mCv.wait_for(lock, 5s, [&] { return mShutdown || mActiveWorkers == 0; });
+    }
+
+    void advanceBy(std::chrono::nanoseconds delta) const {
+        if (delta > 0ns) {
+            advanceTo(now() + delta);
+        } else {
+            EXPECT_TRUE(waitForWorkersSettled());
+        }
+    }
+
+    [[nodiscard]] bool advanceStepUpTo(time_point target) const {
+        if (!waitForWorkersSettled()) {
+            ADD_FAILURE() << "Workers failed to settle before step";
+            return false;
+        }
+
+        time_point nextTime = target;
+        bool hasEvent = (target != time_point::max());
+        bool fireVsync = false;
+        std::function<void(time_point)> onVsync;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            const time_point current = now();
+            if (mShutdown || current >= target) {
+                return false;
+            }
+            for (const SleepWaiter* waiter : mSleepers) {
+                if (waiter->deadline > current && waiter->deadline < nextTime) {
+                    nextTime = waiter->deadline;
+                    hasEvent = true;
+                }
+            }
+            if (mNextVsyncAfter) {
+                const auto candidate = mNextVsyncAfter(current);
+                if (candidate.has_value() && *candidate > current && *candidate <= nextTime) {
+                    nextTime = *candidate;
+                    hasEvent = true;
+                    fireVsync = true;
+                    onVsync = mOnVsync;
+                }
+            }
+            if (!hasEvent) {
+                return false;
+            }
+
+            mNowNs.store(nextTime.time_since_epoch().count(), std::memory_order_release);
+            for (auto it = mSleepers.begin(); it != mSleepers.end();) {
+                if ((*it)->deadline <= nextTime) {
+                    (*it)->woken = true;
+                    ++mActiveWorkers;
+                    it = mSleepers.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            mCv.notify_all();
+        }
+
+        if (fireVsync && onVsync) {
+            if (!waitForWorkersSettled()) {
+                ADD_FAILURE() << "Workers failed to settle before VSync callback";
+                return false;
+            }
+            onVsync(nextTime);
+            std::unique_lock<std::mutex> lock(mMutex);
+            if (!mCv.wait_for(lock, 5s, [&] {
+                    return mShutdown || (mWaitingInCv == 0 && mActiveWorkers == 0);
+                })) {
+                ADD_FAILURE() << "Workers failed to process VSync callback";
+                return false;
+            }
+        }
+
+        if (!waitForWorkersSettled()) {
+            ADD_FAILURE() << "Workers failed to settle after step";
+            return false;
+        }
+        return true;
+    }
+
+    void advanceTo(time_point target) const {
+        while (advanceStepUpTo(target)) {
+        }
+        ASSERT_TRUE(waitForWorkersSettled());
+    }
+
+    void shutdown() {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mShutdown = true;
+        for (SleepWaiter* waiter : mSleepers) {
+            waiter->woken = true;
+        }
+        mSleepers.clear();
+        mCv.notify_all();
+    }
+
+private:
+    struct SleepWaiter {
+        time_point deadline;
+        bool woken = false;
+    };
+
+    const std::thread::id mDriverThreadId = std::this_thread::get_id();
+    mutable std::atomic<int64_t> mNowNs;
+    mutable std::mutex mMutex;
+    mutable std::condition_variable mCv;
+    mutable int32_t mActiveWorkers;
+    mutable int32_t mWaitingInCv = 0;
+    mutable std::vector<SleepWaiter*> mSleepers;
+    mutable bool mShutdown = false;
+    std::function<std::optional<time_point>(time_point)> mNextVsyncAfter;
+    std::function<void(time_point)> mOnVsync;
+};
+
+class SimulatedSwappyHarness {
+public:
+    explicit SimulatedSwappyHarness(SwappyCommonSettings settings = makeSettings(),
+                                    Clock::time_point initialTime = Clock::time_point{})
+          : mState(std::make_shared<PlatformSharedState>()),
+            mClock(initialTime),
+            mDisplayPeriod(settings.refreshPeriod),
+            mAppVsyncOffset(settings.appVsyncOffset),
+            mSfToVsyncDelay(settings.refreshPeriod - settings.sfVsyncOffset) {
+        mState->initialSettings = settings;
+        mClock.setVsyncCallbacks([this](Clock::time_point
+                                                current) { return nextVsyncAfter(current); },
+                                 [this](Clock::time_point) { deliverVsync(); });
+
+        mSwappy = std::make_unique<SwappyCommon>(std::make_unique<FakeSwappyPlatform>(mState),
+                                                 mClock);
+        EXPECT_TRUE(mSwappy->isValid());
+        EXPECT_TRUE(mClock.waitForWorkersSettled());
+    }
+
+    ~SimulatedSwappyHarness() {
+        if (mSwappy) {
+            mClock.shutdown();
+            mSwappy.reset();
+        }
+    }
+
+    SwappyCommon& swappy() {
+        return *mSwappy;
+    }
+
+    SimulatedClock& clock() {
+        return mClock;
+    }
+
+    std::shared_ptr<PlatformSharedState> platformState() {
+        return mState;
+    }
+
+    void runFrame(std::chrono::nanoseconds cpuWork, std::chrono::nanoseconds gpuWork,
+                  std::chrono::nanoseconds swapCpuCost = 500us) {
+        mClock.advanceBy(cpuWork);
+        const auto handlers = readySwapHandlers(gpuWork);
+        mSwappy->onPreSwap(handlers);
+        mClock.advanceBy(swapCpuCost);
+        mSwappy->onPostSwap(handlers);
+    }
+
+private:
+    std::optional<Clock::time_point> nextVsyncAfter(Clock::time_point current) const {
+        std::lock_guard<std::mutex> lock(mState->mutex);
+        if (!mState->choreographerCallbackArmed || mDisplayPeriod <= 0ns) {
+            return std::nullopt;
+        }
+        const int64_t periodNs = mDisplayPeriod.count();
+        const int64_t offsetNs = mAppVsyncOffset.count();
+        const int64_t nowNs = current.time_since_epoch().count();
+        const int64_t adjusted = nowNs - offsetNs;
+        int64_t k = adjusted / periodNs;
+        if (adjusted % periodNs < 0) {
+            --k;
+        }
+        int64_t nextNs = (k + 1) * periodNs + offsetNs;
+        while (nextNs <= nowNs) {
+            nextNs += periodNs;
+        }
+        return Clock::time_point(std::chrono::nanoseconds(nextNs));
+    }
+
+    void deliverVsync() {
+        SwappyPlatform::ChoreographerCallback callback;
+        {
+            std::lock_guard<std::mutex> lock(mState->mutex);
+            if (!mState->choreographerCallbackArmed || !mState->onChoreographer) {
+                return;
+            }
+            mState->choreographerCallbackArmed = false;
+            callback = mState->onChoreographer;
+        }
+        callback(mSfToVsyncDelay);
+    }
+
+    std::shared_ptr<PlatformSharedState> mState;
+    SimulatedClock mClock;
+    std::chrono::nanoseconds mDisplayPeriod;
+    std::chrono::nanoseconds mAppVsyncOffset;
+    std::chrono::nanoseconds mSfToVsyncDelay;
+    std::unique_ptr<SwappyCommon> mSwappy;
+};
+
+TEST_F(SwappyCommonHostTest, EpochZeroStartFramePacesSecondFrameWithoutTreatingZeroAsSentinel) {
+    SimulatedSwappyHarness harness(makeSettings(), Clock::time_point{});
+
+    int64_t recordedCpuTimeNs = -1;
+    SwappyTracer tracer{};
+    tracer.userData = &recordedCpuTimeNs;
+    tracer.postWait = [](void* data, int64_t cpuTimeNs, int64_t) {
+        *static_cast<int64_t*>(data) = cpuTimeNs;
+    };
+    harness.swappy().addTracerCallbacks(tracer);
+
+    const auto handlers = readySwapHandlers(2ms);
+    harness.swappy().onPreSwap(handlers);
+    harness.swappy().onPostSwap(handlers);
+    EXPECT_EQ(harness.clock().now(), Clock::time_point{});
+
+    harness.clock().advanceBy(4ms);
+    harness.swappy().onPreSwap(handlers);
+
+    EXPECT_EQ(recordedCpuTimeNs, std::chrono::nanoseconds(4ms).count());
+    EXPECT_GT(harness.clock().now(), Clock::time_point{4ms});
+    EXPECT_TRUE(harness.swappy().needToSetPresentationTime());
+}
+
+TEST_F(SwappyCommonHostTest, LightWorkloadSwitchesPipelineOffAndPacesAt60Hz) {
+    SimulatedSwappyHarness harness(makeSettings(), Clock::time_point{1s});
+    EXPECT_EQ(harness.swappy().getCurrentPipelineMode(), PipelineMode::On);
+
+    for (int frame = 0; frame < 150; ++frame) {
+        harness.runFrame(2ms, 2ms);
+    }
+
+    EXPECT_EQ(harness.swappy().getCurrentPipelineMode(), PipelineMode::Off);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), k60HzPeriod);
+
+    const Clock::time_point firstPresent = harness.swappy().getPresentationTime();
+    harness.runFrame(2ms, 2ms);
+    const Clock::time_point secondPresent = harness.swappy().getPresentationTime();
+    EXPECT_NEAR((secondPresent - firstPresent).count(), k60HzPeriod.count(), 1'000'000);
+}
+
+TEST_F(SwappyCommonHostTest, HeavyWorkloadStepsDownTo30HzVotesSetFrameRateAndRecoversTo60Hz) {
+    SimulatedSwappyHarness harness(makeSettings(), Clock::time_point{1s});
+    ANativeWindow window{42};
+    harness.swappy().setANativeWindow(&window);
+
+    int intervalChangeCallbacks = 0;
+    SwappyTracer tracer{};
+    tracer.userData = &intervalChangeCallbacks;
+    tracer.swapIntervalChanged = [](void* data) { ++(*static_cast<int*>(data)); };
+    harness.swappy().addTracerCallbacks(tracer);
+
+    for (int frame = 0; frame < 150; ++frame) {
+        harness.runFrame(20ms, 6ms);
+    }
+
+    EXPECT_NEAR(harness.swappy().getSwapDuration().count(), k30HzPeriod.count(), 100);
+    EXPECT_GE(intervalChangeCallbacks, 1);
+    {
+        const auto snapshot = snapshotPlatformState(*harness.platformState());
+        ASSERT_FALSE(snapshot.frameRateVotes.empty());
+        // DisplayRateController votes pipelineFrameTime (~21ms => ~47.6Hz) at swapInterval=2
+        // before discrete-ladder rate voting is layered on.
+        EXPECT_LT(snapshot.frameRateVotes.back().second, 55.0f);
+        EXPECT_GT(snapshot.frameRateVotes.back().second, 29.0f);
+    }
+
+    const int callbacksAt30Hz = intervalChangeCallbacks;
+    for (int frame = 0; frame < 150; ++frame) {
+        harness.runFrame(3ms, 3ms);
+    }
+
+    EXPECT_EQ(harness.swappy().getSwapDuration(), k60HzPeriod);
+    EXPECT_GT(intervalChangeCallbacks, callbacksAt30Hz);
+    const auto snapshot = snapshotPlatformState(*harness.platformState());
+    EXPECT_NEAR(snapshot.frameRateVotes.back().second, 60.0f, 0.05f);
+}
+
+TEST_F(SwappyCommonHostTest, IncompleteGpuFenceSlipsOneFrameAndReportsGpuTimeWhenComplete) {
+    SimulatedSwappyHarness harness(makeSettings(), Clock::time_point{1s});
+
+    int64_t lastGpuTimeNs = 0;
+    SwappyTracer tracer{};
+    tracer.userData = &lastGpuTimeNs;
+    tracer.postWait = [](void* data, int64_t, int64_t gpuTimeNs) {
+        *static_cast<int64_t*>(data) = gpuTimeNs;
+    };
+    harness.swappy().addTracerCallbacks(tracer);
+
+    harness.runFrame(3ms, 3ms);
+
+    int pollCount = 0;
+    const SwappyCommon::SwapHandlers slipOnceHandlers{
+            .lastFrameIsComplete = [&pollCount] { return ++pollCount >= 2; },
+            .getPrevFrameGpuTime = [] { return 12ms; },
+    };
+    harness.clock().advanceBy(3ms);
+    const Clock::time_point beforeSlipSwap = harness.clock().now();
+    harness.swappy().onPreSwap(slipOnceHandlers);
+    EXPECT_GE(harness.clock().now() - beforeSlipSwap, k60HzPeriod);
+    EXPECT_EQ(lastGpuTimeNs, std::chrono::nanoseconds(12ms).count());
+    harness.swappy().onPostSwap(slipOnceHandlers);
+}
+
+TEST_F(SwappyCommonHostTest, BufferStuffingFixWaitAddsExtraFrameAfterConsecutiveHighLatencyFrames) {
+    SimulatedSwappyHarness harness(makeSettings(), Clock::time_point{1s});
+    for (int i = 0; i < 8; ++i) {
+        harness.runFrame(3ms, 3ms);
+    }
+
+    int latestFrameIndex = 0;
+    SwappyTracer tracer{};
+    tracer.userData = &latestFrameIndex;
+    tracer.startFrame = [](void* data, int currentFrame, int64_t) {
+        *static_cast<int*>(data) = currentFrame;
+    };
+    harness.swappy().addTracerCallbacks(tracer);
+
+    harness.swappy().setBufferStuffingFixWait(2);
+    harness.swappy().setLastLatencyRecordedCallback([] { return 4; });
+
+    // Two consecutive high-latency frames (expected latency = 2 VSyncs) arm
+    // mTargetFrame += 1 at the end of the second frame so the next frame waits 2 VSyncs.
+    harness.runFrame(3ms, 3ms);
+    harness.runFrame(3ms, 3ms);
+    const int frameBeforeExtraWait = latestFrameIndex;
+    const Clock::time_point presentBeforeExtraWait = harness.swappy().getPresentationTime();
+
+    harness.runFrame(3ms, 3ms);
+    EXPECT_EQ(latestFrameIndex - frameBeforeExtraWait, 2);
+    EXPECT_NEAR((harness.swappy().getPresentationTime() - presentBeforeExtraWait).count(),
+                (2 * k60HzPeriod).count(), 1'000'000);
+}
+
+TEST_F(SwappyCommonHostTest, EnableFramePacingTogglesNeedToSetPresentationTime) {
+    SimulatedSwappyHarness harness(makeSettings(), Clock::time_point{1s});
+    harness.runFrame(3ms, 3ms);
+
+    harness.swappy().enableFramePacing(false);
+    harness.runFrame(3ms, 3ms);
+    harness.clock().advanceBy(3ms);
+    harness.swappy().onPreSwap(readySwapHandlers(3ms));
+    EXPECT_FALSE(harness.swappy().needToSetPresentationTime());
+    harness.swappy().onPostSwap(readySwapHandlers(3ms));
+
+    harness.swappy().enableFramePacing(true);
+    harness.runFrame(3ms, 3ms);
+    harness.clock().advanceBy(3ms);
+    harness.swappy().onPreSwap(readySwapHandlers(3ms));
+    EXPECT_TRUE(harness.swappy().needToSetPresentationTime());
+    harness.swappy().onPostSwap(readySwapHandlers(3ms));
+}
+
+TEST_F(SwappyCommonHostTest, ResetFramePacingRestoresInitialRefreshPeriodAndAutoSwapInterval) {
+    SimulatedSwappyHarness harness(makeSettings(), Clock::time_point{1s});
+    for (int frame = 0; frame < 150; ++frame) {
+        harness.runFrame(20ms, 6ms);
+    }
+    EXPECT_NEAR(harness.swappy().getSwapDuration().count(), k30HzPeriod.count(), 100);
+
+    harness.swappy().resetFramePacing();
+    harness.runFrame(3ms, 3ms);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), k60HzPeriod);
+}
+
+TEST_F(SwappyCommonHostTest, MultiVsyncWaitReArmsPlatformCallbacksAcrossAllTargetVsyncs) {
+    SimulatedSwappyHarness harness(makeSettings(), Clock::time_point{1s});
+    harness.swappy().setAutoSwapInterval(false);
+    Settings::getInstance()->setSwapDuration((12 * k60HzPeriod).count());
+
+    int latestFrameIndex = 0;
+    SwappyTracer tracer{};
+    tracer.userData = &latestFrameIndex;
+    tracer.startFrame = [](void* data, int currentFrame, int64_t) {
+        *static_cast<int*>(data) = currentFrame;
+    };
+    harness.swappy().addTracerCallbacks(tracer);
+
+    harness.runFrame(2ms, 2ms);
+    const int frameIndexBeforeLongWait = latestFrameIndex;
+
+    harness.runFrame(2ms, 2ms);
+    EXPECT_GE(latestFrameIndex - frameIndexBeforeLongWait, 12);
+    EXPECT_GE(snapshotPlatformState(*harness.platformState()).postFrameCallbacksCount, 12);
 }
 
 } // namespace

@@ -29,6 +29,7 @@
 
 #include "CPUTracer.h"
 #include "ChoreographerFilter.h"
+#include "Clock.h"
 #include "DisplayRateController.h"
 #include "FrameDurations.h"
 #include "PacingImplementation.h"
@@ -55,7 +56,8 @@ public:
         std::function<std::chrono::nanoseconds()> getPrevFrameGpuTime;
     };
 
-    explicit SwappyCommon(std::unique_ptr<SwappyPlatform> platform);
+    explicit SwappyCommon(std::unique_ptr<SwappyPlatform> platform,
+                          const Clock& clock = SteadyClock::instance());
 
     ~SwappyCommon();
 
@@ -92,7 +94,7 @@ public:
         mAutoSwapIntervalThreshold = swapDuration;
     }
 
-    std::chrono::steady_clock::time_point getPresentationTime() {
+    Clock::time_point getPresentationTime() {
         return mPresentationTime;
     }
     std::chrono::nanoseconds getRefreshPeriod() const {
@@ -142,12 +144,13 @@ private:
     void postSwapBuffersCallbacks();
     void preWaitCallbacks();
     void postWaitCallbacks(std::chrono::nanoseconds cpuTime, std::chrono::nanoseconds gpuTime);
-    void startFrameCallbacks();
+    void startFrameCallbacks(int32_t currentFrame);
     void swapIntervalChangedCallbacks();
     void onSettingsChanged();
     void updateMeasuredSwapDuration(std::chrono::nanoseconds duration);
     void startFrame();
     void waitUntil(int32_t target);
+    void waitUntilLocked(int32_t target) REQUIRES(mWaitingMutex);
     void waitUntilTargetFrame();
     void waitOneFrame();
     void setPreferredDisplayModeId(int index) REQUIRES(mMutex);
@@ -159,6 +162,7 @@ private:
     bool waitForNextFrame(const SwapHandlers& h);
 
     std::unique_ptr<SwappyPlatform> mPlatform;
+    const Clock& mClock;
 
     SwappyCommonSettings mCommonSettings{};
 
@@ -168,12 +172,12 @@ private:
 
     std::mutex mWaitingMutex;
     std::condition_variable mWaitingCondition;
-    std::chrono::steady_clock::time_point mCurrentFrameTimestamp = std::chrono::steady_clock::now();
-    int32_t mCurrentFrame = 0;
-    std::optional<std::chrono::nanoseconds> mSfToVsyncDelay;
+    Clock::time_point mCurrentFrameTimestamp GUARDED_BY(mWaitingMutex);
+    int32_t mCurrentFrame GUARDED_BY(mWaitingMutex) = 0;
+    std::optional<std::chrono::nanoseconds> mSfToVsyncDelay GUARDED_BY(mWaitingMutex);
     std::atomic<std::chrono::nanoseconds> mMeasuredSwapDuration;
 
-    std::chrono::steady_clock::time_point mSwapTime;
+    Clock::time_point mSwapTime{};
 
     std::mutex mMutex;
 
@@ -186,7 +190,7 @@ private:
     int32_t mAutoSwapInterval;
     std::atomic<std::chrono::nanoseconds> mAutoSwapIntervalThreshold = {50ms}; // 20FPS
 
-    std::chrono::steady_clock::time_point mStartFrameTime;
+    std::optional<Clock::time_point> mStartFrameTime;
 
     struct SwappyTracerCallbacks {
         std::list<Tracer<>> preWait;
@@ -200,7 +204,7 @@ private:
     SwappyTracerCallbacks mInjectedTracers;
 
     int32_t mTargetFrame = 0;
-    std::chrono::steady_clock::time_point mPresentationTime = std::chrono::steady_clock::now();
+    Clock::time_point mPresentationTime;
     bool mPresentationTimeNeeded;
     PipelineMode mPipelineMode = PipelineMode::On;
 
