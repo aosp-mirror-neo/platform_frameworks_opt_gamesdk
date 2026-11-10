@@ -1,0 +1,78 @@
+/*
+ * Copyright 2026 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Rewrites Maven Central repository URLs to Google's GCS mirror (and places
+// the mirror ahead of gradlePluginPortal(), which otherwise 303-redirects
+// transitive plugin dependencies to repo.maven.apache.org) so builds do not
+// hit Maven Central IP rate limits (HTTP 429) on shared CI NATs.
+// Works both as a Gradle init script (init.d / --init-script) and via
+// gradle.apply(from: ...) in settings.gradle.
+import org.gradle.api.artifacts.dsl.RepositoryHandler
+import org.gradle.api.artifacts.repositories.MavenArtifactRepository
+
+URI mavenCentralMirrorUri = URI.create('https://maven-central.storage-download.googleapis.com/maven2/')
+Set<String> mavenCentralHosts = ['repo.maven.apache.org', 'repo1.maven.org'] as Set
+
+def rewriteMavenCentral = { RepositoryHandler repositories ->
+    repositories.withType(MavenArtifactRepository).all { MavenArtifactRepository repo ->
+        String normalizedPath = repo.url?.path?.replaceAll('/+$', '')
+        if (repo.url?.host in mavenCentralHosts && normalizedPath == '/maven2') {
+            repo.setUrl(mavenCentralMirrorUri)
+        }
+    }
+}
+
+def ensurePluginPortalMirror = { RepositoryHandler repositories ->
+    if (repositories.empty) {
+        repositories.google()
+        repositories.maven {
+            name = 'MavenCentralGcsMirror'
+            url = mavenCentralMirrorUri
+        }
+        repositories.gradlePluginPortal()
+        return
+    }
+    rewriteMavenCentral(repositories)
+    boolean hasMirror = repositories.withType(MavenArtifactRepository).any { MavenArtifactRepository repo ->
+        repo.url == mavenCentralMirrorUri
+    }
+    if (!hasMirror) {
+        def mirrorRepo = repositories.maven {
+            name = 'MavenCentralGcsMirror'
+            url = mavenCentralMirrorUri
+        }
+        repositories.remove(mirrorRepo)
+        repositories.add(0, mirrorRepo)
+    }
+}
+
+beforeSettings { settings ->
+    rewriteMavenCentral(settings.buildscript.repositories)
+    rewriteMavenCentral(settings.pluginManagement.repositories)
+}
+
+settingsEvaluated { settings ->
+    rewriteMavenCentral(settings.buildscript.repositories)
+    ensurePluginPortalMirror(settings.pluginManagement.repositories)
+    if (settings.hasProperty('dependencyResolutionManagement')) {
+        rewriteMavenCentral(settings.dependencyResolutionManagement.repositories)
+    }
+}
+
+allprojects { project ->
+    rewriteMavenCentral(project.buildscript.repositories)
+    rewriteMavenCentral(project.repositories)
+}

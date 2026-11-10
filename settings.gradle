@@ -1,3 +1,5 @@
+gradle.apply from: file('gradle/maven-central-mirror.init.gradle')
+
 rootProject.name = 'androidgamesdk'
 include ':game-activity'
 include ':game-text-input'

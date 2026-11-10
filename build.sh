@@ -172,6 +172,12 @@ then
     dist_dir=$(pwd)/../dist
 else
     dist_dir=$DIST_DIR
+    # Install the Maven Central GCS mirror init script so standalone sample and
+    # testapp Gradle builds do not hit repo.maven.apache.org IP rate limits.
+    gradle_init_dir="${GRADLE_USER_HOME:-$HOME/.gradle}/init.d"
+    mkdir -p "$gradle_init_dir"
+    cp "$(pwd)/gradle/maven-central-mirror.init.gradle" \
+        "$gradle_init_dir/gamesdk-maven-central-mirror.init.gradle"
 fi
 
 package_coverage_bundle() {
