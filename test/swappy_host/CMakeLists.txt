@@ -115,7 +115,7 @@ gtest_discover_tests(swappy_host_test PROPERTIES TIMEOUT 10)
 
 add_executable(swappy_host_trace_off_test ${SWAPPY_HOST_TRACE_OFF_TEST_SOURCES})
 target_compile_options(swappy_host_trace_off_test PRIVATE ${SWAPPY_HOST_TEST_COMPILE_OPTIONS})
-target_compile_definitions(swappy_host_trace_off_test PRIVATE ${SWAPPY_HOST_TEST_COMPILE_DEFINITIONS} TRACE=0)
+target_compile_definitions(swappy_host_trace_off_test PRIVATE ${SWAPPY_HOST_TEST_COMPILE_DEFINITIONS} AGDK_TRACE=0)
 target_link_libraries(swappy_host_trace_off_test ${SWAPPY_HOST_TEST_LIBS})
 gtest_discover_tests(swappy_host_trace_off_test TEST_PREFIX "trace_off." PROPERTIES TIMEOUT 10)
 

@@ -18,6 +18,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -32,11 +33,12 @@ using gamesdk::test::ScopedMockTrace;
 
 struct MockInstrumentedLayout {
     uint64_t baselineField = 0;
-    TRACE_MEMBER(uint64_t, traceField) = 42;
+    TRACE_MEMBER(uint64_t traceField = 42);
+    TRACE_MEMBER(std::array<uint64_t, 2> tracePair = {1, 2});
 };
 
-static_assert(sizeof(MockInstrumentedLayout) == 2 * sizeof(uint64_t),
-              "TRACE_MEMBER must declare the member when TRACE != 0");
+static_assert(sizeof(MockInstrumentedLayout) == 4 * sizeof(uint64_t),
+              "TRACE_MEMBER must declare the members when AGDK_TRACE != 0");
 
 TEST(TraceHostTest, DefaultInstanceAndMacrosAreSafeNoOpsOnHost) {
     Trace* hostTrace = Trace::getInstance();
@@ -142,6 +144,8 @@ TEST(TraceHostTest, MacrosDispatchWhenEnabledAndSkipArgumentsWhenDisabled) {
     MockInstrumentedLayout holder;
     EXPECT_EQ(holder.baselineField, 0u);
     EXPECT_EQ(holder.traceField, 42u);
+    EXPECT_EQ(holder.tracePair[0], 1u);
+    EXPECT_EQ(holder.tracePair[1], 2u);
 
     ScopedMockTrace mockTrace(true);
     EXPECT_TRUE(TRACE_ENABLED());

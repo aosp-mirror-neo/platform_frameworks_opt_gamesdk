@@ -16,11 +16,11 @@
 
 #pragma once
 
-#ifndef TRACE
-#define TRACE 1
+#ifndef AGDK_TRACE
+#define AGDK_TRACE 1
 #endif
 
-#if TRACE == 0
+#if AGDK_TRACE == 0
 
 #include <cstdint>
 #include <memory>
@@ -72,9 +72,9 @@ struct ScopedTrace {
 #define TRACE_INSTANT(...) ((void)0)
 #define TRACE_ENABLED() false
 // Declares a member that exists only when tracing is compiled in.
-#define TRACE_MEMBER(type, name) static_assert(true, "")
+#define TRACE_MEMBER(...) static_assert(true, "")
 
-#else // TRACE != 0
+#else // AGDK_TRACE != 0
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -310,6 +310,6 @@ private:
     } while (0)
 #define TRACE_ENABLED() gamesdk::Trace::getInstance()->isEnabled()
 // Declares a member that exists only when tracing is compiled in.
-#define TRACE_MEMBER(type, name) type name
+#define TRACE_MEMBER(...) __VA_ARGS__
 
-#endif // TRACE != 0
+#endif // AGDK_TRACE != 0

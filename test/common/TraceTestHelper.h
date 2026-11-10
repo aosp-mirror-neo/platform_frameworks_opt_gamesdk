@@ -18,7 +18,7 @@
 
 #include "Trace.h"
 
-#if TRACE != 0
+#if AGDK_TRACE != 0
 
 #include <algorithm>
 #include <atomic>
@@ -134,4 +134,4 @@ private:
 } // namespace test
 } // namespace gamesdk
 
-#endif // TRACE != 0
+#endif // AGDK_TRACE != 0
