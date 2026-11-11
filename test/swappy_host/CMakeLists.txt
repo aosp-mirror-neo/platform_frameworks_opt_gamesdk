@@ -58,6 +58,7 @@ set(SWAPPY_HOST_COMMON_SOURCES
   choreographertimer_test.cpp
   classicpacingimpl_test.cpp
   clock_test.cpp
+  displayratecontroller_test.cpp
   framedurations_test.cpp
   framestatistics_test.cpp
   refreshperiodset_test.cpp

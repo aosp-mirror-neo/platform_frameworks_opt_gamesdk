@@ -475,8 +475,8 @@ void SwappyCommon::setPreferredRefreshPeriod(nanoseconds frameTime) {
             mPlatform->setFrameRate(mWindow, *votedHz);
         }
 
-        const auto frameRate = std::min(1e9f / frameTime.count(), 1e9f / mSwapDuration.count());
-        TRACE_INT("preferredRefreshPeriod", (int)frameRate);
+        TRACE_INT("preferredRefreshPeriod",
+                  static_cast<int>(std::lround(mDisplayRateController.lastVotedFrameRateHz())));
     } else {
         if (!mPlatform || !mSupportedRefreshPeriods) {
             return;

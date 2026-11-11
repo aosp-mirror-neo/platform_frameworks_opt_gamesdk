@@ -32,7 +32,9 @@ namespace swappy {
 // and legacy WindowManager preferredDisplayModeId (API 28-29).
 class DisplayRateController {
 public:
-    static constexpr float kVoteMarginHz = 1.f; // 1Hz
+    // 0.1 Hz absorbs 1 ns period rounding while still voting sub-20 Hz ARR
+    // transitions (e.g. 16 vs 15 Hz and 11 vs 10 Hz).
+    static constexpr float kVoteMarginHz = 0.1f;
 
     struct ModeSelection {
         std::chrono::nanoseconds refreshPeriod{0};
@@ -41,22 +43,32 @@ public:
     };
 
     [[nodiscard]] bool hasVoted() const {
-        return mLastVotedFrameRateHz != 0.f || mLastModeId >= 0;
+        return mLastVotedFrameRateHz > 0.f || mLastModeId >= 0;
     }
 
     void onWindowChanged() {
         mLastVotedFrameRateHz = 0.f;
     }
 
+    // Returns a new frameRate (in Hz) to pass to ANativeWindow_setFrameRate when
+    // the clamped target period moves outside the 0.1 Hz deadband.
     [[nodiscard]] std::optional<float> voteFrameRateHz(std::chrono::nanoseconds targetPeriod,
                                                        std::chrono::nanoseconds minSwapDuration) {
-        auto frameRate = 1e9f / targetPeriod.count();
-        frameRate = std::min(frameRate, 1e9f / minSwapDuration.count());
-        if (std::abs(mLastVotedFrameRateHz - frameRate) > kVoteMarginHz) {
-            mLastVotedFrameRateHz = frameRate;
-            return frameRate;
+        const auto effectivePeriod = std::max(targetPeriod, minSwapDuration);
+        if (effectivePeriod <= std::chrono::nanoseconds::zero()) {
+            return std::nullopt;
         }
-        return std::nullopt;
+        const float frameRate = 1e9f / static_cast<float>(effectivePeriod.count());
+        if (mLastVotedFrameRateHz > 0.f &&
+            std::abs(mLastVotedFrameRateHz - frameRate) <= kVoteMarginHz) {
+            return std::nullopt;
+        }
+        mLastVotedFrameRateHz = frameRate;
+        return frameRate;
+    }
+
+    [[nodiscard]] float lastVotedFrameRateHz() const {
+        return mLastVotedFrameRateHz;
     }
 
     // Selects the longest physical Display.Mode period whose integer multiple
@@ -73,7 +85,7 @@ public:
         std::pair<std::chrono::nanoseconds, int> bestConfig{0ns, -1};
         std::chrono::nanoseconds minCandidateSwapDuration = 1s;
         for (const auto& [period, modeId] : *supportedPeriods) {
-            if (modeId < 0) {
+            if (modeId < 0 || period <= 0ns) {
                 continue;
             }
             const int interval = calculateSwapInterval(targetPeriod, period);
