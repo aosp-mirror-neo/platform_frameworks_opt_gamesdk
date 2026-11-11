@@ -21,9 +21,11 @@
 #include <android/looper.h>
 #include <jni.h>
 
+#include <algorithm>
 #include <map>
 
 #include "JNIUtil.h"
+#include "RefreshPeriodSet.h"
 #include "Settings.h"
 #include "SwappyLog.h"
 
@@ -87,6 +89,8 @@ SwappyDisplayManager::SwappyDisplayManager(JavaVM* vm, jobject mainActivity) : m
             env->GetMethodID(swappyDisplayManagerClass, "<init>", "(JLandroid/app/Activity;)V");
     mSetPreferredDisplayModeId =
             env->GetMethodID(swappyDisplayManagerClass, "setPreferredDisplayModeId", "(I)V");
+    mEnableRefreshCallbackForwarding =
+            env->GetMethodID(swappyDisplayManagerClass, "enableRefreshCallbackForwarding", "()V");
     mTerminate = env->GetMethodID(swappyDisplayManagerClass, "terminate", "()V");
     jobject swappyDisplayManager =
             env->NewObject(swappyDisplayManagerClass, constructor, (jlong)this, mainActivity);
@@ -127,6 +131,16 @@ void SwappyDisplayManager::setPreferredDisplayModeId(int index) {
     env->CallVoidMethod(mJthis, mSetPreferredDisplayModeId, index);
 }
 
+void SwappyDisplayManager::enableRefreshCallbackForwarding() {
+    if (!mInitialized || mEnableRefreshCallbackForwarding == nullptr) {
+        return;
+    }
+    JNIEnv* env;
+    mJVM->AttachCurrentThread(&env, nullptr);
+
+    env->CallVoidMethod(mJthis, mEnableRefreshCallbackForwarding);
+}
+
 // Helper class to wrap JNI entry points to SwappyDisplayManager
 class SwappyDisplayManagerJNI {
 public:
@@ -161,18 +175,31 @@ JNIEXPORT void JNICALL
 Java_com_google_androidgamesdk_SwappyDisplayManager_nSetSupportedRefreshPeriods(
         JNIEnv* env, jobject /* this */, jlong cookie, jlongArray refreshPeriods,
         jintArray modeIds) {
-    int length = env->GetArrayLength(refreshPeriods);
-    auto refreshPeriodsMap = std::make_shared<SwappyDisplayManager::RefreshPeriodMap>();
-
-    jlong* refreshPeriodsArr = env->GetLongArrayElements(refreshPeriods, 0);
-    jint* modeIdsArr = env->GetIntArrayElements(modeIds, 0);
-    for (int i = 0; i < length; i++) {
-        (*refreshPeriodsMap)[std::chrono::nanoseconds(refreshPeriodsArr[i])] = modeIdsArr[i];
+    if (refreshPeriods == nullptr || modeIds == nullptr) {
+        return;
     }
-    env->ReleaseLongArrayElements(refreshPeriods, refreshPeriodsArr, 0);
-    env->ReleaseIntArrayElements(modeIds, modeIdsArr, 0);
 
-    SwappyDisplayManagerJNI::onSetSupportedRefreshPeriods(cookie, refreshPeriodsMap);
+    const jsize length =
+            std::min(env->GetArrayLength(refreshPeriods), env->GetArrayLength(modeIds));
+    jlong* refreshPeriodsArr = env->GetLongArrayElements(refreshPeriods, nullptr);
+    if (refreshPeriodsArr == nullptr) {
+        return;
+    }
+    jint* modeIdsArr = env->GetIntArrayElements(modeIds, nullptr);
+    if (modeIdsArr == nullptr) {
+        env->ReleaseLongArrayElements(refreshPeriods, refreshPeriodsArr, JNI_ABORT);
+        return;
+    }
+
+    auto refreshPeriodsMap = std::make_shared<SwappyDisplayManager::RefreshPeriodMap>();
+    for (jsize i = 0; i < length; ++i) {
+        insertRefreshPeriod(*refreshPeriodsMap, std::chrono::nanoseconds(refreshPeriodsArr[i]),
+                            modeIdsArr[i]);
+    }
+    env->ReleaseLongArrayElements(refreshPeriods, refreshPeriodsArr, JNI_ABORT);
+    env->ReleaseIntArrayElements(modeIds, modeIdsArr, JNI_ABORT);
+
+    SwappyDisplayManagerJNI::onSetSupportedRefreshPeriods(cookie, std::move(refreshPeriodsMap));
 }
 
 JNIEXPORT void JNICALL Java_com_google_androidgamesdk_SwappyDisplayManager_nOnRefreshPeriodChanged(

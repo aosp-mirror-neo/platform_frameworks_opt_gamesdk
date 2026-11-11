@@ -24,6 +24,8 @@
 #include <memory>
 #include <mutex>
 
+#include "RefreshPeriodSet.h"
+
 namespace swappy {
 
 struct SdkVersion {
@@ -49,11 +51,12 @@ public:
     }
 
     // Map from refresh period to display mode id
-    using RefreshPeriodMap = std::map<std::chrono::nanoseconds, int>;
+    using RefreshPeriodMap = ::swappy::RefreshPeriodMap;
 
     std::shared_ptr<RefreshPeriodMap> getSupportedRefreshPeriods();
 
     void setPreferredDisplayModeId(int index);
+    void enableRefreshCallbackForwarding();
 
 private:
     JavaVM* mJVM;
@@ -62,6 +65,7 @@ private:
     std::shared_ptr<RefreshPeriodMap> mSupportedRefreshPeriods;
     jobject mJthis = nullptr;
     jmethodID mSetPreferredDisplayModeId = nullptr;
+    jmethodID mEnableRefreshCallbackForwarding = nullptr;
     jmethodID mTerminate = nullptr;
     bool mInitialized = false;
 
