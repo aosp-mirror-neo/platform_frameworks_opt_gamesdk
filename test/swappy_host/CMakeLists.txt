@@ -61,8 +61,11 @@ set(SWAPPY_HOST_COMMON_SOURCES
   framedurations_test.cpp
   refreshperiodset_test.cpp
   swapintervalladder_test.cpp
+  swappycommon_test.cpp
+  ../../games-frame-pacing/common/CPUTracer.cpp
   ../../games-frame-pacing/common/ChoreographerFilter.cpp
   ../../games-frame-pacing/common/Settings.cpp
+  ../../games-frame-pacing/common/SwappyCommon.cpp
   ../../games-frame-pacing/common/Thread.cpp
 )
 

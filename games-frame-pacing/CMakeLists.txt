@@ -79,6 +79,7 @@ add_library( swappy_static
 
              STATIC
 
+             ${SOURCE_LOCATION_COMMON}/AndroidSwappyPlatform.cpp
              ${SOURCE_LOCATION_COMMON}/ChoreographerFilter.cpp
              ${SOURCE_LOCATION_COMMON}/ChoreographerThread.cpp
              ${SOURCE_LOCATION_COMMON}/CpuInfo.cpp

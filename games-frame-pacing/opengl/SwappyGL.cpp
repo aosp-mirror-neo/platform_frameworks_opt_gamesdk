@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdlib>
 
+#include "AndroidSwappyPlatform.h"
 #include "SwappyLog.h"
 #include "Thread.h"
 #include "Trace.h"
@@ -256,7 +257,7 @@ EGL* SwappyGL::getEgl() {
 }
 
 SwappyGL::SwappyGL(JNIEnv* env, jobject jactivity, ConstructorTag)
-      : mFrameStatistics(nullptr), mCommonBase(env, jactivity) {
+      : mFrameStatistics(nullptr), mCommonBase(createAndroidSwappyPlatform(env, jactivity)) {
     {
         std::lock_guard<std::mutex> lock(mEglMutex);
         mEgl = EGL::create(mCommonBase.getFenceTimeout());
