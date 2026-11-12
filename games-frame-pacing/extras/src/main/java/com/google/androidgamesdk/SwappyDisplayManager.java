@@ -29,6 +29,7 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
     private static final int NO_MODE_ID = -1;
     private static final int ANDROID_16_SDK_INT = 36;
     private static final Method sHasArrSupportMethod = resolveHasArrSupportMethod();
+    private static final Method sSetRenderAheadEnabledMethod = resolveSetRenderAheadEnabledMethod();
 
     private long mCookie;
     private Activity mActivity;
@@ -46,6 +47,14 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
         }
         try {
             return Display.class.getMethod("hasArrSupport");
+        } catch (NoSuchMethodException e) {
+            return null;
+        }
+    }
+
+    private static Method resolveSetRenderAheadEnabledMethod() {
+        try {
+            return Window.class.getMethod("setRenderAheadEnabled", boolean.class);
         } catch (NoSuchMethodException e) {
             return null;
         }
@@ -236,6 +245,28 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
                 l.preferredDisplayModeId = modeId;
 
                 w.setAttributes(l);
+            }
+        });
+    }
+
+    // Called from native SwappyDisplayManager.cpp
+    public void disableRenderAhead() {
+        if (sSetRenderAheadEnabledMethod == null) {
+            return;
+        }
+        final Activity activity = mActivity;
+        activity.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                Window w = activity.getWindow();
+                if (w == null) {
+                    return;
+                }
+                try {
+                    sSetRenderAheadEnabledMethod.invoke(w, false);
+                } catch (ReflectiveOperationException | RuntimeException e) {
+                    Log.w(LOG_TAG, "Failed to disable render-ahead", e);
+                }
             }
         });
     }

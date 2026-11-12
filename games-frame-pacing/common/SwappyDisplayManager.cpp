@@ -96,12 +96,24 @@ SwappyDisplayManager::SwappyDisplayManager(JavaVM* vm, jobject mainActivity) : m
             env->GetMethodID(swappyDisplayManagerClass.get(), "setPreferredDisplayModeId", "(I)V");
     mEnableRefreshCallbackForwarding = env->GetMethodID(swappyDisplayManagerClass.get(),
                                                         "enableRefreshCallbackForwarding", "()V");
+    jmethodID disableRenderAhead =
+            env->GetMethodID(swappyDisplayManagerClass.get(), "disableRenderAhead", "()V");
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        disableRenderAhead = nullptr;
+    }
     mTerminate = env->GetMethodID(swappyDisplayManagerClass.get(), "terminate", "()V");
     ScopedLocalRef<jobject> swappyDisplayManager(env,
                                                  env->NewObject(swappyDisplayManagerClass.get(),
                                                                 constructor, (jlong)this,
                                                                 mainActivity));
     mJthis = env->NewGlobalRef(swappyDisplayManager.get());
+    if (mJthis != nullptr && disableRenderAhead != nullptr) {
+        env->CallVoidMethod(mJthis, disableRenderAhead);
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+    }
 
     mInitialized = true;
 }
