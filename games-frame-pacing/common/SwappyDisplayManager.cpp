@@ -71,8 +71,8 @@ bool SwappyDisplayManager::useSwappyDisplayManager(SdkVersion sdkVersion) {
     return !(sdkVersion.sdkInt >= 31 || (sdkVersion.sdkInt == 30 && sdkVersion.previewSdkInt == 1));
 }
 
-SwappyDisplayManager::SwappyDisplayManager(JavaVM* vm, jobject mainActivity) : mJVM(vm) {
-    if (!vm || !mainActivity) {
+SwappyDisplayManager::SwappyDisplayManager(JavaVM* vm, jobject context) : mJVM(vm) {
+    if (!vm || !context) {
         return;
     }
 
@@ -82,9 +82,17 @@ SwappyDisplayManager::SwappyDisplayManager(JavaVM* vm, jobject mainActivity) : m
         return;
     }
 
+    // Passing an object to a constructor that expects another type is
+    // undefined behaviour, so skip the display manager if `context` is not an
+    // android.content.Context.
+    if (!isInstanceOf(env, context, "android/content/Context")) {
+        SWAPPY_LOGE("SwappyDisplayManager requires an android.content.Context");
+        return;
+    }
+
     ScopedLocalRef<jclass>
             swappyDisplayManagerClass(env,
-                                      gamesdk::loadClass(env, mainActivity,
+                                      gamesdk::loadClass(env, context,
                                                          SwappyDisplayManager::SDM_CLASS,
                                                          (JNINativeMethod*)SwappyDisplayManager::
                                                                  SDMNativeMethods,
@@ -93,10 +101,22 @@ SwappyDisplayManager::SwappyDisplayManager(JavaVM* vm, jobject mainActivity) : m
 
     if (swappyDisplayManagerClass.get() == nullptr) return;
 
+    constexpr const char* kContextConstructorSignature = "(JLandroid/content/Context;)V";
+    constexpr const char* kActivityConstructorSignature = "(JLandroid/app/Activity;)V";
     jmethodID constructor = env->GetMethodID(swappyDisplayManagerClass.get(), "<init>",
-                                             "(JLandroid/app/Activity;)V");
-    if (!isUsableResult(env, constructor, "SwappyDisplayManager.<init>")) {
-        return;
+                                             kContextConstructorSignature);
+    if (env->ExceptionCheck() || constructor == nullptr) {
+        env->ExceptionClear();
+        if (isInstanceOf(env, context, "android/app/Activity")) {
+            constructor = env->GetMethodID(swappyDisplayManagerClass.get(), "<init>",
+                                           kActivityConstructorSignature);
+        }
+        if (env->ExceptionCheck() || constructor == nullptr) {
+            env->ExceptionClear();
+            SWAPPY_LOGE("The Java SwappyDisplayManager has no constructor for %s",
+                        kContextConstructorSignature);
+            return;
+        }
     }
     mSetPreferredDisplayModeId =
             env->GetMethodID(swappyDisplayManagerClass.get(), "setPreferredDisplayModeId", "(I)V");
@@ -124,7 +144,7 @@ SwappyDisplayManager::SwappyDisplayManager(JavaVM* vm, jobject mainActivity) : m
                                                  env->NewObject(swappyDisplayManagerClass.get(),
                                                                 constructor,
                                                                 reinterpret_cast<jlong>(this),
-                                                                mainActivity));
+                                                                context));
     if (!isUsableResult(env, swappyDisplayManager.get(), "SwappyDisplayManager instance")) {
         return;
     }

@@ -123,7 +123,14 @@ bool SwappyVk_initAndGetRefreshCycleDuration_internal(JNIEnv* env, jobject jacti
  *
  * @param[in]  env - JNIEnv that is assumed to be from AttachCurrentThread
  * function
- * @param[in]  jactivity - NativeActivity object handle, used for JNI
+ * @param[in]  jactivity - Activity object handle, used for JNI. Any other
+ * android.content.Context also works: display-associated contexts (such as from
+ * createDisplayContext or Presentation) use their associated display on
+ * Android 11 (API 30) and above, while non-display contexts such as a Service
+ * or Application use the default display. Non-Activity contexts have no
+ * window, so Swappy cannot switch the refresh rate through the window below
+ * Android 12 (API 31). Swappy fails to initialize for null or for an object
+ * that is not a Context.
  * @param[in]  physicalDevice   - The VkPhysicalDevice associated with the
  * swapchain
  * @param[in]  device    - The VkDevice associated with the swapchain

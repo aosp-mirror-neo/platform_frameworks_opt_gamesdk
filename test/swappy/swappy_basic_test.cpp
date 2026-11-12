@@ -22,9 +22,11 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "ChoreographerShim.h"
+#include "Settings.h"
 #include "SwappyDisplayManager.h"
 #include "SwappyJniUtils.h"
 #include "gcov_flush_environment.h"
@@ -70,6 +72,13 @@ public:
             jlong, std::shared_ptr<SwappyDisplayManager::RefreshPeriodMap>);
     static void onRefreshPeriodChanged(jlong, long, long, long);
 };
+
+class SwappyDisplayManagerTestPeer {
+public:
+    static jobject javaInstance(const SwappyDisplayManager& displayManager) {
+        return displayManager.mJthis;
+    }
+};
 } // namespace swappy
 
 namespace {
@@ -83,6 +92,14 @@ std::mutex g_mockThreadsMutex;
 std::vector<std::thread> g_mockThreads;
 std::condition_variable g_mockThreadsCv;
 
+// While set, Swappy gets the real libandroid.so, instead of the one with the
+// mocked AChoreographer, so that the tests that run on the real Android
+// runtime see a real choreographer.
+std::atomic<bool> g_useRealLibAndroid{false};
+
+JavaVM* g_realJavaVM = nullptr;
+jclass g_testContextsClass = nullptr;
+
 struct MockFrameData {
     int64_t expectedPresentationTimeNanos;
     int64_t deadlineNanos;
@@ -91,6 +108,26 @@ struct MockFrameData {
 } // namespace
 
 extern "C" {
+
+// Called when the test library is loaded by the Java test runner, which is the
+// only place that hands out the real JavaVM.
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* /* reserved */) {
+    g_realJavaVM = vm;
+
+    // Resolved here, through the class loader that loads this library, because
+    // a thread attached later may not see the test app's classes.
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_OK) {
+        jclass testContextsClass = env->FindClass("com/swappy/testapp/TestContexts");
+        if (testContextsClass != nullptr) {
+            g_testContextsClass = static_cast<jclass>(env->NewGlobalRef(testContextsClass));
+            env->DeleteLocalRef(testContextsClass);
+        } else {
+            env->ExceptionClear();
+        }
+    }
+    return JNI_VERSION_1_6;
+}
 
 void setupMockNDKChoreographer() {
     LOGI("[MockChoreographer] setupMockNDKChoreographer");
@@ -268,10 +305,11 @@ void* getRealLibAndroid() {
 extern "C" {
 
 // Intercepts dlopen calls via the -Wl,--wrap=dlopen linker flag defined in CMakeLists.txt.
-// This allows us to inject mocked AChoreographer symbols for libandroid.so on SDK 37+.
+// This allows us to inject mocked AChoreographer symbols for libandroid.so on SDK 37+, unless a
+// test asks for the real library.
 void* __wrap_dlopen(const char* filename, int flag) {
     LOGI("[__wrap_dlopen] dlopen called for: %s", filename ? filename : "nullptr");
-    if (filename && strcmp(filename, "libandroid.so") == 0) {
+    if (filename && strcmp(filename, "libandroid.so") == 0 && !g_useRealLibAndroid.load()) {
         LOGI("[__wrap_dlopen] Intercepted libandroid.so");
         return reinterpret_cast<void*>(0x1234abcd);
     }
@@ -317,6 +355,11 @@ int __wrap_dlclose(void* handle) {
 namespace android {
 
 namespace swappytest {
+
+// Lets the mocked JNI tell an Activity or UnsupportedOperationException from
+// other Java classes.
+const jclass kMockActivityClass = reinterpret_cast<jclass>(0x40);
+const jclass kMockUnsupportedOperationExceptionClass = reinterpret_cast<jclass>(0x41);
 
 class MockJNI {
 public:
@@ -559,6 +602,137 @@ Java_com_google_androidgamesdk_ChoreographerCallback_nOnChoreographer(JNIEnv* en
                                                                       jlong cookie,
                                                                       jlong frameTimeNanos);
 
+// The real kinds of Context that can host Swappy on the Android runtime, which
+// come from an instance of TestContexts in the test app. All global references,
+// plus any launched Activity or VirtualDisplay, are torn down on destruction.
+class RealContexts {
+public:
+    RealContexts() = default;
+    RealContexts(const RealContexts&) = delete;
+    RealContexts& operator=(const RealContexts&) = delete;
+
+    ~RealContexts() {
+        JNIEnv* env = getEnv();
+        if (env == nullptr) {
+            return;
+        }
+
+        if (mInstance != nullptr && g_testContextsClass != nullptr) {
+            jmethodID closeMethod = env->GetMethodID(g_testContextsClass, "close", "()V");
+            clearPendingException(env);
+            if (closeMethod != nullptr) {
+                env->CallVoidMethod(mInstance, closeMethod);
+                clearPendingException(env);
+            }
+            env->DeleteGlobalRef(mInstance);
+        }
+        for (jobject context : mContexts) {
+            env->DeleteGlobalRef(context);
+        }
+    }
+
+    // The JNIEnv of the thread that runs the test, which is a Java thread.
+    static JNIEnv* getEnv() {
+        JNIEnv* env = nullptr;
+        if (g_realJavaVM == nullptr ||
+            g_realJavaVM->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+            return nullptr;
+        }
+        return env;
+    }
+
+    jobject getApplication() {
+        return callContextMethod("getApplication", "()Landroid/app/Application;");
+    }
+
+    jobject createService() {
+        return callContextMethod("createService", "()Landroid/app/Service;");
+    }
+
+    jobject createDisplayContext() {
+        return callContextMethod("createDisplayContext", "()Landroid/content/Context;");
+    }
+
+    jobject createPresentationContext() {
+        return callContextMethod("createPresentationContext", "()Landroid/content/Context;");
+    }
+
+    jobject launchActivity() {
+        return callContextMethod("launchActivity", "()Landroid/app/Activity;");
+    }
+
+    jint getVirtualDisplayId() {
+        JNIEnv* env = getEnv();
+        if (!ensureInstance(env)) {
+            return 0;
+        }
+        jmethodID methodId = env->GetMethodID(g_testContextsClass, "getVirtualDisplayId", "()I");
+        if (clearPendingException(env) || methodId == nullptr) {
+            return 0;
+        }
+        const jint displayId = env->CallIntMethod(mInstance, methodId);
+        if (clearPendingException(env)) {
+            return 0;
+        }
+        return displayId;
+    }
+
+private:
+    static bool clearPendingException(JNIEnv* env) {
+        if (!env->ExceptionCheck()) {
+            return false;
+        }
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        return true;
+    }
+
+    bool ensureInstance(JNIEnv* env) {
+        if (mInstance != nullptr) {
+            return true;
+        }
+        if (env == nullptr || g_testContextsClass == nullptr) {
+            return false;
+        }
+        jmethodID constructor = env->GetMethodID(g_testContextsClass, "<init>", "()V");
+        if (clearPendingException(env) || constructor == nullptr) {
+            return false;
+        }
+        gamesdk::ScopedLocalRef<jobject> localInstance(env,
+                                                       env->NewObject(g_testContextsClass,
+                                                                      constructor));
+        if (clearPendingException(env) || localInstance.get() == nullptr) {
+            return false;
+        }
+        mInstance = env->NewGlobalRef(localInstance.get());
+        return mInstance != nullptr;
+    }
+
+    jobject callContextMethod(const char* method, const char* signature) {
+        JNIEnv* env = getEnv();
+        if (!ensureInstance(env)) {
+            return nullptr;
+        }
+        jmethodID methodId = env->GetMethodID(g_testContextsClass, method, signature);
+        if (clearPendingException(env) || methodId == nullptr) {
+            return nullptr;
+        }
+        gamesdk::ScopedLocalRef<jobject> localContext(env,
+                                                      env->CallObjectMethod(mInstance, methodId));
+        if (clearPendingException(env) || localContext.get() == nullptr) {
+            return nullptr;
+        }
+        jobject globalRef = env->NewGlobalRef(localContext.get());
+        if (globalRef != nullptr) {
+            mContexts.push_back(globalRef);
+        }
+        return globalRef;
+    }
+
+    jobject mInstance = nullptr;
+    std::vector<jobject> mContexts;
+};
+
 class AImageReaderSwapchainTestBase : public ::testing::Test {
 private:
     std::atomic<jlong> mChoreographerCookie{0};
@@ -586,6 +760,10 @@ public:
     std::mutex mAcquiredImagesMutex;
     std::condition_variable mAcquiredImagesCv;
     int mAcquiredImages = 0;
+    std::vector<std::string> mRequestedServiceNames;
+    std::vector<jobject> mGetSystemServiceReceivers;
+    std::vector<jint> mRequestedDisplayIds;
+    std::vector<jobject> mGetDisplayReceivers;
     _JNIEnv mEnvStruct;
     JNIInvokeInterface mInvokeInterface = {};
     _JavaVM mJavaVM;
@@ -701,6 +879,11 @@ public:
 
         ON_CALL(mMockJni, FindClass(testing::_, testing::_))
                 .WillByDefault(testing::Return(reinterpret_cast<jclass>(0x1)));
+        ON_CALL(mMockJni, FindClass(testing::_, testing::StrEq("android/app/Activity")))
+                .WillByDefault(testing::Return(kMockActivityClass));
+        ON_CALL(mMockJni,
+                FindClass(testing::_, testing::StrEq("java/lang/UnsupportedOperationException")))
+                .WillByDefault(testing::Return(kMockUnsupportedOperationExceptionClass));
         ON_CALL(mMockJni, ExceptionCheck(testing::_))
                 .WillByDefault(testing::Invoke([this](JNIEnv*) {
                     return mPendingException.load() ? JNI_TRUE : JNI_FALSE;
@@ -780,7 +963,8 @@ public:
 
         ON_CALL(mMockJni,
                 GetMethodID(testing::_, testing::_, testing::StrEq("<init>"),
-                            testing::StrEq("(JLandroid/app/Activity;)V")))
+                            testing::AnyOf(testing::StrEq("(JLandroid/app/Activity;)V"),
+                                           testing::StrEq("(JLandroid/content/Context;)V"))))
                 .WillByDefault(testing::Return(kSwappyDisplayManagerConstructor));
 
         ON_CALL(mMockJni,
@@ -958,7 +1142,14 @@ public:
                 }));
     }
 
-    void reportAsNonActivity(jobject object) {
+    // Makes `object` an instance of Context, but not of Activity, like a
+    // Service or an Application.
+    void reportAsNonActivityContext(jobject object) {
+        ON_CALL(mMockJni, IsInstanceOf(testing::_, object, kMockActivityClass))
+                .WillByDefault(testing::Return(JNI_FALSE));
+    }
+
+    void reportAsNonContext(jobject object) {
         ON_CALL(mMockJni, IsInstanceOf(testing::_, object, testing::_))
                 .WillByDefault(testing::Return(JNI_FALSE));
     }
@@ -998,8 +1189,105 @@ public:
                         }));
     }
 
+    // Records Context.getDisplay() calls in mGetDisplayReceivers and returns
+    // `display`. If `throwUnsupported` is true, throws a mocked
+    // UnsupportedOperationException instead.
+    void trackContextGetDisplayCalls(jobject display, bool throwUnsupported = false) {
+        const jmethodID contextGetDisplay = reinterpret_cast<jmethodID>(0x33);
+        const jclass contextClass = reinterpret_cast<jclass>(0x42);
+        const jclass displayManagerClass = reinterpret_cast<jclass>(0x43);
+        ON_CALL(mMockJni, FindClass(testing::_, testing::StrEq("android/content/Context")))
+                .WillByDefault(testing::Return(contextClass));
+        ON_CALL(mMockJni,
+                FindClass(testing::_, testing::StrEq("android/hardware/display/DisplayManager")))
+                .WillByDefault(testing::Return(displayManagerClass));
+        ON_CALL(mMockJni,
+                GetMethodID(testing::_, contextClass, testing::StrEq("getDisplay"),
+                            testing::StrEq("()Landroid/view/Display;")))
+                .WillByDefault(testing::Return(contextGetDisplay));
+        ON_CALL(mMockJni, CallObjectMethodV(testing::_, testing::_, contextGetDisplay, testing::_))
+                .WillByDefault(testing::Invoke(
+                        [this, display, throwUnsupported](JNIEnv*, jobject receiver, jmethodID,
+                                                          va_list) -> jobject {
+                            mGetDisplayReceivers.push_back(receiver);
+                            if (throwUnsupported) {
+                                mPendingException = true;
+                                return nullptr;
+                            }
+                            return display;
+                        }));
+        if (throwUnsupported) {
+            const jthrowable mockUnsupported = reinterpret_cast<jthrowable>(0x44);
+            ON_CALL(mMockJni, ExceptionOccurred(testing::_))
+                    .WillByDefault(testing::Invoke([this, mockUnsupported](JNIEnv*) -> jthrowable {
+                        return mPendingException.load() ? mockUnsupported : nullptr;
+                    }));
+            ON_CALL(mMockJni,
+                    IsInstanceOf(testing::_, mockUnsupported,
+                                 kMockUnsupportedOperationExceptionClass))
+                    .WillByDefault(testing::Return(JNI_TRUE));
+        }
+    }
+
+    // Makes the mocked display service answer like a device would, and records
+    // in mRequestedServiceNames, mGetSystemServiceReceivers and
+    // mRequestedDisplayIds how Swappy asked for the default display.
+    void trackDisplayServiceCalls() {
+        const jmethodID getSystemService = reinterpret_cast<jmethodID>(0x31);
+        const jmethodID displayManagerGetDisplay = reinterpret_cast<jmethodID>(0x32);
+        ON_CALL(mMockJni,
+                GetMethodID(testing::_, testing::_, testing::StrEq("getSystemService"), testing::_))
+                .WillByDefault(testing::Return(getSystemService));
+        ON_CALL(mMockJni,
+                GetMethodID(testing::_, testing::_, testing::StrEq("getDisplay"),
+                            testing::StrEq("(I)Landroid/view/Display;")))
+                .WillByDefault(testing::Return(displayManagerGetDisplay));
+        ON_CALL(mMockJni, NewStringUTF(testing::_, testing::_))
+                .WillByDefault(testing::Invoke([this](JNIEnv*, const char* name) {
+                    mRequestedServiceNames.push_back(name);
+                    return reinterpret_cast<jstring>(0x7);
+                }));
+        ON_CALL(mMockJni, CallObjectMethodV(testing::_, testing::_, getSystemService, testing::_))
+                .WillByDefault(
+                        testing::Invoke([this](JNIEnv*, jobject receiver, jmethodID, va_list) {
+                            mGetSystemServiceReceivers.push_back(receiver);
+                            return reinterpret_cast<jobject>(0x9);
+                        }));
+        ON_CALL(mMockJni,
+                CallObjectMethodV(testing::_, testing::_, displayManagerGetDisplay, testing::_))
+                .WillByDefault(testing::Invoke([this](JNIEnv*, jobject, jmethodID, va_list args) {
+                    va_list argsCopy;
+                    va_copy(argsCopy, args);
+                    mRequestedDisplayIds.push_back(va_arg(argsCopy, jint));
+                    va_end(argsCopy);
+                    return reinterpret_cast<jobject>(0xA);
+                }));
+    }
+
+    void makeDisplayServiceUnavailable() {
+        ON_CALL(mMockJni,
+                CallObjectMethodV(testing::_, testing::_, reinterpret_cast<jmethodID>(0x31),
+                                  testing::_))
+                .WillByDefault(testing::Return(nullptr));
+    }
+
+    void expectDisplayReadThroughDisplayService(jobject context) {
+        EXPECT_EQ(0, mGetWindowManagerCalls.load());
+        EXPECT_THAT(mRequestedServiceNames, testing::Contains("display"));
+        EXPECT_THAT(mRequestedServiceNames, testing::Not(testing::Contains("window")));
+        EXPECT_EQ(std::vector<jobject>{context}, mGetSystemServiceReceivers);
+        EXPECT_EQ(std::vector<jint>{0}, mRequestedDisplayIds);
+    }
+
+    void expectDisplayReadThroughContextGetDisplay(jobject context) {
+        EXPECT_EQ(0, mGetWindowManagerCalls.load());
+        EXPECT_EQ(std::vector<jobject>{context}, mGetDisplayReceivers);
+        EXPECT_TRUE(mGetSystemServiceReceivers.empty());
+        EXPECT_TRUE(mRequestedDisplayIds.empty());
+    }
+
     // Expectations shared by the tests that initialize Swappy with an object
-    // that is not an Activity.
+    // that is not a Context.
     void expectNoActivityMethodCalledAndNothingLeaked() {
         EXPECT_EQ(0, mGetWindowManagerCalls.load());
         EXPECT_FALSE(mPendingException.load());
@@ -1299,7 +1587,7 @@ public:
         trackGetWindowManagerCalls();
         trackGlobalRefs();
         if (context != nullptr) {
-            reportAsNonActivity(context);
+            reportAsNonContext(context);
         }
 
         std::vector<const char*> instanceLayers;
@@ -1317,6 +1605,28 @@ public:
         cleanUpSwapchainForTest();
         expectNoActivityMethodCalledAndNothingLeaked();
     }
+
+    struct ScopedSemaphore {
+        VkDevice device = VK_NULL_HANDLE;
+        VkSemaphore semaphore = VK_NULL_HANDLE;
+        ScopedSemaphore(VkDevice device, VkSemaphore semaphore)
+              : device(device), semaphore(semaphore) {}
+        ScopedSemaphore(const ScopedSemaphore&) = delete;
+        ScopedSemaphore& operator=(const ScopedSemaphore&) = delete;
+        ScopedSemaphore(ScopedSemaphore&& other) noexcept
+              : device(other.device), semaphore(std::exchange(other.semaphore, VK_NULL_HANDLE)) {}
+        ScopedSemaphore& operator=(ScopedSemaphore&& other) noexcept {
+            if (this != &other) {
+                vkDestroySemaphore(device, semaphore, nullptr);
+                device = other.device;
+                semaphore = std::exchange(other.semaphore, VK_NULL_HANDLE);
+            }
+            return *this;
+        }
+        ~ScopedSemaphore() {
+            vkDestroySemaphore(device, semaphore, nullptr);
+        }
+    };
 };
 
 TEST_F(AImageReaderVulkanSwapchainTest, TestHelperMethods) {
@@ -2667,7 +2977,7 @@ public:
         trackGetWindowManagerCalls();
         trackGlobalRefs();
         if (context != nullptr) {
-            reportAsNonActivity(context);
+            reportAsNonContext(context);
         }
         buildEGLForTest();
 
@@ -2892,8 +3202,69 @@ TEST_F(AImageReaderVulkanSwapchainTest, InitFailsGracefullyWithNullContext) {
     expectInitFailsGracefully(nullptr);
 }
 
-TEST_F(AImageReaderVulkanSwapchainTest, InitFailsGracefullyWithNonActivityObject) {
+TEST_F(AImageReaderVulkanSwapchainTest, InitFailsGracefullyWithNonContextObject) {
     expectInitFailsGracefully(reinterpret_cast<jobject>(0x4321));
+}
+
+TEST_F(AImageReaderVulkanSwapchainTest, InitializesWithNonActivityContext) {
+    setupMockJni(23);
+    trackGetWindowManagerCalls();
+    trackDisplayServiceCalls();
+    jobject serviceContext = reinterpret_cast<jobject>(0x4321);
+    reportAsNonActivityContext(serviceContext);
+
+    std::vector<const char*> instanceLayers;
+    std::vector<const char*> deviceLayers;
+    buildSwapchainForTest(instanceLayers, deviceLayers);
+
+    uint64_t refreshDuration = 0;
+    EXPECT_TRUE(SwappyVk_initAndGetRefreshCycleDuration(gMockEnv, serviceContext, mPhysicalDev,
+                                                        mDevice, mSwapchain, &refreshDuration));
+    EXPECT_GT(refreshDuration, 0U);
+    expectDisplayReadThroughDisplayService(serviceContext);
+}
+
+TEST_F(AImageReaderVulkanSwapchainTest, InitializesWithAssociatedDisplayContextOnSdk30Plus) {
+    setupMockJni(30);
+    trackGetWindowManagerCalls();
+    trackDisplayServiceCalls();
+    jobject displayContext = reinterpret_cast<jobject>(0x4322);
+    jobject associatedDisplay = reinterpret_cast<jobject>(0x5555);
+    reportAsNonActivityContext(displayContext);
+    trackContextGetDisplayCalls(associatedDisplay);
+
+    std::vector<const char*> instanceLayers;
+    std::vector<const char*> deviceLayers;
+    buildSwapchainForTest(instanceLayers, deviceLayers);
+
+    uint64_t refreshDuration = 0;
+    EXPECT_TRUE(SwappyVk_initAndGetRefreshCycleDuration(gMockEnv, displayContext, mPhysicalDev,
+                                                        mDevice, mSwapchain, &refreshDuration));
+    EXPECT_GT(refreshDuration, 0U);
+    EXPECT_GT(SwappyVk_getSupportedRefreshPeriodsNS(nullptr, 0, mSwapchain), 0);
+    expectDisplayReadThroughContextGetDisplay(displayContext);
+}
+
+TEST_F(AImageReaderVulkanSwapchainTest,
+       FallsBackToDisplayManagerWhenContextGetDisplayThrowsUnsupportedOnSdk30Plus) {
+    setupMockJni(30);
+    trackGetWindowManagerCalls();
+    trackDisplayServiceCalls();
+    jobject serviceContext = reinterpret_cast<jobject>(0x4323);
+    reportAsNonActivityContext(serviceContext);
+    trackContextGetDisplayCalls(nullptr, /*throwUnsupported=*/true);
+
+    std::vector<const char*> instanceLayers;
+    std::vector<const char*> deviceLayers;
+    buildSwapchainForTest(instanceLayers, deviceLayers);
+
+    uint64_t refreshDuration = 0;
+    EXPECT_TRUE(SwappyVk_initAndGetRefreshCycleDuration(gMockEnv, serviceContext, mPhysicalDev,
+                                                        mDevice, mSwapchain, &refreshDuration));
+    EXPECT_GT(refreshDuration, 0U);
+    EXPECT_GT(SwappyVk_getSupportedRefreshPeriodsNS(nullptr, 0, mSwapchain), 0);
+    EXPECT_FALSE(mPendingException.load());
+    expectDisplayReadThroughDisplayService(serviceContext);
 }
 TEST_F(AImageReaderVulkanSwapchainTest, EntryPointsAreSafeOnUninitializedSwapchain) {
     std::vector<const char*> instanceLayers;
@@ -3311,8 +3682,159 @@ TEST_F(AImageReaderEGLSwapchainTest, InitFailsGracefullyWithNullContext) {
     expectInitFailsGracefully(nullptr);
 }
 
-TEST_F(AImageReaderEGLSwapchainTest, InitFailsGracefullyWithNonActivityObject) {
+TEST_F(AImageReaderEGLSwapchainTest, InitFailsGracefullyWithNonContextObject) {
     expectInitFailsGracefully(reinterpret_cast<jobject>(0x4321));
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, InitializesWithNonActivityContext) {
+    setupMockJni(23);
+    trackGetWindowManagerCalls();
+    trackDisplayServiceCalls();
+    jobject serviceContext = reinterpret_cast<jobject>(0x4321);
+    reportAsNonActivityContext(serviceContext);
+    buildEGLForTest();
+
+    EXPECT_TRUE(SwappyGL_init(gMockEnv, serviceContext));
+    EXPECT_TRUE(SwappyGL_isEnabled());
+    EXPECT_GT(SwappyGL_getRefreshPeriodNanos(), 0U);
+    expectDisplayReadThroughDisplayService(serviceContext);
+
+    SwappyGL_destroy();
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, InitializesWithAssociatedDisplayContextOnSdk30Plus) {
+    setupMockJni(30);
+    trackGetWindowManagerCalls();
+    trackDisplayServiceCalls();
+    jobject displayContext = reinterpret_cast<jobject>(0x4322);
+    jobject associatedDisplay = reinterpret_cast<jobject>(0x5555);
+    reportAsNonActivityContext(displayContext);
+    trackContextGetDisplayCalls(associatedDisplay);
+    buildEGLForTest();
+
+    EXPECT_TRUE(SwappyGL_init(gMockEnv, displayContext));
+    EXPECT_TRUE(SwappyGL_isEnabled());
+    EXPECT_GT(SwappyGL_getRefreshPeriodNanos(), 0U);
+    EXPECT_GT(SwappyGL_getSupportedRefreshPeriodsNS(nullptr, 0), 0);
+    expectDisplayReadThroughContextGetDisplay(displayContext);
+
+    SwappyGL_destroy();
+}
+
+TEST_F(AImageReaderEGLSwapchainTest,
+       FallsBackToDisplayManagerWhenContextGetDisplayThrowsUnsupportedOnSdk30Plus) {
+    setupMockJni(30);
+    trackGetWindowManagerCalls();
+    trackDisplayServiceCalls();
+    jobject serviceContext = reinterpret_cast<jobject>(0x4323);
+    reportAsNonActivityContext(serviceContext);
+    trackContextGetDisplayCalls(nullptr, /*throwUnsupported=*/true);
+    buildEGLForTest();
+
+    EXPECT_TRUE(SwappyGL_init(gMockEnv, serviceContext));
+    EXPECT_TRUE(SwappyGL_isEnabled());
+    EXPECT_GT(SwappyGL_getRefreshPeriodNanos(), 0U);
+    EXPECT_GT(SwappyGL_getSupportedRefreshPeriodsNS(nullptr, 0), 0);
+    EXPECT_FALSE(mPendingException.load());
+    expectDisplayReadThroughDisplayService(serviceContext);
+
+    SwappyGL_destroy();
+}
+
+TEST_F(AImageReaderEGLSwapchainTest,
+       InitFailsWhenContextGetDisplayThrowsUnexpectedExceptionOnSdk30Plus) {
+    setupMockJni(30);
+    trackGlobalRefs();
+    trackDisplayServiceCalls();
+    jobject brokenDisplayContext = reinterpret_cast<jobject>(0x4324);
+    reportAsNonActivityContext(brokenDisplayContext);
+    trackContextGetDisplayCalls(nullptr, /*throwUnsupported=*/true);
+    const jthrowable unexpectedException = reinterpret_cast<jthrowable>(0x45);
+    ON_CALL(mMockJni, ExceptionOccurred(testing::_))
+            .WillByDefault(testing::Invoke([this, unexpectedException](JNIEnv*) -> jthrowable {
+                return mPendingException.load() ? unexpectedException : nullptr;
+            }));
+    ON_CALL(mMockJni,
+            IsInstanceOf(testing::_, unexpectedException, kMockUnsupportedOperationExceptionClass))
+            .WillByDefault(testing::Return(JNI_FALSE));
+    buildEGLForTest();
+
+    EXPECT_FALSE(SwappyGL_init(gMockEnv, brokenDisplayContext));
+    EXPECT_FALSE(SwappyGL_isEnabled());
+    EXPECT_FALSE(mPendingException.load());
+    EXPECT_TRUE(mGetSystemServiceReceivers.empty());
+
+    SwappyGL_destroy();
+    EXPECT_EQ(mCreatedGlobalRefs.load(), mDeletedGlobalRefs.load());
+    EXPECT_EQ(gCreatedLocalRefs.load(), gDeletedLocalRefs.load());
+}
+
+TEST_F(AImageReaderEGLSwapchainTest,
+       ServiceContextRefreshRateCallbackSkipsContextGetDisplayAndReleasesLocalsOnSdk37) {
+    setupMockJni(37);
+    setupMockNDKChoreographer();
+    trackDisplayServiceCalls();
+    jobject serviceContext = reinterpret_cast<jobject>(0x4325);
+    reportAsNonActivityContext(serviceContext);
+    trackContextGetDisplayCalls(nullptr, /*throwUnsupported=*/true);
+    buildEGLForTest();
+
+    ASSERT_TRUE(SwappyGL_init(gMockEnv, serviceContext));
+    EXPECT_EQ(std::vector<jobject>{serviceContext}, mGetDisplayReceivers);
+    ASSERT_EQ(1U, mRequestedDisplayIds.size());
+    const int netLocalRefsAfterInit = gCreatedLocalRefs.load() - gDeletedLocalRefs.load();
+
+    constexpr int kCallbackIterations = 600;
+    for (int i = 0; i < kCallbackIterations; ++i) {
+        ASSERT_TRUE(triggerMockRefreshRateCallback(11'111'111));
+    }
+
+    // Service Contexts resolve to DefaultDisplay once at init and query DisplayManager
+    // on each refresh-rate change instead of re-throwing UnsupportedOperationException.
+    EXPECT_EQ(std::vector<jobject>{serviceContext}, mGetDisplayReceivers);
+    EXPECT_EQ(static_cast<size_t>(1 + kCallbackIterations), mRequestedDisplayIds.size());
+    EXPECT_EQ(gCreatedLocalRefs.load() - gDeletedLocalRefs.load(), netLocalRefsAfterInit);
+
+    cleanupMockNDKChoreographer();
+    SwappyGL_destroy();
+}
+
+TEST_F(AImageReaderEGLSwapchainTest,
+       AssociatedDisplayContextRefreshRateCallbackQueriesContextGetDisplayOnSdk37) {
+    setupMockJni(37);
+    setupMockNDKChoreographer();
+    trackDisplayServiceCalls();
+    jobject displayContext = reinterpret_cast<jobject>(0x4326);
+    jobject associatedDisplay = reinterpret_cast<jobject>(0x4327);
+    reportAsNonActivityContext(displayContext);
+    trackContextGetDisplayCalls(associatedDisplay);
+    buildEGLForTest();
+
+    ASSERT_TRUE(SwappyGL_init(gMockEnv, displayContext));
+    ASSERT_EQ(1U, mGetDisplayReceivers.size());
+
+    ASSERT_TRUE(triggerMockRefreshRateCallback(8'333'333));
+    EXPECT_EQ((std::vector<jobject>{displayContext, displayContext}), mGetDisplayReceivers);
+    EXPECT_TRUE(mGetSystemServiceReceivers.empty());
+
+    cleanupMockNDKChoreographer();
+    SwappyGL_destroy();
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, InitFailsGracefullyWhenDisplayServiceIsUnavailable) {
+    setupMockJni(23);
+    trackGlobalRefs();
+    trackDisplayServiceCalls();
+    makeDisplayServiceUnavailable();
+    jobject serviceContext = reinterpret_cast<jobject>(0x4321);
+    reportAsNonActivityContext(serviceContext);
+    buildEGLForTest();
+
+    EXPECT_FALSE(SwappyGL_init(gMockEnv, serviceContext));
+    EXPECT_FALSE(SwappyGL_isEnabled());
+
+    SwappyGL_destroy();
+    EXPECT_EQ(mCreatedGlobalRefs.load(), mDeletedGlobalRefs.load());
 }
 
 TEST_F(AImageReaderEGLSwapchainTest, InitFailsGracefullyWhenDisplayQueryThrows) {
@@ -3626,11 +4148,11 @@ TEST_F(AImageReaderEGLSwapchainTest, InitFailsGracefullyWithoutJavaVM) {
 
 TEST_F(AImageReaderEGLSwapchainTest, SwapsAfterFailedInit) {
     setupMockJni(23);
-    jobject notAnActivity = reinterpret_cast<jobject>(0x4321);
-    reportAsNonActivity(notAnActivity);
+    jobject notAContext = reinterpret_cast<jobject>(0x4321);
+    reportAsNonContext(notAContext);
     buildEGLForTest();
 
-    ASSERT_FALSE(SwappyGL_init(gMockEnv, notAnActivity));
+    ASSERT_FALSE(SwappyGL_init(gMockEnv, notAContext));
 
     // The app may ignore the failure and keep calling SwappyGL_swap.
     for (int i = 0; i < 3; ++i) {
@@ -3645,11 +4167,11 @@ TEST_F(AImageReaderEGLSwapchainTest, SwapsAfterFailedInit) {
 
 TEST_F(AImageReaderEGLSwapchainTest, EntryPointsAreSafeAfterFailedInit) {
     setupMockJni(23);
-    jobject notAnActivity = reinterpret_cast<jobject>(0x4321);
-    reportAsNonActivity(notAnActivity);
+    jobject notAContext = reinterpret_cast<jobject>(0x4321);
+    reportAsNonContext(notAContext);
     buildEGLForTest();
 
-    ASSERT_FALSE(SwappyGL_init(gMockEnv, notAnActivity));
+    ASSERT_FALSE(SwappyGL_init(gMockEnv, notAContext));
 
     SwappyTracer tracer{};
     SwappyGL_injectTracer(&tracer);
@@ -3764,6 +4286,353 @@ TEST_F(AImageReaderEGLSwapchainTest, ToleratesMissingDisableRenderAheadMethod) {
 
     cleanupMockNDKChoreographer();
     SwappyGL_destroy();
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, FallsBackToActivityConstructorWhenContextConstructorMissing) {
+    setupMockJni(37);
+    setupMockNDKChoreographer();
+    buildEGLForTest();
+
+    bool pendingException = false;
+    int exceptionClears = 0;
+    ON_CALL(mMockJni,
+            GetMethodID(testing::_, testing::_, testing::StrEq("<init>"),
+                        testing::StrEq("(JLandroid/content/Context;)V")))
+            .WillByDefault(testing::Invoke([&](JNIEnv*, jclass, const char*, const char*) {
+                pendingException = true;
+                return nullptr;
+            }));
+    ON_CALL(mMockJni, ExceptionCheck(testing::_)).WillByDefault(testing::Invoke([&](JNIEnv*) {
+        return pendingException ? JNI_TRUE : JNI_FALSE;
+    }));
+    ON_CALL(mMockJni, ExceptionClear(testing::_)).WillByDefault(testing::Invoke([&](JNIEnv*) {
+        pendingException = false;
+        ++exceptionClears;
+    }));
+
+    jobject fakeActivity = reinterpret_cast<jobject>(0x1234);
+    EXPECT_TRUE(SwappyGL_init(gMockEnv, fakeActivity));
+    EXPECT_FALSE(pendingException);
+    EXPECT_EQ(exceptionClears, 1);
+
+    cleanupMockNDKChoreographer();
+    SwappyGL_destroy();
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, NonActivityContextFailsWhenContextConstructorMissing) {
+    setupMockJni(37);
+    setupMockNDKChoreographer();
+    trackDisplayServiceCalls();
+    jobject serviceContext = reinterpret_cast<jobject>(0x4328);
+    reportAsNonActivityContext(serviceContext);
+    trackContextGetDisplayCalls(nullptr, /*throwUnsupported=*/true);
+    buildEGLForTest();
+
+    bool activityConstructorQueried = false;
+    ON_CALL(mMockJni,
+            GetMethodID(testing::_, testing::_, testing::StrEq("<init>"),
+                        testing::StrEq("(JLandroid/content/Context;)V")))
+            .WillByDefault(testing::Invoke([this](JNIEnv*, jclass, const char*, const char*) {
+                mPendingException = true;
+                return nullptr;
+            }));
+    ON_CALL(mMockJni,
+            GetMethodID(testing::_, testing::_, testing::StrEq("<init>"),
+                        testing::StrEq("(JLandroid/app/Activity;)V")))
+            .WillByDefault(testing::Invoke([&](JNIEnv*, jclass, const char*, const char*) {
+                activityConstructorQueried = true;
+                return reinterpret_cast<jmethodID>(0x21);
+            }));
+
+    EXPECT_FALSE(SwappyGL_init(gMockEnv, serviceContext));
+    EXPECT_FALSE(activityConstructorQueried);
+    EXPECT_FALSE(mPendingException.load());
+
+    cleanupMockNDKChoreographer();
+    SwappyGL_destroy();
+}
+
+class SwappyDisplayManagerMockTest : public AImageReaderSwapchainTestBase {};
+
+TEST_F(SwappyDisplayManagerMockTest, FailsGracefullyWithNonContextObject) {
+    setupMockJni(29);
+    jobject notAContext = reinterpret_cast<jobject>(0x4321);
+    reportAsNonContext(notAContext);
+
+    swappy::SwappyDisplayManager displayManager(&mJavaVM, notAContext);
+
+    EXPECT_FALSE(displayManager.isInitialized());
+}
+
+class AImageReaderEGLRealRuntimeTest : public AImageReaderEGLSwapchainTest {
+public:
+    RealContexts mRealContexts;
+
+    void SetUp() override {
+        if (g_realJavaVM == nullptr) {
+            GTEST_SKIP() << "Requires Android app runtime (JNI_OnLoad)";
+        }
+        g_useRealLibAndroid = true;
+    }
+
+    void TearDown() override {
+        g_useRealLibAndroid = false;
+        AImageReaderEGLSwapchainTest::TearDown();
+    }
+
+    void expectSwappyPacesFramesWith(jobject context) {
+        ASSERT_NE(nullptr, context) << "Failed to get the Context from the test app";
+        buildEGLForTest();
+
+        ASSERT_TRUE(SwappyGL_init(RealContexts::getEnv(), context));
+        EXPECT_TRUE(SwappyGL_isEnabled());
+        EXPECT_GT(SwappyGL_getRefreshPeriodNanos(), 0U);
+        EXPECT_TRUE(SwappyGL_setWindow(mWindow));
+        SwappyGL_setSwapIntervalNS(SWAPPY_SWAP_60FPS);
+
+        for (int i = 0; i < 5; ++i) {
+            glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            SwappyGL_recordFrameStart(mDisplay, mSurface);
+            EXPECT_TRUE(SwappyGL_swap(mDisplay, mSurface));
+        }
+        EXPECT_TRUE(waitForAcquiredImages(1)) << "No frame reached the AImageReader";
+
+        SwappyGL_destroy();
+    }
+};
+
+TEST_F(AImageReaderEGLRealRuntimeTest, PacesFramesWithApplicationContext) {
+    expectSwappyPacesFramesWith(mRealContexts.getApplication());
+}
+
+TEST_F(AImageReaderEGLRealRuntimeTest, PacesFramesWithServiceContext) {
+    expectSwappyPacesFramesWith(mRealContexts.createService());
+}
+
+TEST_F(AImageReaderEGLRealRuntimeTest, PacesFramesWithDisplayContext) {
+    jobject displayContext = mRealContexts.createDisplayContext();
+    EXPECT_GT(mRealContexts.getVirtualDisplayId(), 0);
+    expectSwappyPacesFramesWith(displayContext);
+}
+
+TEST_F(AImageReaderEGLRealRuntimeTest, PacesFramesWithPresentationContext) {
+    jobject presentationContext = mRealContexts.createPresentationContext();
+    EXPECT_GT(mRealContexts.getVirtualDisplayId(), 0);
+    expectSwappyPacesFramesWith(presentationContext);
+}
+
+TEST_F(AImageReaderEGLRealRuntimeTest, PacesFramesWithActivity) {
+    expectSwappyPacesFramesWith(mRealContexts.launchActivity());
+}
+
+class AImageReaderVulkanRealRuntimeTest : public AImageReaderVulkanSwapchainTest {
+public:
+    RealContexts mRealContexts;
+
+    void SetUp() override {
+        if (g_realJavaVM == nullptr) {
+            GTEST_SKIP() << "Requires Android app runtime (JNI_OnLoad)";
+        }
+        g_useRealLibAndroid = true;
+    }
+
+    void TearDown() override {
+        g_useRealLibAndroid = false;
+        AImageReaderVulkanSwapchainTest::TearDown();
+    }
+
+    void expectSwappyPacesFramesWith(jobject context) {
+        ASSERT_NE(nullptr, context) << "Failed to get the Context from the test app";
+        std::vector<const char*> instanceLayers;
+        std::vector<const char*> deviceLayers;
+        buildSwapchainForTest(instanceLayers, deviceLayers);
+
+        uint64_t refreshDuration = 0;
+        ASSERT_TRUE(SwappyVk_initAndGetRefreshCycleDuration(RealContexts::getEnv(), context,
+                                                            mPhysicalDev, mDevice, mSwapchain,
+                                                            &refreshDuration));
+        EXPECT_GT(refreshDuration, 0U);
+        SwappyVk_setQueueFamilyIndex(mDevice, mPresentQueue, mPresentQueueFamily);
+        SwappyVk_setSwapIntervalNS(mDevice, mSwapchain, SWAPPY_SWAP_60FPS);
+
+        {
+            constexpr int kFrameCount = 5;
+            std::vector<ScopedSemaphore> imageAvailableSemaphores;
+            imageAvailableSemaphores.reserve(kFrameCount);
+            for (int i = 0; i < kFrameCount; ++i) {
+                VkSemaphoreCreateInfo semaphoreInfo{};
+                semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+                VkSemaphore rawSemaphore = VK_NULL_HANDLE;
+                VK_CHECK(vkCreateSemaphore(mDevice, &semaphoreInfo, nullptr, &rawSemaphore));
+                imageAvailableSemaphores.emplace_back(mDevice, rawSemaphore);
+                VkSemaphore acquireSemaphore = imageAvailableSemaphores.back().semaphore;
+
+                uint32_t imageIndex;
+                ASSERT_EQ(VK_SUCCESS,
+                          vkAcquireNextImageKHR(mDevice, mSwapchain, UINT64_MAX, acquireSemaphore,
+                                                VK_NULL_HANDLE, &imageIndex));
+                SwappyVk_recordFrameStart(mPresentQueue, mSwapchain, imageIndex);
+
+                VkPresentInfoKHR presentInfo{};
+                presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+                presentInfo.waitSemaphoreCount = 1;
+                presentInfo.pWaitSemaphores = &acquireSemaphore;
+                presentInfo.swapchainCount = 1;
+                presentInfo.pSwapchains = &mSwapchain;
+                presentInfo.pImageIndices = &imageIndex;
+                EXPECT_EQ(VK_SUCCESS, SwappyVk_queuePresent(mPresentQueue, &presentInfo));
+            }
+            EXPECT_TRUE(waitForAcquiredImages(1)) << "No frame reached the AImageReader";
+            VK_CHECK(vkQueueWaitIdle(mPresentQueue));
+        }
+
+        cleanUpSwapchainForTest();
+    }
+};
+
+TEST_F(AImageReaderVulkanRealRuntimeTest, PacesFramesWithApplicationContext) {
+    expectSwappyPacesFramesWith(mRealContexts.getApplication());
+}
+
+TEST_F(AImageReaderVulkanRealRuntimeTest, PacesFramesWithServiceContext) {
+    expectSwappyPacesFramesWith(mRealContexts.createService());
+}
+
+TEST_F(AImageReaderVulkanRealRuntimeTest, PacesFramesWithDisplayContext) {
+    jobject displayContext = mRealContexts.createDisplayContext();
+    EXPECT_GT(mRealContexts.getVirtualDisplayId(), 0);
+    expectSwappyPacesFramesWith(displayContext);
+}
+
+TEST_F(AImageReaderVulkanRealRuntimeTest, PacesFramesWithPresentationContext) {
+    jobject presentationContext = mRealContexts.createPresentationContext();
+    EXPECT_GT(mRealContexts.getVirtualDisplayId(), 0);
+    expectSwappyPacesFramesWith(presentationContext);
+}
+
+TEST_F(AImageReaderVulkanRealRuntimeTest, PacesFramesWithActivity) {
+    expectSwappyPacesFramesWith(mRealContexts.launchActivity());
+}
+
+// Swappy initializes SwappyDisplayManager on Android 9+ to enumerate display
+// modes and observe secondary-display refresh-rate changes.
+class SwappyDisplayManagerRealRuntimeTest : public AImageReaderSwapchainTestBase {
+public:
+    RealContexts mRealContexts;
+
+    void SetUp() override {
+        if (g_realJavaVM == nullptr) {
+            GTEST_SKIP() << "Requires Android app runtime (JNI_OnLoad)";
+        }
+        g_useRealLibAndroid = true;
+    }
+
+    void TearDown() override {
+        g_useRealLibAndroid = false;
+        swappy::Settings::reset();
+        AImageReaderSwapchainTestBase::TearDown();
+    }
+
+    void expectReportsRefreshPeriodsWith(jobject context) {
+        ASSERT_NE(nullptr, context) << "Failed to get the Context from the test app";
+
+        swappy::SwappyDisplayManager displayManager(g_realJavaVM, context);
+
+        ASSERT_TRUE(displayManager.isInitialized());
+        auto refreshPeriods = displayManager.getSupportedRefreshPeriods();
+        ASSERT_NE(nullptr, refreshPeriods);
+        EXPECT_FALSE(refreshPeriods->empty());
+        // Must not crash when there is no window to set the mode on.
+        displayManager.setPreferredDisplayModeId(refreshPeriods->begin()->second);
+    }
+
+    static void dispatchDisplayChangedWithPriorRate(const swappy::SwappyDisplayManager& manager,
+                                                    float priorRefreshRateHz, jint displayId) {
+        JNIEnv* env = RealContexts::getEnv();
+        ASSERT_NE(nullptr, env);
+        jobject javaInstance = swappy::SwappyDisplayManagerTestPeer::javaInstance(manager);
+        ASSERT_NE(nullptr, javaInstance);
+        gamesdk::ScopedLocalRef<jclass> managerClass(env, env->GetObjectClass(javaInstance));
+        ASSERT_NE(nullptr, managerClass.get());
+
+        jfieldID refreshRateField = env->GetFieldID(managerClass.get(), "mCurrentRefreshRate", "F");
+        ASSERT_NE(nullptr, refreshRateField);
+        env->SetFloatField(javaInstance, refreshRateField, priorRefreshRateHz);
+        ASSERT_FALSE(env->ExceptionCheck());
+
+        jmethodID onDisplayChanged =
+                env->GetMethodID(managerClass.get(), "onDisplayChanged", "(I)V");
+        ASSERT_NE(nullptr, onDisplayChanged);
+        env->CallVoidMethod(javaInstance, onDisplayChanged, displayId);
+        ASSERT_FALSE(env->ExceptionCheck());
+    }
+};
+
+TEST_F(SwappyDisplayManagerRealRuntimeTest, ReportsRefreshPeriodsWithApplicationContext) {
+    expectReportsRefreshPeriodsWith(mRealContexts.getApplication());
+}
+
+TEST_F(SwappyDisplayManagerRealRuntimeTest, ReportsRefreshPeriodsWithServiceContext) {
+    expectReportsRefreshPeriodsWith(mRealContexts.createService());
+}
+
+TEST_F(SwappyDisplayManagerRealRuntimeTest, ReportsRefreshPeriodsWithDisplayContext) {
+    jobject displayContext = mRealContexts.createDisplayContext();
+    EXPECT_GT(mRealContexts.getVirtualDisplayId(), 0);
+    expectReportsRefreshPeriodsWith(displayContext);
+}
+
+TEST_F(SwappyDisplayManagerRealRuntimeTest, ReportsRefreshPeriodsWithPresentationContext) {
+    jobject presentationContext = mRealContexts.createPresentationContext();
+    EXPECT_GT(mRealContexts.getVirtualDisplayId(), 0);
+    expectReportsRefreshPeriodsWith(presentationContext);
+}
+
+TEST_F(SwappyDisplayManagerRealRuntimeTest, ReportsRefreshPeriodsWithActivity) {
+    expectReportsRefreshPeriodsWith(mRealContexts.launchActivity());
+}
+
+TEST_F(SwappyDisplayManagerRealRuntimeTest, IgnoresDisplayChangedForOtherDisplayId) {
+    jobject displayContext = mRealContexts.createDisplayContext();
+    ASSERT_NE(nullptr, displayContext);
+    const jint virtualDisplayId = mRealContexts.getVirtualDisplayId();
+    ASSERT_GT(virtualDisplayId, 0);
+
+    swappy::SwappyDisplayManager displayManager(g_realJavaVM, displayContext);
+    ASSERT_TRUE(displayManager.isInitialized());
+    ASSERT_NE(nullptr, displayManager.getSupportedRefreshPeriods());
+
+    constexpr std::chrono::nanoseconds kSentinelPeriod(11'111'111);
+    swappy::Settings::getInstance()->setDisplayTimings(
+            {kSentinelPeriod, std::chrono::nanoseconds(0), std::chrono::nanoseconds(0)});
+
+    dispatchDisplayChangedWithPriorRate(displayManager, /*priorRefreshRateHz=*/123.0f,
+                                        /*displayId=*/0);
+
+    EXPECT_EQ(kSentinelPeriod, swappy::Settings::getInstance()->getDisplayTimings().refreshPeriod);
+}
+
+TEST_F(SwappyDisplayManagerRealRuntimeTest, ForwardsRefreshRateChangeForSecondaryDisplay) {
+    jobject displayContext = mRealContexts.createDisplayContext();
+    ASSERT_NE(nullptr, displayContext);
+    const jint virtualDisplayId = mRealContexts.getVirtualDisplayId();
+    ASSERT_GT(virtualDisplayId, 0);
+
+    swappy::SwappyDisplayManager displayManager(g_realJavaVM, displayContext);
+    ASSERT_TRUE(displayManager.isInitialized());
+    ASSERT_NE(nullptr, displayManager.getSupportedRefreshPeriods());
+
+    constexpr std::chrono::nanoseconds kSentinelPeriod(11'111'111);
+    swappy::Settings::getInstance()->setDisplayTimings(
+            {kSentinelPeriod, std::chrono::nanoseconds(0), std::chrono::nanoseconds(0)});
+
+    dispatchDisplayChangedWithPriorRate(displayManager, /*priorRefreshRateHz=*/123.0f,
+                                        virtualDisplayId);
+
+    const auto updatedPeriod = swappy::Settings::getInstance()->getDisplayTimings().refreshPeriod;
+    EXPECT_GT(updatedPeriod, std::chrono::nanoseconds(0));
+    EXPECT_NE(kSentinelPeriod, updatedPeriod);
 }
 
 } // namespace swappytest

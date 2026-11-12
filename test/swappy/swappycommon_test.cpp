@@ -40,12 +40,6 @@ using namespace swappy;
 using time_point = std::chrono::steady_clock::time_point;
 using duration = std::chrono::steady_clock::duration;
 
-// Spoof these - we shouldn't be doing any Java loading in the tests.
-extern "C" {
-char _binary_classes_dex_start;
-char _binary_classes_dex_end;
-}
-
 namespace swappycommon_test {
 
 class SwappyCommonTest : public SwappyCommon {

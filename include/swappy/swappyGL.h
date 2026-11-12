@@ -37,7 +37,14 @@ extern "C" {
  * @brief Initialize Swappy, getting the required Android parameters from the
  * display subsystem via JNI.
  * @param env The JNI environment where Swappy is used
- * @param jactivity The activity where Swappy is used
+ * @param jactivity The Activity where Swappy is used. Any other
+ * android.content.Context also works: display-associated contexts (such as from
+ * createDisplayContext or Presentation) use their associated display on
+ * Android 11 (API 30) and above, while non-display contexts such as a Service
+ * or Application use the default display. Non-Activity contexts have no
+ * window, so Swappy cannot switch the refresh rate through the window below
+ * Android 12 (API 31). Swappy fails to initialize for null or for an object
+ * that is not a Context.
  * @return false if Swappy failed to initialize.
  * @see SwappyGL_destroy
  */

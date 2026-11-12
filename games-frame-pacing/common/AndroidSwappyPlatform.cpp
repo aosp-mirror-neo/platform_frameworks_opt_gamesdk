@@ -135,6 +135,141 @@ ScopedLocalRef<jobject> getDisplayFromActivity(JNIEnv* env, jobject activity) {
     return display;
 }
 
+enum class AssociatedDisplayLookup { kFound, kUnsupportedContext, kError };
+
+// On API 30+, queries the Display directly associated with `context` (for
+// example from createDisplayContext or Presentation). Non-display Contexts such
+// as Service or Application throw UnsupportedOperationException and return
+// kUnsupportedContext; unexpected JNI or runtime failures return kError.
+AssociatedDisplayLookup getDisplayFromAssociatedContext(JNIEnv* env, jobject context,
+                                                        ScopedLocalRef<jobject>* outDisplay) {
+    *outDisplay = ScopedLocalRef<jobject>(env, nullptr);
+    ScopedLocalRef<jclass> contextClass(env, env->FindClass("android/content/Context"));
+    if (!isUsableResult(env, contextClass.get(), "android.content.Context")) {
+        return AssociatedDisplayLookup::kError;
+    }
+
+    jmethodID getDisplay =
+            env->GetMethodID(contextClass.get(), "getDisplay", "()Landroid/view/Display;");
+    if (!isUsableResult(env, getDisplay, "Context.getDisplay")) {
+        return AssociatedDisplayLookup::kError;
+    }
+
+    ScopedLocalRef<jobject> display(env, env->CallObjectMethod(context, getDisplay));
+    if (env->ExceptionCheck()) {
+        ScopedLocalRef<jthrowable> exception(env, env->ExceptionOccurred());
+        env->ExceptionClear();
+        if (exception.get() != nullptr &&
+            isInstanceOf(env, exception.get(), "java/lang/UnsupportedOperationException")) {
+            return AssociatedDisplayLookup::kUnsupportedContext;
+        }
+        SWAPPY_LOGE("Exception while calling Context.getDisplay");
+        return AssociatedDisplayLookup::kError;
+    }
+    if (display.get() == nullptr) {
+        return AssociatedDisplayLookup::kUnsupportedContext;
+    }
+    *outDisplay = std::move(display);
+    return AssociatedDisplayLookup::kFound;
+}
+
+// Returns the default display of `context` through DisplayManager, which works
+// without a visual context, or a null reference if it cannot be retrieved.
+ScopedLocalRef<jobject> getDefaultDisplayFromDisplayManager(JNIEnv* env, jobject context) {
+    ScopedLocalRef<jclass> contextClass(env, env->FindClass("android/content/Context"));
+    if (!isUsableResult(env, contextClass.get(), "android.content.Context")) {
+        return ScopedLocalRef<jobject>(env, nullptr);
+    }
+
+    jmethodID getSystemService = env->GetMethodID(contextClass.get(), "getSystemService",
+                                                  "(Ljava/lang/String;)Ljava/lang/Object;");
+    if (!isUsableResult(env, getSystemService, "Context.getSystemService")) {
+        return ScopedLocalRef<jobject>(env, nullptr);
+    }
+
+    // The value of Context.DISPLAY_SERVICE.
+    ScopedLocalRef<jstring> displayServiceName(env, env->NewStringUTF("display"));
+    if (!isUsableResult(env, displayServiceName.get(), "the display service name")) {
+        return ScopedLocalRef<jobject>(env, nullptr);
+    }
+
+    ScopedLocalRef<jobject> displayManager(env,
+                                           env->CallObjectMethod(context, getSystemService,
+                                                                 displayServiceName.get()));
+    if (!isUsableResult(env, displayManager.get(), "the DisplayManager")) {
+        return ScopedLocalRef<jobject>(env, nullptr);
+    }
+
+    ScopedLocalRef<jclass> displayManagerClass(env,
+                                               env->FindClass(
+                                                       "android/hardware/display/DisplayManager"));
+    if (!isUsableResult(env, displayManagerClass.get(),
+                        "android.hardware.display.DisplayManager")) {
+        return ScopedLocalRef<jobject>(env, nullptr);
+    }
+
+    jmethodID getDisplay =
+            env->GetMethodID(displayManagerClass.get(), "getDisplay", "(I)Landroid/view/Display;");
+    if (!isUsableResult(env, getDisplay, "DisplayManager.getDisplay")) {
+        return ScopedLocalRef<jobject>(env, nullptr);
+    }
+
+    // The value of Display.DEFAULT_DISPLAY.
+    constexpr jint kDefaultDisplayId = 0;
+    ScopedLocalRef<jobject> display(env,
+                                    env->CallObjectMethod(displayManager.get(), getDisplay,
+                                                          kDefaultDisplayId));
+    if (!isUsableResult(env, display.get(), "the default Display")) {
+        return ScopedLocalRef<jobject>(env, nullptr);
+    }
+    return display;
+}
+
+enum class DisplaySource { kActivityWindow, kAssociatedContext, kDefaultDisplay };
+
+// Resolves the initial Display and remembers which DisplaySource owns it so
+// subsequent refresh-rate callbacks query that source directly without
+// re-classifying `context` or re-throwing UnsupportedOperationException.
+ScopedLocalRef<jobject> resolveInitialDisplay(JNIEnv* env, jobject context, bool isActivity,
+                                              SdkVersion sdkVersion, DisplaySource* outSource) {
+    if (isActivity) {
+        *outSource = DisplaySource::kActivityWindow;
+        return getDisplayFromActivity(env, context);
+    }
+    if (sdkVersion.sdkInt >= 30) {
+        ScopedLocalRef<jobject> associatedDisplay(env, nullptr);
+        switch (getDisplayFromAssociatedContext(env, context, &associatedDisplay)) {
+            case AssociatedDisplayLookup::kFound:
+                *outSource = DisplaySource::kAssociatedContext;
+                return associatedDisplay;
+            case AssociatedDisplayLookup::kError:
+                return ScopedLocalRef<jobject>(env, nullptr);
+            case AssociatedDisplayLookup::kUnsupportedContext:
+                break;
+        }
+    }
+    *outSource = DisplaySource::kDefaultDisplay;
+    return getDefaultDisplayFromDisplayManager(env, context);
+}
+
+ScopedLocalRef<jobject> queryTargetDisplay(JNIEnv* env, jobject context, DisplaySource source) {
+    switch (source) {
+        case DisplaySource::kActivityWindow:
+            return getDisplayFromActivity(env, context);
+        case DisplaySource::kAssociatedContext: {
+            ScopedLocalRef<jobject> associatedDisplay(env, nullptr);
+            if (getDisplayFromAssociatedContext(env, context, &associatedDisplay) ==
+                AssociatedDisplayLookup::kFound) {
+                return associatedDisplay;
+            }
+            return ScopedLocalRef<jobject>(env, nullptr);
+        }
+        case DisplaySource::kDefaultDisplay:
+            return getDefaultDisplayFromDisplayManager(env, context);
+    }
+    return ScopedLocalRef<jobject>(env, nullptr);
+}
+
 constexpr float kMinRefreshRateHz = 1.0f;
 constexpr float kMaxRefreshRateHz = 1e6f;
 
@@ -368,11 +503,15 @@ public:
         // Calling a method on a null or foreign object aborts the VM, so reject
         // them before anything is called on jactivity.
         if (jactivity == nullptr) {
-            SWAPPY_LOGE("Swappy requires an android.app.Activity, but got null");
+            SWAPPY_LOGE("Swappy requires an android.content.Context, but got null");
             return;
         }
-        if (!isInstanceOf(env, jactivity, "android/app/Activity")) {
-            SWAPPY_LOGE("Swappy requires an android.app.Activity, but got another kind of object");
+        // An Activity keeps using its own window manager. Any other Context uses
+        // its associated Display on API 30+ or falls back to the display service.
+        const bool isActivity = isInstanceOf(env, jactivity, "android/app/Activity");
+        if (!isActivity && !isInstanceOf(env, jactivity, "android/content/Context")) {
+            SWAPPY_LOGE(
+                    "Swappy requires an android.content.Context, but got another kind of object");
             return;
         }
 
@@ -396,7 +535,9 @@ public:
         }
 
         mSettings.sdkVersion = getSdkVersion(env);
-        ScopedLocalRef<jobject> display = getDisplayFromActivity(env, mJactivity);
+        ScopedLocalRef<jobject> display =
+                resolveInitialDisplay(env, mJactivity, isActivity, mSettings.sdkVersion,
+                                      &mDisplaySource);
         if (display.get() == nullptr || !readDisplayTimings(env, display.get(), &mSettings)) {
             return;
         }
@@ -504,7 +645,7 @@ private:
         SWAPPY_LOGV("onRefreshRateChanged");
 
         SwappyCommonSettings settings{};
-        ScopedLocalRef<jobject> display = getDisplayFromActivity(env, mJactivity);
+        ScopedLocalRef<jobject> display = queryTargetDisplay(env, mJactivity, mDisplaySource);
         if (display.get() == nullptr || !readDisplayTimings(env, display.get(), &settings)) {
             return;
         }
@@ -519,6 +660,7 @@ private:
     JavaVM* mJVM = nullptr;
     void* mLibAndroid = nullptr;
     PFN_ANativeWindow_setFrameRate mANativeWindowSetFrameRate = nullptr;
+    DisplaySource mDisplaySource = DisplaySource::kActivityWindow;
     SwappyCommonSettings mSettings{};
     std::unique_ptr<SwappyDisplayManager> mDisplayManager;
     bool mValid = false;

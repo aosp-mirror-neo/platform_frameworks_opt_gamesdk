@@ -39,7 +39,7 @@ public:
     static bool useSwappyDisplayManager(SdkVersion sdkVersion);
     static bool usesMinSdkOrLater(SdkVersion sdkVersion);
 
-    SwappyDisplayManager(JavaVM*, jobject mainActivity);
+    SwappyDisplayManager(JavaVM*, jobject context);
     ~SwappyDisplayManager();
 
     bool isInitialized() {
@@ -66,6 +66,7 @@ private:
     bool mInitialized = false;
 
     friend class SwappyDisplayManagerJNI;
+    friend class SwappyDisplayManagerTestPeer;
 };
 
 } // namespace swappy

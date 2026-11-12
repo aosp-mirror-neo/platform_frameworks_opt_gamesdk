@@ -5,6 +5,7 @@ import static android.app.NativeActivity.META_DATA_LIB_NAME;
 import android.annotation.TargetApi;
 import android.app.Activity;
 import android.content.ComponentName;
+import android.content.Context;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.hardware.display.DisplayManager;
@@ -32,9 +33,12 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
     private static final Method sSetRenderAheadEnabledMethod = resolveSetRenderAheadEnabledMethod();
 
     private long mCookie;
+    // The Activity hosting Swappy, or null if Swappy is hosted by another kind
+    // of Context, which has no window.
     private Activity mActivity;
     private DisplayManager mDisplayManager;
     private WindowManager mWindowManager;
+    private int mDisplayId = Display.DEFAULT_DISPLAY;
     private Display.Mode mCurrentMode;
     private float mCurrentRefreshRate;
     private boolean mForwardRefreshCallbacks;
@@ -81,7 +85,7 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
     }
 
     private static boolean isValidRefreshRate(float refreshRate) {
-        return refreshRate > 0.0f && !Float.isNaN(refreshRate) && !Float.isInfinite(refreshRate);
+        return refreshRate >= 1.0f && refreshRate <= 1_000_000.0f;
     }
 
     private long toPeriodNanos(float refreshRate) {
@@ -128,8 +132,40 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
 
     // Called from native SwappyDisplayManager.cpp
     public SwappyDisplayManager(long cookie, Activity activity) {
+        this(cookie, (Context) activity);
+    }
+
+    // Called from native SwappyDisplayManager.cpp
+    public SwappyDisplayManager(long cookie, Context context) {
+        if (context instanceof Activity) {
+            mActivity = (Activity) context;
+            loadNativeLibraryOfActivity(mActivity);
+        }
+
+        mCookie = cookie;
+        mForwardRefreshCallbacks = shouldForwardRefreshCallbacks();
+
+        mDisplayManager = context.getSystemService(DisplayManager.class);
+        if (mActivity != null) {
+            mWindowManager = mActivity.getSystemService(WindowManager.class);
+        }
+        Display display = resolveInitialDisplay(context);
+        mDisplayId = display.getDisplayId();
+        mCurrentMode = display.getMode();
+        mCurrentRefreshRate = display.getRefreshRate();
+        updateSupportedRefreshRates(display);
+
+        // Register display listener callbacks
+        synchronized (this) {
+            mLooper = new LooperThread();
+            mLooper.start();
+            mDisplayManager.registerDisplayListener(this, mLooper.mHandler);
+        }
+    }
+
+    private void loadNativeLibraryOfActivity(Activity activity) {
         // Load the native library for cases where an NDK application is running
-        // without a java componenet
+        // without a java component
         try {
             ActivityInfo ai = activity.getPackageManager().getActivityInfo(
                     activity.getIntent().getComponent(), PackageManager.GET_META_DATA);
@@ -142,24 +178,32 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
         } catch (java.lang.Throwable e) {
             Log.e(LOG_TAG, e.getMessage());
         }
+    }
 
-        mCookie = cookie;
-        mActivity = activity;
-        mForwardRefreshCallbacks = shouldForwardRefreshCallbacks();
-
-        mDisplayManager = mActivity.getSystemService(DisplayManager.class);
-        mWindowManager = mActivity.getSystemService(WindowManager.class);
-        Display display = mWindowManager.getDefaultDisplay();
-        mCurrentMode = display.getMode();
-        mCurrentRefreshRate = display.getRefreshRate();
-        updateSupportedRefreshRates(display);
-
-        // Register display listener callbacks
-        synchronized (this) {
-            mLooper = new LooperThread();
-            mLooper.start();
-            mDisplayManager.registerDisplayListener(this, mLooper.mHandler);
+    private Display resolveInitialDisplay(Context context) {
+        if (mWindowManager != null) {
+            return mWindowManager.getDefaultDisplay();
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                Display associatedDisplay = context.getDisplay();
+                if (associatedDisplay != null) {
+                    return associatedDisplay;
+                }
+            } catch (UnsupportedOperationException e) {
+                // Non-display Contexts such as Service or Application fall back to DEFAULT_DISPLAY.
+            }
+        }
+        return mDisplayManager.getDisplay(Display.DEFAULT_DISPLAY);
+    }
+
+    // An Activity reads the display through its window manager. Any other
+    // Context queries the DisplayManager for the display resolved at init.
+    private Display getTargetDisplay() {
+        if (mWindowManager != null) {
+            return mWindowManager.getDefaultDisplay();
+        }
+        return mDisplayManager.getDisplay(mDisplayId);
     }
 
     private static final class RefreshRateList {
@@ -234,6 +278,10 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
 
     // Called from native SwappyDisplayManager.cpp
     public void setPreferredDisplayModeId(final int modeId) {
+        // Only a window can ask for a display mode.
+        if (mActivity == null) {
+            return;
+        }
         mActivity.runOnUiThread(new Runnable() {
             @Override
             public void run() {
@@ -251,10 +299,11 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
 
     // Called from native SwappyDisplayManager.cpp
     public void disableRenderAhead() {
-        if (sSetRenderAheadEnabledMethod == null) {
+        // Only an Activity has a window to disable render-ahead on.
+        final Activity activity = mActivity;
+        if (sSetRenderAheadEnabledMethod == null || activity == null) {
             return;
         }
-        final Activity activity = mActivity;
         activity.runOnUiThread(new Runnable() {
             @Override
             public void run() {
@@ -291,7 +340,10 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
     @Override
     public void onDisplayChanged(int displayId) {
         synchronized (this) {
-            Display display = mWindowManager.getDefaultDisplay();
+            Display display = getTargetDisplay();
+            if (display == null || displayId != display.getDisplayId()) {
+                return;
+            }
             float newRefreshRate = display.getRefreshRate();
             Display.Mode newMode = display.getMode();
             boolean modeChanged = newMode.getModeId() != mCurrentMode.getModeId();
@@ -306,7 +358,11 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
                 updateSupportedRefreshRates(display);
             }
 
-            if (mForwardRefreshCallbacks && refreshRateChanged
+            // NDKChoreographerThread uses AChoreographer_getInstance(), which only tracks
+            // Display.DEFAULT_DISPLAY, so forward changes directly for secondary displays.
+            boolean forwardRefreshCallback =
+                    mForwardRefreshCallbacks || display.getDisplayId() != Display.DEFAULT_DISPLAY;
+            if (forwardRefreshCallback && refreshRateChanged
                     && isValidRefreshRate(newRefreshRate)) {
                 final long appVsyncOffsetNanos = display.getAppVsyncOffsetNanos();
                 final long vsyncPresentationDeadlineNanos = display.getPresentationDeadlineNanos();
