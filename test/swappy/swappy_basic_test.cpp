@@ -10,6 +10,8 @@
 #include <vulkan/vulkan.h>
 
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdlib>
@@ -24,6 +26,7 @@
 
 #include "ChoreographerShim.h"
 #include "SwappyDisplayManager.h"
+#include "SwappyJniUtils.h"
 #include "gcov_flush_environment.h"
 #include "swappy/swappyGL.h"
 #include "swappy/swappyGL_extra.h"
@@ -340,6 +343,7 @@ public:
     MOCK_METHOD(jobject, NewObjectV, (JNIEnv*, jclass, jmethodID, va_list));
     MOCK_METHOD(jint, RegisterNatives, (JNIEnv*, jclass, const JNINativeMethod*, jint));
     MOCK_METHOD(void, CallVoidMethodV, (JNIEnv*, jobject, jmethodID, va_list));
+    MOCK_METHOD(jboolean, IsInstanceOf, (JNIEnv*, jobject, jclass));
 };
 
 static MockJNI* gMockJni = nullptr;
@@ -447,6 +451,9 @@ static jint MockRegisterNatives(JNIEnv* env, jclass clazz, const JNINativeMethod
                                 jint nMethods) {
     return gMockJni->RegisterNatives(env, clazz, methods, nMethods);
 }
+static jboolean MockIsInstanceOf(JNIEnv* env, jobject obj, jclass clazz) {
+    return gMockJni->IsInstanceOf(env, obj, clazz);
+}
 
 static _JNIEnv* gMockEnv = nullptr;
 static std::mutex gTestSerializationMutex;
@@ -494,6 +501,13 @@ public:
     ANativeWindow* mWindow = nullptr;
 
     testing::NiceMock<MockJNI> mMockJni;
+    std::atomic<bool> mPendingException{false};
+    std::atomic<int> mGetWindowManagerCalls{0};
+    std::atomic<int> mCreatedGlobalRefs{0};
+    std::atomic<int> mDeletedGlobalRefs{0};
+    std::mutex mAcquiredImagesMutex;
+    std::condition_variable mAcquiredImagesCv;
+    int mAcquiredImages = 0;
     _JNIEnv mEnvStruct;
     JNIInvokeInterface mInvokeInterface = {};
     _JavaVM mJavaVM;
@@ -605,7 +619,12 @@ public:
 
         ON_CALL(mMockJni, FindClass(testing::_, testing::_))
                 .WillByDefault(testing::Return(reinterpret_cast<jclass>(0x1)));
-        ON_CALL(mMockJni, ExceptionCheck(testing::_)).WillByDefault(testing::Return(JNI_FALSE));
+        ON_CALL(mMockJni, ExceptionCheck(testing::_))
+                .WillByDefault(testing::Invoke([this](JNIEnv*) {
+                    return mPendingException.load() ? JNI_TRUE : JNI_FALSE;
+                }));
+        ON_CALL(mMockJni, ExceptionClear(testing::_))
+                .WillByDefault(testing::Invoke([this](JNIEnv*) { mPendingException = false; }));
         ON_CALL(mMockJni, ExceptionOccurred(testing::_)).WillByDefault(testing::Return(nullptr));
         ON_CALL(mMockJni,
                 GetStaticFieldID(testing::_, testing::_, testing::StrEq("SDK_INT"), testing::_))
@@ -700,6 +719,8 @@ public:
                 .WillByDefault(testing::Invoke([](JNIEnv*, jobject, jmethodID, va_list) {}));
         ON_CALL(mMockJni, RegisterNatives(testing::_, testing::_, testing::_, testing::_))
                 .WillByDefault(testing::Return(JNI_OK));
+        ON_CALL(mMockJni, IsInstanceOf(testing::_, testing::_, testing::_))
+                .WillByDefault(testing::Return(JNI_TRUE));
 
         mJniInterface.FindClass = MockFindClass;
         mJniInterface.GetMethodID = MockGetMethodID;
@@ -724,6 +745,7 @@ public:
         mJniInterface.NewStringUTF = MockNewStringUTF;
         mJniInterface.NewObjectV = MockNewObjectV;
         mJniInterface.RegisterNatives = MockRegisterNatives;
+        mJniInterface.IsInstanceOf = MockIsInstanceOf;
 
         mEnvStruct.functions = &mJniInterface;
         gMockEnv = &mEnvStruct;
@@ -759,7 +781,7 @@ public:
         LOGI("ANativeWindow obtained from AImageReader");
     }
 
-    static void onImageAvailable(void*, AImageReader* reader) {
+    static void onImageAvailable(void* context, AImageReader* reader) {
         LOGI("onImageAvailable callback triggered");
         AImage* image = nullptr;
         media_status_t status = AImageReader_acquireLatestImage(reader, &image);
@@ -769,6 +791,68 @@ public:
         }
         AImage_delete(image);
         LOGI("Released acquired image");
+        if (context != nullptr) {
+            auto* self = static_cast<AImageReaderSwapchainTestBase*>(context);
+            {
+                std::lock_guard<std::mutex> lock(self->mAcquiredImagesMutex);
+                self->mAcquiredImages++;
+            }
+            self->mAcquiredImagesCv.notify_all();
+        }
+    }
+
+    // Waits, for a bounded time, until the AImageReader listener has received
+    // `count` frames.
+    bool waitForAcquiredImages(int count) {
+        std::unique_lock<std::mutex> lock(mAcquiredImagesMutex);
+        return mAcquiredImagesCv.wait_for(lock, std::chrono::seconds(2),
+                                          [this, count] { return mAcquiredImages >= count; });
+    }
+
+    // Counts the calls to Activity.getWindowManager made through the mocked JNI
+    // in mGetWindowManagerCalls.
+    void trackGetWindowManagerCalls() {
+        const jmethodID getWindowManager = reinterpret_cast<jmethodID>(0x30);
+        ON_CALL(mMockJni,
+                GetMethodID(testing::_, testing::_, testing::StrEq("getWindowManager"), testing::_))
+                .WillByDefault(testing::Return(getWindowManager));
+        ON_CALL(mMockJni, CallObjectMethodV(testing::_, testing::_, getWindowManager, testing::_))
+                .WillByDefault(testing::Invoke([this](JNIEnv*, jobject, jmethodID, va_list) {
+                    mGetWindowManagerCalls++;
+                    return reinterpret_cast<jobject>(0x4);
+                }));
+    }
+
+    // Counts the global references created and deleted through the mocked JNI
+    // in mCreatedGlobalRefs and mDeletedGlobalRefs.
+    void trackGlobalRefs() {
+        ON_CALL(mMockJni, NewGlobalRef(testing::_, testing::_))
+                .WillByDefault(testing::Invoke([this](JNIEnv*, jobject object) {
+                    if (object != nullptr) {
+                        mCreatedGlobalRefs++;
+                    }
+                    return object;
+                }));
+        ON_CALL(mMockJni, DeleteGlobalRef(testing::_, testing::_))
+                .WillByDefault(testing::Invoke([this](JNIEnv*, jobject object) {
+                    if (object != nullptr) {
+                        mDeletedGlobalRefs++;
+                    }
+                }));
+    }
+
+    void reportAsNonActivity(jobject object) {
+        ON_CALL(mMockJni, IsInstanceOf(testing::_, object, testing::_))
+                .WillByDefault(testing::Return(JNI_FALSE));
+    }
+
+    // Expectations shared by the tests that initialize Swappy with an object
+    // that is not an Activity.
+    void expectNoActivityMethodCalledAndNothingLeaked() {
+        EXPECT_EQ(0, mGetWindowManagerCalls.load());
+        EXPECT_FALSE(mPendingException.load());
+        EXPECT_EQ(mCreatedGlobalRefs.load(), mDeletedGlobalRefs.load());
+        EXPECT_EQ(gCreatedLocalRefs.load(), gDeletedLocalRefs.load());
     }
 };
 
@@ -1054,6 +1138,32 @@ public:
         for (int i = 0; i < frameCount; ++i) {
             SwappyVk_recordFrameStart(mPresentQueue, mSwapchain, 0);
         }
+    }
+
+    // Initializes Swappy with `context`, which Swappy has to reject, and
+    // checks that it does so without calling anything on it.
+    void expectInitFailsGracefully(jobject context) {
+        setupMockJni(23);
+        trackGetWindowManagerCalls();
+        trackGlobalRefs();
+        if (context != nullptr) {
+            reportAsNonActivity(context);
+        }
+
+        std::vector<const char*> instanceLayers;
+        std::vector<const char*> deviceLayers;
+        buildSwapchainForTest(instanceLayers, deviceLayers);
+
+        uint64_t refreshDuration = 0;
+        EXPECT_FALSE(SwappyVk_initAndGetRefreshCycleDuration(gMockEnv, context, mPhysicalDev,
+                                                             mDevice, mSwapchain,
+                                                             &refreshDuration));
+        bool isEnabled = true;
+        EXPECT_TRUE(SwappyVk_isEnabled(mSwapchain, &isEnabled));
+        EXPECT_FALSE(isEnabled);
+
+        cleanUpSwapchainForTest();
+        expectNoActivityMethodCalledAndNothingLeaked();
     }
 };
 
@@ -2330,12 +2440,30 @@ public:
                                         8,
                                         EGL_RED_SIZE,
                                         8,
+                                        EGL_ALPHA_SIZE,
+                                        8,
                                         EGL_NONE};
 
-        EGLConfig config;
-        EGLint numConfigs;
-        ASSERT_TRUE(eglChooseConfig(mDisplay, configAttribs, &config, 1, &numConfigs));
+        EGLint numConfigs = 0;
+        ASSERT_TRUE(eglChooseConfig(mDisplay, configAttribs, nullptr, 0, &numConfigs));
         ASSERT_GT(numConfigs, 0);
+        std::vector<EGLConfig> configs(numConfigs);
+        ASSERT_TRUE(
+                eglChooseConfig(mDisplay, configAttribs, configs.data(), numConfigs, &numConfigs));
+        ASSERT_GT(numConfigs, 0);
+
+        // Pick a config whose native visual matches AIMAGE_FORMAT_RGBA_8888 (0x1);
+        // otherwise devices advertising 10-bit or wide-color configs cause
+        // NdkImageReader::acquireImageLocked to reject the output buffer.
+        EGLConfig config = configs[0];
+        for (EGLint i = 0; i < numConfigs; ++i) {
+            EGLint nativeVisualId = 0;
+            if (eglGetConfigAttrib(mDisplay, configs[i], EGL_NATIVE_VISUAL_ID, &nativeVisualId) &&
+                nativeVisualId == AIMAGE_FORMAT_RGBA_8888) {
+                config = configs[i];
+                break;
+            }
+        }
 
         const EGLint contextAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
         mContext = eglCreateContext(mDisplay, config, EGL_NO_CONTEXT, contextAttribs);
@@ -2378,6 +2506,24 @@ public:
         createAImageReader(640, 480, AIMAGE_FORMAT_RGBA_8888, 3, &listener);
         getANativeWindowFromReader();
         createEGLContext();
+    }
+
+    // Initializes Swappy with `context`, which Swappy has to reject, and
+    // checks that it does so without calling anything on it.
+    void expectInitFailsGracefully(jobject context) {
+        setupMockJni(23);
+        trackGetWindowManagerCalls();
+        trackGlobalRefs();
+        if (context != nullptr) {
+            reportAsNonActivity(context);
+        }
+        buildEGLForTest();
+
+        EXPECT_FALSE(SwappyGL_init(gMockEnv, context));
+        EXPECT_FALSE(SwappyGL_isEnabled());
+
+        SwappyGL_destroy();
+        expectNoActivityMethodCalledAndNothingLeaked();
     }
 };
 
@@ -2590,6 +2736,13 @@ failingGetRefreshCycleDurationGOOGLE(VkDevice /*device*/, VkSwapchainKHR /*swapc
 
 } // namespace
 
+TEST_F(AImageReaderVulkanSwapchainTest, InitFailsGracefullyWithNullContext) {
+    expectInitFailsGracefully(nullptr);
+}
+
+TEST_F(AImageReaderVulkanSwapchainTest, InitFailsGracefullyWithNonActivityObject) {
+    expectInitFailsGracefully(reinterpret_cast<jobject>(0x4321));
+}
 TEST_F(AImageReaderVulkanSwapchainTest, EntryPointsAreSafeOnUninitializedSwapchain) {
     std::vector<const char*> instanceLayers;
     std::vector<const char*> deviceLayers;
@@ -3002,6 +3155,74 @@ TEST_F(AImageReaderVulkanSwapchainTest, RenderingLoopSDK37) {
     vkDestroySemaphore(mDevice, imageAvailableSemaphore, nullptr);
 }
 
+TEST_F(AImageReaderEGLSwapchainTest, InitFailsGracefullyWithNullContext) {
+    expectInitFailsGracefully(nullptr);
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, InitFailsGracefullyWithNonActivityObject) {
+    expectInitFailsGracefully(reinterpret_cast<jobject>(0x4321));
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, InitFailsGracefullyWhenDisplayQueryThrows) {
+    setupMockJni(23);
+    trackGlobalRefs();
+    ON_CALL(mMockJni,
+            GetMethodID(testing::_, testing::_, testing::StrEq("getWindowManager"), testing::_))
+            .WillByDefault(
+                    testing::Invoke([this](JNIEnv*, jclass, const char*, const char*) -> jmethodID {
+                        mPendingException = true;
+                        return nullptr;
+                    }));
+    buildEGLForTest();
+
+    EXPECT_FALSE(SwappyGL_init(gMockEnv, reinterpret_cast<jobject>(0x1234)));
+    EXPECT_FALSE(mPendingException.load());
+
+    SwappyGL_destroy();
+    EXPECT_EQ(mCreatedGlobalRefs.load(), mDeletedGlobalRefs.load());
+    EXPECT_EQ(gCreatedLocalRefs.load(), gDeletedLocalRefs.load());
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, InitFailsGracefullyWhenNewGlobalRefReturnsNull) {
+    setupMockJni(23);
+    trackGetWindowManagerCalls();
+    ON_CALL(mMockJni, NewGlobalRef(testing::_, testing::_)).WillByDefault(testing::Return(nullptr));
+    buildEGLForTest();
+
+    EXPECT_FALSE(SwappyGL_init(gMockEnv, reinterpret_cast<jobject>(0x1234)));
+
+    SwappyGL_destroy();
+    expectNoActivityMethodCalledAndNothingLeaked();
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, IsInstanceOfRejectsNullObject) {
+    setupMockJni(23);
+
+    // JNI IsInstanceOf returns JNI_TRUE for NULL, which setupMockJni mirrors.
+    EXPECT_FALSE(swappy::isInstanceOf(gMockEnv, nullptr, "android/app/Activity"));
+    EXPECT_EQ(gCreatedLocalRefs.load(), gDeletedLocalRefs.load());
+}
+
+class AImageReaderEGLInvalidRefreshRateTest : public AImageReaderEGLSwapchainTest,
+                                              public testing::WithParamInterface<float> {};
+
+TEST_P(AImageReaderEGLInvalidRefreshRateTest, InitFailsGracefullyWithInvalidRefreshRate) {
+    setupMockJni(23);
+    trackGlobalRefs();
+    ON_CALL(mMockJni, CallFloatMethodV(testing::_, testing::_, testing::_, testing::_))
+            .WillByDefault(testing::Return(GetParam()));
+    buildEGLForTest();
+
+    EXPECT_FALSE(SwappyGL_init(gMockEnv, reinterpret_cast<jobject>(0x1234)));
+
+    SwappyGL_destroy();
+    EXPECT_EQ(mCreatedGlobalRefs.load(), mDeletedGlobalRefs.load());
+    EXPECT_EQ(gCreatedLocalRefs.load(), gDeletedLocalRefs.load());
+}
+
+INSTANTIATE_TEST_SUITE_P(InvalidRefreshRates, AImageReaderEGLInvalidRefreshRateTest,
+                         testing::Values(0.0f, -60.0f, 1e-12f, 1e12f, std::nanf(""), INFINITY));
+
 TEST_F(AImageReaderEGLSwapchainTest, RefreshRateCallbacksReleaseLocalRefsOnSdk37) {
     setupMockJni(37);
     setupMockNDKChoreographer();
@@ -3021,6 +3242,77 @@ TEST_F(AImageReaderEGLSwapchainTest, RefreshRateCallbacksReleaseLocalRefsOnSdk37
     EXPECT_EQ(gCreatedLocalRefs.load() - gDeletedLocalRefs.load(), netLocalRefsAfterInit);
 
     cleanupMockNDKChoreographer();
+    SwappyGL_destroy();
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, InitFailsGracefullyWithoutJavaVM) {
+    setupMockJni(23);
+    trackGlobalRefs();
+    ON_CALL(mMockJni, GetJavaVM(testing::_, testing::_)).WillByDefault(testing::Return(JNI_ERR));
+    buildEGLForTest();
+
+    EXPECT_FALSE(SwappyGL_init(gMockEnv, reinterpret_cast<jobject>(0x1234)));
+
+    SwappyGL_destroy();
+    EXPECT_EQ(1, mCreatedGlobalRefs.load());
+    EXPECT_EQ(1, mDeletedGlobalRefs.load());
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, SwapsAfterFailedInit) {
+    setupMockJni(23);
+    jobject notAnActivity = reinterpret_cast<jobject>(0x4321);
+    reportAsNonActivity(notAnActivity);
+    buildEGLForTest();
+
+    ASSERT_FALSE(SwappyGL_init(gMockEnv, notAnActivity));
+
+    // The app may ignore the failure and keep calling SwappyGL_swap.
+    for (int i = 0; i < 3; ++i) {
+        glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        EXPECT_TRUE(SwappyGL_swap(mDisplay, mSurface));
+    }
+    EXPECT_TRUE(waitForAcquiredImages(1)) << "No frame reached the AImageReader";
+
+    SwappyGL_destroy();
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, EntryPointsAreSafeAfterFailedInit) {
+    setupMockJni(23);
+    jobject notAnActivity = reinterpret_cast<jobject>(0x4321);
+    reportAsNonActivity(notAnActivity);
+    buildEGLForTest();
+
+    ASSERT_FALSE(SwappyGL_init(gMockEnv, notAnActivity));
+
+    SwappyTracer tracer{};
+    SwappyGL_injectTracer(&tracer);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    SwappyGL_onChoreographer(1000);
+#pragma clang diagnostic pop
+    EXPECT_TRUE(SwappyGL_setWindow(mWindow));
+    SwappyGL_setUseAffinity(false);
+    SwappyGL_setSwapIntervalNS(SWAPPY_SWAP_60FPS);
+    SwappyGL_getSwapIntervalNS();
+    SwappyGL_getRefreshPeriodNanos();
+    SwappyGL_setAutoSwapInterval(true);
+    SwappyGL_setMaxAutoSwapIntervalNS(SWAPPY_SWAP_30FPS);
+    SwappyGL_setAutoPipelineMode(true);
+    SwappyGL_setFenceTimeoutNS(50000000);
+    SwappyGL_getFenceTimeoutNS();
+    SwappyGL_setBufferStuffingFixWait(2);
+    SwappyGL_getSupportedRefreshPeriodsNS(nullptr, 0);
+    SwappyGL_enableStats(true);
+    SwappyGL_recordFrameStart(mDisplay, mSurface);
+    SwappyStats stats{};
+    SwappyGL_getStats(&stats);
+    SwappyGL_clearStats();
+    SwappyGL_resetFramePacing();
+    SwappyGL_enableFramePacing(true);
+    SwappyGL_enableBlockingWait(true);
+    SwappyGL_uninjectTracer(&tracer);
+
     SwappyGL_destroy();
 }
 

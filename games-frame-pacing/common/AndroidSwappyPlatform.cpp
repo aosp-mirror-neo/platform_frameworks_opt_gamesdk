@@ -21,6 +21,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -30,10 +31,10 @@
 #include "ChoreographerThread.h"
 #include "Settings.h"
 #include "SwappyDisplayManager.h"
-#include "SwappyJniUtils.h"
 #include "swappy/swappy_common.h"
 
 #define LOG_TAG "SwappyCommon"
+#include "SwappyJniUtils.h"
 #include "SwappyLog.h"
 
 namespace swappy {
@@ -96,57 +97,100 @@ SdkVersion getSdkVersion(JNIEnv* env) {
     return SdkVersion{sdk, sdkPreview};
 }
 
-bool getSettingsFromApp(JNIEnv* env, jobject jactivity, SwappyCommonSettings* out) {
-    if (out == nullptr) {
-        return false;
+// Returns the default display of `activity` (which must be an Activity), or
+// a null reference if it cannot be retrieved.
+ScopedLocalRef<jobject> getDisplayFromActivity(JNIEnv* env, jobject activity) {
+    ScopedLocalRef<jclass> activityClass(env, env->FindClass("android/app/Activity"));
+    if (!isUsableResult(env, activityClass.get(), "android.app.Activity")) {
+        return ScopedLocalRef<jobject>(env, nullptr);
     }
-
-    ScopedLocalRef<jclass> activityClass(env, env->FindClass("android/app/NativeActivity"));
-    ScopedLocalRef<jclass> windowManagerClass(env, env->FindClass("android/view/WindowManager"));
-    ScopedLocalRef<jclass> displayClass(env, env->FindClass("android/view/Display"));
 
     jmethodID getWindowManager = env->GetMethodID(activityClass.get(), "getWindowManager",
                                                   "()Landroid/view/WindowManager;");
+    if (!isUsableResult(env, getWindowManager, "Activity.getWindowManager")) {
+        return ScopedLocalRef<jobject>(env, nullptr);
+    }
+
+    ScopedLocalRef<jobject> windowManager(env, env->CallObjectMethod(activity, getWindowManager));
+    if (!isUsableResult(env, windowManager.get(), "the WindowManager")) {
+        return ScopedLocalRef<jobject>(env, nullptr);
+    }
+
+    ScopedLocalRef<jclass> windowManagerClass(env, env->FindClass("android/view/WindowManager"));
+    if (!isUsableResult(env, windowManagerClass.get(), "android.view.WindowManager")) {
+        return ScopedLocalRef<jobject>(env, nullptr);
+    }
 
     jmethodID getDefaultDisplay = env->GetMethodID(windowManagerClass.get(), "getDefaultDisplay",
                                                    "()Landroid/view/Display;");
+    if (!isUsableResult(env, getDefaultDisplay, "WindowManager.getDefaultDisplay")) {
+        return ScopedLocalRef<jobject>(env, nullptr);
+    }
 
-    ScopedLocalRef<jobject> wm(env, env->CallObjectMethod(jactivity, getWindowManager));
-    ScopedLocalRef<jobject> display(env, env->CallObjectMethod(wm.get(), getDefaultDisplay));
+    ScopedLocalRef<jobject> display(env,
+                                    env->CallObjectMethod(windowManager.get(), getDefaultDisplay));
+    if (!isUsableResult(env, display.get(), "the default Display")) {
+        return ScopedLocalRef<jobject>(env, nullptr);
+    }
+    return display;
+}
+
+constexpr float kMinRefreshRateHz = 1.0f;
+constexpr float kMaxRefreshRateHz = 1e6f;
+
+// Fills the refresh period and the vsync offsets of `out` from `display`.
+bool readDisplayTimings(JNIEnv* env, jobject display, SwappyCommonSettings* out) {
+    ScopedLocalRef<jclass> displayClass(env, env->FindClass("android/view/Display"));
+    if (!isUsableResult(env, displayClass.get(), "android.view.Display")) {
+        return false;
+    }
 
     jmethodID getRefreshRate = env->GetMethodID(displayClass.get(), "getRefreshRate", "()F");
+    if (!isUsableResult(env, getRefreshRate, "Display.getRefreshRate")) {
+        return false;
+    }
 
-    const float refreshRateHz = env->CallFloatMethod(display.get(), getRefreshRate);
-
-    jmethodID getAppVsyncOffsetNanos =
-            env->GetMethodID(displayClass.get(), "getAppVsyncOffsetNanos", "()J");
+    const float refreshRateHz = env->CallFloatMethod(display, getRefreshRate);
+    if (consumePendingException(env, "Display.getRefreshRate")) {
+        return false;
+    }
+    if (!std::isfinite(refreshRateHz) || refreshRateHz < kMinRefreshRateHz ||
+        refreshRateHz > kMaxRefreshRateHz) {
+        SWAPPY_LOGE("Invalid display refresh rate: %f Hz", refreshRateHz);
+        return false;
+    }
 
     // getAppVsyncOffsetNanos was only added in API 21.
     // Return gracefully if this device doesn't support it.
-    if (getAppVsyncOffsetNanos == 0 || env->ExceptionCheck()) {
-        SWAPPY_LOGE("Error while getting method: getAppVsyncOffsetNanos");
-        env->ExceptionClear();
+    jmethodID getAppVsyncOffsetNanos =
+            env->GetMethodID(displayClass.get(), "getAppVsyncOffsetNanos", "()J");
+    if (!isUsableResult(env, getAppVsyncOffsetNanos, "Display.getAppVsyncOffsetNanos")) {
         return false;
     }
-    const long appVsyncOffsetNanos = env->CallLongMethod(display.get(), getAppVsyncOffsetNanos);
+    const jlong appVsyncOffsetNanos = env->CallLongMethod(display, getAppVsyncOffsetNanos);
+    if (consumePendingException(env, "Display.getAppVsyncOffsetNanos")) {
+        return false;
+    }
 
     jmethodID getPresentationDeadlineNanos =
             env->GetMethodID(displayClass.get(), "getPresentationDeadlineNanos", "()J");
-
-    if (getPresentationDeadlineNanos == 0 || env->ExceptionCheck()) {
-        SWAPPY_LOGE("Error while getting method: getPresentationDeadlineNanos");
+    if (!isUsableResult(env, getPresentationDeadlineNanos,
+                        "Display.getPresentationDeadlineNanos")) {
+        return false;
+    }
+    const jlong vsyncPresentationDeadlineNanos =
+            env->CallLongMethod(display, getPresentationDeadlineNanos);
+    if (consumePendingException(env, "Display.getPresentationDeadlineNanos")) {
         return false;
     }
 
-    const long vsyncPresentationDeadlineNanos =
-            env->CallLongMethod(display.get(), getPresentationDeadlineNanos);
+    constexpr int64_t kOneMsInNs = 1'000'000;
+    constexpr double kOneSInNs = 1'000'000'000.0;
 
-    constexpr long kOneMsInNs = 1000 * 1000;
-    constexpr long kOneSInNs = kOneMsInNs * 1000;
-
-    const long vsyncPeriodNanos = static_cast<long>(kOneSInNs / refreshRateHz);
-    const long sfVsyncOffsetNanos =
-            vsyncPeriodNanos - (vsyncPresentationDeadlineNanos - kOneMsInNs);
+    const int64_t vsyncPeriodNanos =
+            static_cast<int64_t>(std::llround(kOneSInNs / static_cast<double>(refreshRateHz)));
+    const int64_t sfVsyncOffsetNanos =
+            vsyncPeriodNanos - (static_cast<int64_t>(vsyncPresentationDeadlineNanos) - kOneMsInNs);
 
     using std::chrono::nanoseconds;
     out->refreshPeriod = nanoseconds(vsyncPeriodNanos);
@@ -322,12 +366,33 @@ public:
     AndroidSwappyPlatform(JNIEnv* env, jobject jactivity) {
         SWAPPY_LOGI("Swappy version %d.%d", SWAPPY_MAJOR_VERSION, SWAPPY_MINOR_VERSION);
 
-        if (env == nullptr || jactivity == nullptr) {
+        if (env == nullptr) {
+            SWAPPY_LOGE("Swappy requires a non-null JNIEnv");
+            return;
+        }
+        // Calling a method on a null or foreign object aborts the VM, so reject
+        // them before anything is called on jactivity.
+        if (jactivity == nullptr) {
+            SWAPPY_LOGE("Swappy requires an android.app.Activity, but got null");
+            return;
+        }
+        if (!isInstanceOf(env, jactivity, "android/app/Activity")) {
+            SWAPPY_LOGE("Swappy requires an android.app.Activity, but got another kind of object");
             return;
         }
 
         mJactivity = env->NewGlobalRef(jactivity);
-        env->GetJavaVM(&mJVM);
+        if (mJactivity == nullptr) {
+            SWAPPY_LOGE("Failed to create a global reference");
+            return;
+        }
+        if (env->GetJavaVM(&mJVM) != JNI_OK) {
+            SWAPPY_LOGE("Failed to get the JavaVM");
+            mJVM = nullptr;
+            env->DeleteGlobalRef(mJactivity);
+            mJactivity = nullptr;
+            return;
+        }
 
         mLibAndroid = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
         if (mLibAndroid == nullptr) {
@@ -336,7 +401,8 @@ public:
         }
 
         mSettings.sdkVersion = getSdkVersion(env);
-        if (!getSettingsFromApp(env, mJactivity, &mSettings)) {
+        ScopedLocalRef<jobject> display = getDisplayFromActivity(env, mJactivity);
+        if (display.get() == nullptr || !readDisplayTimings(env, display.get(), &mSettings)) {
             return;
         }
 
@@ -444,8 +510,8 @@ private:
         SWAPPY_LOGV("onRefreshRateChanged");
 
         SwappyCommonSettings settings{};
-        if (!getSettingsFromApp(env, mJactivity, &settings)) {
-            SWAPPY_LOGE("failed to query display timings");
+        ScopedLocalRef<jobject> display = getDisplayFromActivity(env, mJactivity);
+        if (display.get() == nullptr || !readDisplayTimings(env, display.get(), &settings)) {
             return;
         }
 

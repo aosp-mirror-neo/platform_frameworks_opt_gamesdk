@@ -18,6 +18,13 @@
 
 #include <jni.h>
 
+#include "SwappyLog.h"
+
+#pragma push_macro("LOG_TAG")
+#ifndef LOG_TAG
+#define LOG_TAG "SwappyCommon"
+#endif
+
 namespace swappy {
 
 // Owns a JNI local reference (jobject, jclass, jstring, jthrowable) and
@@ -67,4 +74,44 @@ private:
     T mRef;
 };
 
+// Logs and clears the exception left pending by the JNI call described by
+// `operation`, so that no exception ever leaks to the caller of Swappy.
+// Returns whether an exception was pending.
+inline bool consumePendingException(JNIEnv* env, const char* operation) {
+    if (!env->ExceptionCheck()) {
+        return false;
+    }
+    env->ExceptionClear();
+    SWAPPY_LOGE("Exception while calling %s", operation);
+    return true;
+}
+
+// Returns whether `result`, the outcome of the JNI lookup or call described by
+// `operation`, is non-null and did not throw.
+inline bool isUsableResult(JNIEnv* env, const void* result, const char* operation) {
+    if (consumePendingException(env, operation)) {
+        return false;
+    }
+    if (result == nullptr) {
+        SWAPPY_LOGE("Failed to get %s", operation);
+        return false;
+    }
+    return true;
+}
+
+inline bool isInstanceOf(JNIEnv* env, jobject object, const char* className) {
+    if (object == nullptr) {
+        return false;
+    }
+    ScopedLocalRef<jclass> objectClass(env, env->FindClass(className));
+    if (!isUsableResult(env, objectClass.get(), className)) {
+        return false;
+    }
+
+    const jboolean result = env->IsInstanceOf(object, objectClass.get());
+    return !consumePendingException(env, "IsInstanceOf") && result == JNI_TRUE;
+}
+
 } // namespace swappy
+
+#pragma pop_macro("LOG_TAG")

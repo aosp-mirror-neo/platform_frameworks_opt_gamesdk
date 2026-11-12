@@ -956,4 +956,26 @@ TEST_F(SwappyCommonHostTest, MultiVsyncWaitReArmsPlatformCallbacksAcrossAllTarge
     EXPECT_GE(snapshotPlatformState(*harness.platformState()).postFrameCallbacksCount, 12);
 }
 
+TEST_F(SwappyCommonHostTest, InvalidPlatformRemainsInvalidAndHandlesEntryPointsSafely) {
+    auto state = std::make_shared<PlatformSharedState>();
+    state->valid = false;
+    SwappyCommon swappy(std::make_unique<FakeSwappyPlatform>(state));
+
+    EXPECT_FALSE(swappy.isValid());
+
+    ANativeWindow window{1};
+    swappy.setANativeWindow(&window);
+    swappy.onChoreographer(1'000'000);
+    EXPECT_EQ(swappy.getSupportedRefreshPeriodsNS(nullptr, 0), 0);
+    swappy.resetFramePacing();
+    swappy.enableFramePacing(false);
+    swappy.enableBlockingWait(true);
+    swappy.setANativeWindow(nullptr);
+
+    const PlatformSnapshot snapshot = snapshotPlatformState(*state);
+    EXPECT_TRUE(snapshot.acquiredWindows.empty());
+    EXPECT_TRUE(snapshot.releasedWindows.empty());
+    EXPECT_EQ(snapshot.postFrameCallbacksCount, 0);
+}
+
 } // namespace
