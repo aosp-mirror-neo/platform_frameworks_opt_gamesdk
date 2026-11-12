@@ -33,13 +33,28 @@
 extern "C" {
 #endif
 
+#if defined(__cplusplus) && __cplusplus >= 201402L
+#define SWAPPY_DEPRECATED(msg) [[deprecated(msg)]]
+#elif defined(__GNUC__) || defined(__clang__)
+#define SWAPPY_DEPRECATED(msg) __attribute__((deprecated(msg)))
+#else
+#define SWAPPY_DEPRECATED(msg)
+#endif
+
 /**
  * @brief If an app wishes to use the Android choreographer to provide ticks to
  * Swappy, it can call this function.
  *
+ * @deprecated Let Swappy manage its own Choreographer thread instead of
+ * forwarding external Choreographer ticks. If you depend on this API, please
+ * reach out to the team, as we hope to eventually remove it.
+ *
  * @warning This function *must* be called before the first `Swappy_swap()`
  * call. Afterwards, call this function every choreographer tick.
  */
+SWAPPY_DEPRECATED("Let Swappy manage its own Choreographer thread instead of forwarding "
+                  "external Choreographer ticks. If you depend on this API, please reach "
+                  "out to the team, as we hope to eventually remove it.")
 void SwappyGL_onChoreographer(int64_t frameTimeNanos);
 
 /** @brief Pass callbacks to be called each frame to trace execution. */
