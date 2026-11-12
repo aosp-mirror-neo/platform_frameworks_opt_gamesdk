@@ -25,13 +25,9 @@
 #include <mutex>
 
 #include "RefreshPeriodSet.h"
+#include "SdkVersion.h"
 
 namespace swappy {
-
-struct SdkVersion {
-    int sdkInt;        // Build.VERSION.SDK_INT
-    int previewSdkInt; // Build.VERSION.PREVIEW_SDK_INT
-};
 
 class SwappyDisplayManager {
 public:

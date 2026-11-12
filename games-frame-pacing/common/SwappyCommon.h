@@ -16,44 +16,31 @@
 
 #pragma once
 
-#include <jni.h>
-
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 
 #include "CPUTracer.h"
 #include "ChoreographerFilter.h"
-#include "ChoreographerThread.h"
+#include "DisplayRateController.h"
 #include "FrameDurations.h"
 #include "PacingImplementation.h"
-#include "SwappyDisplayManager.h"
+#include "RefreshPeriodSet.h"
+#include "Settings.h"
+#include "SwappyPlatform.h"
 #include "Thread.h"
-#include "swappy/swappyGL.h"
-#include "swappy/swappyGL_extra.h"
+#include "swappy/swappy_common.h"
 
 namespace swappy {
 
-// ANativeWindow_setFrameRate is supported from API 30. To allow compilation for
-// minSDK < 30 we need runtime support to call this API.
-using PFN_ANativeWindow_setFrameRate = int32_t (*)(ANativeWindow* window, float frameRate,
-                                                   int8_t compatibility);
-
 using namespace std::chrono_literals;
-
-struct SwappyCommonSettings {
-    SdkVersion sdkVersion;
-
-    std::chrono::nanoseconds refreshPeriod;
-    std::chrono::nanoseconds appVsyncOffset;
-    std::chrono::nanoseconds sfVsyncOffset;
-
-    static bool getFromApp(JNIEnv* env, jobject jactivity, SwappyCommonSettings* out);
-    static SdkVersion getSDKVersion(JNIEnv* env);
-    static bool queryDisplayTimings(JNIEnv* env, jobject jactivity, SwappyCommonSettings* out);
-};
 
 // Common part between OpenGL and Vulkan implementations.
 class SwappyCommon {
@@ -68,7 +55,7 @@ public:
         std::function<std::chrono::nanoseconds()> getPrevFrameGpuTime;
     };
 
-    SwappyCommon(JNIEnv* env, jobject jactivity);
+    explicit SwappyCommon(std::unique_ptr<SwappyPlatform> platform);
 
     ~SwappyCommon();
 
@@ -123,8 +110,6 @@ public:
         mFenceTimeout = t;
     }
 
-    bool isDeviceUnsupported();
-
     void setANativeWindow(ANativeWindow* window);
 
     void setBufferStuffingFixWait(int32_t nFrames) {
@@ -141,10 +126,6 @@ public:
 
     void enableFramePacing(bool enable);
     void enableBlockingWait(bool enable);
-
-protected:
-    // Used for testing
-    SwappyCommon(const SwappyCommonSettings& settings);
 
 private:
     // Aliased so the member declarations below can reference them unqualified.
@@ -169,7 +150,7 @@ private:
     void waitUntil(int32_t target);
     void waitUntilTargetFrame();
     void waitOneFrame();
-    void setPreferredDisplayModeId(int index);
+    void setPreferredDisplayModeId(int index) REQUIRES(mMutex);
     void setPreferredRefreshPeriod(std::chrono::nanoseconds frameTime) REQUIRES(mMutex);
     void updateDisplayTimings();
 
@@ -177,20 +158,13 @@ private:
     // frame's completion
     bool waitForNextFrame(const SwapHandlers& h);
 
-    void onRefreshRateChanged();
+    std::unique_ptr<SwappyPlatform> mPlatform;
 
-    const jobject mJactivity;
-    void* mLibAndroid = nullptr;
-    PFN_ANativeWindow_setFrameRate mANativeWindow_setFrameRate = nullptr;
-
-    JavaVM* mJVM = nullptr;
-
-    SwappyCommonSettings mCommonSettings;
+    SwappyCommonSettings mCommonSettings{};
 
     std::unique_ptr<ChoreographerFilter> mChoreographerFilter;
 
     bool mUsingExternalChoreographer = false;
-    std::unique_ptr<ChoreographerThread> mChoreographerThread;
 
     std::mutex mWaitingMutex;
     std::condition_variable mWaitingCondition;
@@ -234,11 +208,7 @@ private:
 
     std::chrono::nanoseconds mFenceTimeout = std::chrono::nanoseconds(50ms);
 
-    constexpr static bool USE_DISPLAY_MANAGER = true;
-    std::unique_ptr<SwappyDisplayManager> mDisplayManager;
-    int mNextModeId = -1;
-
-    std::shared_ptr<SwappyDisplayManager::RefreshPeriodMap> mSupportedRefreshPeriods;
+    std::shared_ptr<RefreshPeriodMap> mSupportedRefreshPeriods;
 
     struct TimingSettings {
         std::chrono::nanoseconds refreshPeriod = {};
@@ -267,8 +237,7 @@ private:
 
     ANativeWindow* mWindow GUARDED_BY(mMutex) = nullptr;
     bool mWindowChanged GUARDED_BY(mMutex) = false;
-    float mLatestFrameRateVote GUARDED_BY(mMutex) = 0.f;
-    static constexpr float FRAME_RATE_VOTE_MARGIN = 1.f; // 1Hz
+    DisplayRateController mDisplayRateController GUARDED_BY(mMutex);
 
     // Callback for last latency recorded - used for buffer stuffing fix.
     // Latency is returned in number of V-syncs

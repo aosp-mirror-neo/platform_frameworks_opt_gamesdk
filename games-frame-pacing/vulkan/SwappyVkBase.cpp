@@ -16,6 +16,7 @@
 
 #include "SwappyVkBase.h"
 
+#include "AndroidSwappyPlatform.h"
 #include "system_utils.h"
 
 #define LOG_TAG "SwappyVkBase"
@@ -100,10 +101,9 @@ void ResetVulkanFunctions() {
     vkQueueSubmit = nullptr;
 }
 
-
 SwappyVkBase::SwappyVkBase(JNIEnv* env, jobject jactivity, VkPhysicalDevice physicalDevice,
                            VkDevice device, const SwappyVkFunctionProvider* pFunctionProvider)
-      : mCommonBase(env, jactivity),
+      : mCommonBase(createAndroidSwappyPlatform(env, jactivity)),
         mPhysicalDevice(physicalDevice),
         mDevice(device),
         mpFunctionProvider(pFunctionProvider),

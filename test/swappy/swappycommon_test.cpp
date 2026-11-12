@@ -23,6 +23,7 @@
 #include <thread>
 #include <vector>
 
+#include "common/AndroidSwappyPlatform.h"
 #include "common/CPUTracer.h"
 #include "common/CpuInfo.h"
 #include "common/FrameStatistics.h"
@@ -49,7 +50,8 @@ namespace swappycommon_test {
 
 class SwappyCommonTest : public SwappyCommon {
 public:
-    SwappyCommonTest(const SwappyCommonSettings& settings) : SwappyCommon(settings) {}
+    SwappyCommonTest(const SwappyCommonSettings& settings)
+          : SwappyCommon(createAppSwappyPlatform(settings)) {}
 };
 
 // std::this_thread::sleep_for is inaccurate on emulators, where thread wake-up delays
