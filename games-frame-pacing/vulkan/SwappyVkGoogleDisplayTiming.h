@@ -70,7 +70,8 @@ public:
             std::unique_ptr<SwappyPlatform> platform, VkPhysicalDevice physicalDevice,
             VkDevice device, VkSwapchainKHR swapchain, PFN_vkQueuePresentKHR pfnQueuePresentKHR,
             PFN_vkGetRefreshCycleDurationGOOGLE pfnGetRefreshCycleDurationGOOGLE,
-            PFN_vkGetPastPresentationTimingGOOGLE pfnGetPastPresentationTimingGOOGLE);
+            PFN_vkGetPastPresentationTimingGOOGLE pfnGetPastPresentationTimingGOOGLE,
+            const Clock& clock = SteadyClock::instance());
 
     bool doGetRefreshCycleDuration(VkSwapchainKHR swapchain,
                                    uint64_t* pRefreshDuration) override final;

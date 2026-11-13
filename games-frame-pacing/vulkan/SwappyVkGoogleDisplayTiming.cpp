@@ -32,8 +32,9 @@ SwappyVkGoogleDisplayTiming::SwappyVkGoogleDisplayTiming(
         std::unique_ptr<SwappyPlatform> platform, VkPhysicalDevice physicalDevice, VkDevice device,
         VkSwapchainKHR swapchain, PFN_vkQueuePresentKHR pfnQueuePresentKHR,
         PFN_vkGetRefreshCycleDurationGOOGLE pfnGetRefreshCycleDurationGOOGLE,
-        PFN_vkGetPastPresentationTimingGOOGLE pfnGetPastPresentationTimingGOOGLE)
-      : SwappyVkBase(std::move(platform), physicalDevice, device, pfnQueuePresentKHR),
+        PFN_vkGetPastPresentationTimingGOOGLE pfnGetPastPresentationTimingGOOGLE,
+        const Clock& clock)
+      : SwappyVkBase(std::move(platform), physicalDevice, device, pfnQueuePresentKHR, clock),
         mSwapchain(swapchain),
         mpfnGetRefreshCycleDurationGOOGLE(pfnGetRefreshCycleDurationGOOGLE),
         mpfnGetPastPresentationTimingGOOGLE(pfnGetPastPresentationTimingGOOGLE) {
@@ -127,8 +128,7 @@ void SwappyVkGoogleDisplayTiming::enableStats(bool enabled) {
 }
 
 void SwappyVkGoogleDisplayTiming::recordFrameStart(VkQueue queue, uint32_t image) {
-    uint64_t frameStartTime =
-            static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+    uint64_t frameStartTime = static_cast<uint64_t>(mClock.now().time_since_epoch().count());
     mPendingFrames.push_back({mPresentID, frameStartTime});
 
     // No point in querying if the history is too short, as vulkan loader does

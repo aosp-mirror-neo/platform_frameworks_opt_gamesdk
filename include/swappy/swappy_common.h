@@ -25,6 +25,8 @@
 #include <stdint.h>
 #ifdef __ANDROID__
 #include <android/native_window.h>
+#else
+typedef struct ANativeWindow ANativeWindow;
 #endif
 
 #include "common/gamesdk_common.h"

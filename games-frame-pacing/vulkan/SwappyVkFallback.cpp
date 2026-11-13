@@ -25,8 +25,8 @@ namespace swappy {
 
 SwappyVkFallback::SwappyVkFallback(std::unique_ptr<SwappyPlatform> platform,
                                    VkPhysicalDevice physicalDevice, VkDevice device,
-                                   PFN_vkQueuePresentKHR pfnQueuePresentKHR)
-      : SwappyVkBase(std::move(platform), physicalDevice, device, pfnQueuePresentKHR) {
+                                   PFN_vkQueuePresentKHR pfnQueuePresentKHR, const Clock& clock)
+      : SwappyVkBase(std::move(platform), physicalDevice, device, pfnQueuePresentKHR, clock) {
     if (mCommonBase.isValid()) {
         // Since we don't have presentation timing, we cannot achieve pipelining.
         mCommonBase.setAutoPipelineMode(false);

@@ -116,8 +116,9 @@ void ResetVulkanFunctions() {
 
 SwappyVkBase::SwappyVkBase(std::unique_ptr<SwappyPlatform> platform,
                            VkPhysicalDevice physicalDevice, VkDevice device,
-                           PFN_vkQueuePresentKHR pfnQueuePresentKHR)
-      : mCommonBase(std::move(platform)),
+                           PFN_vkQueuePresentKHR pfnQueuePresentKHR, const Clock& clock)
+      : mCommonBase(std::move(platform), clock),
+        mClock(clock),
         mPhysicalDevice(physicalDevice),
         mDevice(device),
         mpfnQueuePresentKHR(pfnQueuePresentKHR) {}
@@ -401,7 +402,7 @@ void SwappyVkBase::waitForFenceThreadMain(ThreadContext& thread) {
         {
             std::lock_guard<std::mutex> lock(thread.lock);
             // Wait for new fence object
-            thread.condition.wait(thread.lock, [&]() REQUIRES(thread.lock) {
+            mClock.wait(thread.lock, thread.condition, [&]() REQUIRES(thread.lock) {
                 return thread.hasPendingWork || !thread.running;
             });
 
@@ -422,13 +423,13 @@ void SwappyVkBase::waitForFenceThreadMain(ThreadContext& thread) {
             }
 
             gamesdk::ScopedTrace tracer("Swappy: GPU frame time");
-            const auto startTime = std::chrono::steady_clock::now();
+            const auto startTime = mClock.now();
             VkResult result = vkWaitForFences(mDevice, 1, &sync.fence, VK_TRUE,
                                               mCommonBase.getFenceTimeout().count());
             if (result) {
                 SWAPPY_LOGW_ONCE("Failed to wait for fence %d", result);
             }
-            mLastFenceTime = std::chrono::steady_clock::now() - startTime;
+            mLastFenceTime = mClock.now() - startTime;
 
             // Move the sync object to the signaled list
             {

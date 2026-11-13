@@ -18,8 +18,10 @@
 
 #include <utility>
 
+#ifdef __ANDROID__
 #include "AndroidSwappyPlatform.h"
 #include "system_utils.h"
+#endif
 
 #define LOG_TAG "SwappyVk"
 #include "SwappyLog.h"
@@ -173,10 +175,12 @@ std::unique_ptr<SwappyVkBase> SwappyVk::createImplementation(JNIEnv* env, jobjec
         return nullptr;
     }
 
+#ifdef __ANDROID__
     if (gamesdk::GetSystemPropAsBool(SWAPPY_SYSTEM_PROP_KEY_DISABLE, false)) {
         SWAPPY_LOGI("Swappy is disabled");
         return nullptr;
     }
+#endif
 
     auto pfnGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
             pFunctionProvider->getProcAddr("vkGetDeviceProcAddr"));
@@ -219,7 +223,14 @@ std::unique_ptr<SwappyVkBase> SwappyVk::createImplementation(JNIEnv* env, jobjec
     }
 #endif
 
-    std::unique_ptr<SwappyPlatform> platform = createAndroidSwappyPlatform(env, jactivity);
+    std::unique_ptr<SwappyPlatform> platform;
+    if (mPlatformFactory) {
+        platform = mPlatformFactory(env, jactivity);
+    } else {
+#ifdef __ANDROID__
+        platform = createAndroidSwappyPlatform(env, jactivity);
+#endif
+    }
     if (!platform || !platform->isValid()) {
         SWAPPY_LOGE("SwappyCommon could not initialize correctly.");
         return nullptr;
@@ -231,7 +242,8 @@ std::unique_ptr<SwappyVkBase> SwappyVk::createImplementation(JNIEnv* env, jobjec
         impl = std::make_unique<SwappyVkGoogleDisplayTiming>(std::move(platform), physicalDevice,
                                                              device, swapchain, pfnQueuePresentKHR,
                                                              pfnGetRefreshCycleDurationGOOGLE,
-                                                             pfnGetPastPresentationTimingGOOGLE);
+                                                             pfnGetPastPresentationTimingGOOGLE,
+                                                             *mClock);
         SWAPPY_LOGV("SwappyVk initialized for VkDevice %p using "
                     "VK_GOOGLE_display_timing on Android",
                     device);
@@ -239,7 +251,7 @@ std::unique_ptr<SwappyVkBase> SwappyVk::createImplementation(JNIEnv* env, jobjec
 #endif
     {
         impl = std::make_unique<SwappyVkFallback>(std::move(platform), physicalDevice, device,
-                                                  pfnQueuePresentKHR);
+                                                  pfnQueuePresentKHR, *mClock);
         SWAPPY_LOGV("SwappyVk initialized for VkDevice %p using Android fallback", device);
     }
 
@@ -525,6 +537,8 @@ void SwappyVk::clearState() {
     }
     pFunctionProvider = nullptr;
     ResetVulkanFunctions();
+    mPlatformFactory = nullptr;
+    mClock = &SteadyClock::instance();
     std::lock_guard<std::mutex> lock(tracer_list_lock);
     tracer_list.clear();
 }

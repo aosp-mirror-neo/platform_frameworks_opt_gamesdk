@@ -97,6 +97,12 @@ public:
     explicit FakeSwappyPlatform(std::shared_ptr<PlatformSharedState> state)
           : mState(std::move(state)) {}
 
+    ~FakeSwappyPlatform() override {
+        std::lock_guard<std::mutex> lock(mState->mutex);
+        mState->choreographerCallbackArmed = false;
+        mState->onChoreographer = nullptr;
+    }
+
     [[nodiscard]] bool isValid() const override {
         std::lock_guard<std::mutex> lock(mState->mutex);
         return mState->valid;

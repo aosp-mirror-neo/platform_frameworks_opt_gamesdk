@@ -57,7 +57,7 @@
 #include <memory>
 #include <mutex>
 
-#include "ChoreographerShim.h"
+#include "Clock.h"
 #include "Settings.h"
 #include "SwappyCommon.h"
 #include "Trace.h"
@@ -72,20 +72,6 @@ constexpr uint32_t k16_6msec = 16666666;
 constexpr uint32_t kTooCloseToVsyncBoundary = 3000000;
 constexpr uint32_t kTooFarAwayFromVsyncBoundary = 7000000;
 constexpr uint32_t kNudgeWithinVsyncBoundaries = 2000000;
-
-// AChoreographer is supported from API 24. To allow compilation for minSDK < 24
-// and still use AChoreographer for SDK >= 24 we need runtime support to call
-// AChoreographer APIs.
-
-using PFN_AChoreographer_getInstance = AChoreographer* (*)();
-
-using PFN_AChoreographer_postFrameCallback = void (*)(AChoreographer* choreographer,
-                                                      AChoreographer_frameCallback callback,
-                                                      void* data);
-
-using PFN_AChoreographer_postFrameCallbackDelayed = void (*)(AChoreographer* choreographer,
-                                                             AChoreographer_frameCallback callback,
-                                                             void* data, long delayMillis);
 
 extern PFN_vkCreateCommandPool vkCreateCommandPool;
 extern PFN_vkDestroyCommandPool vkDestroyCommandPool;
@@ -112,7 +98,8 @@ void ResetVulkanFunctions();
 class SwappyVkBase {
 public:
     SwappyVkBase(std::unique_ptr<SwappyPlatform> platform, VkPhysicalDevice physicalDevice,
-                 VkDevice device, PFN_vkQueuePresentKHR pfnQueuePresentKHR);
+                 VkDevice device, PFN_vkQueuePresentKHR pfnQueuePresentKHR,
+                 const Clock& clock = SteadyClock::instance());
 
     virtual ~SwappyVkBase();
 
@@ -181,13 +168,14 @@ protected:
 
         Thread thread;
         bool running GUARDED_BY(lock) = true;
-        bool hasPendingWork GUARDED_BY(lock);
+        bool hasPendingWork GUARDED_BY(lock) = false;
         std::mutex lock;
-        std::condition_variable_any condition;
+        std::condition_variable condition;
         VkQueue queue GUARDED_BY(lock);
     };
 
     SwappyCommon mCommonBase;
+    const Clock& mClock;
     VkPhysicalDevice mPhysicalDevice;
     VkDevice mDevice;
 

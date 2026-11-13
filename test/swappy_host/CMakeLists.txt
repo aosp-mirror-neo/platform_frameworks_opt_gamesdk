@@ -21,11 +21,12 @@ project(swappy_host_test CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../external/googletest")
-  set(ANDROID_GTEST_DIR "../../../external/googletest")
-elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../external/googletest")
-  set(ANDROID_GTEST_DIR "../../../../../external/googletest")
-endif()
+foreach(repo_root_rel "../../.." "../../../.." "../../../../..")
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${repo_root_rel}/external/googletest")
+    set(ANDROID_GTEST_DIR "${repo_root_rel}/external/googletest")
+    break()
+  endif()
+endforeach()
 
 find_package(Threads REQUIRED)
 
@@ -45,11 +46,73 @@ if(AGDK_ENABLE_COVERAGE)
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --coverage")
 endif()
 
+if(DEFINED ENV{PREBUILTS_DIR} AND EXISTS "$ENV{PREBUILTS_DIR}")
+  set(AGDK_PREBUILTS_DIR "$ENV{PREBUILTS_DIR}")
+else()
+  foreach(repo_root_rel "../../.." "../../../.." "../../../../..")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${repo_root_rel}/prebuilts")
+      set(AGDK_PREBUILTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/${repo_root_rel}/prebuilts")
+      break()
+    endif()
+  endforeach()
+endif()
+
+if(APPLE)
+  set(SWAPPY_HOST_JDK_ARCHS darwin-arm64 darwin-x86)
+  set(SWAPPY_HOST_JNI_MD_DIR darwin)
+elseif(WIN32)
+  set(SWAPPY_HOST_JDK_ARCHS windows-x86)
+  set(SWAPPY_HOST_JNI_MD_DIR win32)
+else()
+  set(SWAPPY_HOST_JDK_ARCHS linux-x86)
+  set(SWAPPY_HOST_JNI_MD_DIR linux)
+endif()
+
+set(SWAPPY_HOST_JNI_INCLUDE_DIRS)
+if(AGDK_PREBUILTS_DIR)
+  foreach(jdk_ver jdk21 jdk17)
+    foreach(jdk_arch ${SWAPPY_HOST_JDK_ARCHS})
+      set(jdk_inc "${AGDK_PREBUILTS_DIR}/jdk/${jdk_ver}/${jdk_arch}/include")
+      if(EXISTS "${jdk_inc}/jni.h")
+        set(SWAPPY_HOST_JNI_INCLUDE_DIRS "${jdk_inc}" "${jdk_inc}/${SWAPPY_HOST_JNI_MD_DIR}")
+        break()
+      endif()
+    endforeach()
+    if(SWAPPY_HOST_JNI_INCLUDE_DIRS)
+      break()
+    endif()
+  endforeach()
+endif()
+if(NOT SWAPPY_HOST_JNI_INCLUDE_DIRS)
+  find_package(JNI REQUIRED)
+  set(SWAPPY_HOST_JNI_INCLUDE_DIRS ${JNI_INCLUDE_DIRS})
+endif()
+
+set(SWAPPY_HOST_VULKAN_INCLUDE_DIR)
+if(AGDK_PREBUILTS_DIR)
+  foreach(ndk_ver r23 r21 r20)
+    if(EXISTS "${AGDK_PREBUILTS_DIR}/ndk/${ndk_ver}/sources/third_party/vulkan/src/include/vulkan/vulkan.h")
+      set(SWAPPY_HOST_VULKAN_INCLUDE_DIR
+        "${AGDK_PREBUILTS_DIR}/ndk/${ndk_ver}/sources/third_party/vulkan/src/include")
+      break()
+    endif()
+  endforeach()
+endif()
+if(NOT SWAPPY_HOST_VULKAN_INCLUDE_DIR)
+  find_package(Vulkan REQUIRED)
+  set(SWAPPY_HOST_VULKAN_INCLUDE_DIR ${Vulkan_INCLUDE_DIRS})
+endif()
+
 include_directories(
   ../../games-frame-pacing/common
+  ../../games-frame-pacing/vulkan
   ../../include
   ../../src/common
   ../../test/common
+)
+include_directories(SYSTEM
+  ${SWAPPY_HOST_JNI_INCLUDE_DIRS}
+  ${SWAPPY_HOST_VULKAN_INCLUDE_DIR}
 )
 
 set(SWAPPY_HOST_COMMON_SOURCES
@@ -65,6 +128,10 @@ set(SWAPPY_HOST_COMMON_SOURCES
   swapintervalladder_test.cpp
   swappy_c_test.cpp
   swappycommon_test.cpp
+  swappyvk_host_test.cpp
+  jniutil_test.cpp
+  jniutil_no_dex_test.cpp
+  scoped_jni_env_test.cpp
   ../../games-frame-pacing/common/CPUTracer.cpp
   ../../games-frame-pacing/common/ChoreographerFilter.cpp
   ../../games-frame-pacing/common/FrameStatistics.cpp
@@ -72,47 +139,11 @@ set(SWAPPY_HOST_COMMON_SOURCES
   ../../games-frame-pacing/common/SwappyCommon.cpp
   ../../games-frame-pacing/common/Thread.cpp
   ../../games-frame-pacing/common/swappy_c.cpp
-)
-
-set(AGDK_HOST_JNI_INCLUDE_DIRS)
-foreach(CANDIDATE_REL
-    "../../../prebuilts/jdk/jdk21"
-    "../../../../../prebuilts/jdk/jdk21"
-    "../../../prebuilts/jdk/jdk17"
-    "../../../../../prebuilts/jdk/jdk17")
-  if(UNIX AND NOT APPLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/linux-x86/include/jni.h")
-    set(AGDK_HOST_JNI_INCLUDE_DIRS
-      "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/linux-x86/include"
-      "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/linux-x86/include/linux")
-    break()
-  elseif(APPLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/darwin-arm64/include/jni.h")
-    set(AGDK_HOST_JNI_INCLUDE_DIRS
-      "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/darwin-arm64/include"
-      "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/darwin-arm64/include/darwin")
-    break()
-  elseif(APPLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/darwin-x86/include/jni.h")
-    set(AGDK_HOST_JNI_INCLUDE_DIRS
-      "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/darwin-x86/include"
-      "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/darwin-x86/include/darwin")
-    break()
-  elseif(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/windows-x86/include/jni.h")
-    set(AGDK_HOST_JNI_INCLUDE_DIRS
-      "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/windows-x86/include"
-      "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/windows-x86/include/win32")
-    break()
-  endif()
-endforeach()
-
-if(NOT AGDK_HOST_JNI_INCLUDE_DIRS)
-  find_package(JNI REQUIRED)
-  set(AGDK_HOST_JNI_INCLUDE_DIRS ${JNI_INCLUDE_DIRS})
-endif()
-
-include_directories(SYSTEM ${AGDK_HOST_JNI_INCLUDE_DIRS})
-list(APPEND SWAPPY_HOST_COMMON_SOURCES
-  jniutil_test.cpp
-  jniutil_no_dex_test.cpp
-  scoped_jni_env_test.cpp
+  ../../games-frame-pacing/vulkan/SwappyVk.cpp
+  ../../games-frame-pacing/vulkan/SwappyVkBase.cpp
+  ../../games-frame-pacing/vulkan/SwappyVkFallback.cpp
+  ../../games-frame-pacing/vulkan/SwappyVkGoogleDisplayTiming.cpp
+  ../../games-frame-pacing/vulkan/swappyVk_c.cpp
 )
 
 set(SWAPPY_HOST_TEST_SOURCES

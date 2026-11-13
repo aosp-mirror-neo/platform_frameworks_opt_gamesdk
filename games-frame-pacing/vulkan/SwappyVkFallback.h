@@ -30,7 +30,8 @@ namespace swappy {
 class SwappyVkFallback : public SwappyVkBase {
 public:
     SwappyVkFallback(std::unique_ptr<SwappyPlatform> platform, VkPhysicalDevice physicalDevice,
-                     VkDevice device, PFN_vkQueuePresentKHR pfnQueuePresentKHR);
+                     VkDevice device, PFN_vkQueuePresentKHR pfnQueuePresentKHR,
+                     const Clock& clock = SteadyClock::instance());
 
     bool doGetRefreshCycleDuration(VkSwapchainKHR swapchain,
                                    uint64_t* pRefreshDuration) override final;

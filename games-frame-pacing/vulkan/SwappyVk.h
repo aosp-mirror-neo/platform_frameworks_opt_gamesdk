@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 
 #include "SwappyVkBase.h"
@@ -130,6 +131,12 @@ private:
     const SwappyVkFunctionProvider* pFunctionProvider = nullptr;
 
 private:
+    friend class SwappyVkTestPeer;
+    using PlatformFactory = std::function<std::unique_ptr<SwappyPlatform>(JNIEnv*, jobject)>;
+
+    PlatformFactory mPlatformFactory;
+    const Clock* mClock = &SteadyClock::instance();
+
     SwappyVk() {} // Need to implement this constructor
 
     // Forbid copies.
