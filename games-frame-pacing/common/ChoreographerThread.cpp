@@ -35,6 +35,7 @@
 #include "CpuInfo.h"
 #include "JNIUtil.h"
 #include "Settings.h"
+#include "SwappyJniUtils.h"
 #include "SwappyLog.h"
 #include "Thread.h"
 #include "Trace.h"
@@ -322,23 +323,30 @@ JavaChoreographerThread::JavaChoreographerThread(JavaVM* vm, jobject jactivity,
     JNIEnv* env;
     mJVM->AttachCurrentThread(&env, nullptr);
 
-    jclass choreographerCallbackClass =
-            gamesdk::loadClass(env, jactivity, ChoreographerThread::CT_CLASS,
-                               (JNINativeMethod*)ChoreographerThread::CTNativeMethods,
-                               ChoreographerThread::CTNativeMethodsSize);
+    ScopedLocalRef<jclass>
+            choreographerCallbackClass(env,
+                                       gamesdk::
+                                               loadClass(env, jactivity,
+                                                         ChoreographerThread::CT_CLASS,
+                                                         (JNINativeMethod*)ChoreographerThread::
+                                                                 CTNativeMethods,
+                                                         ChoreographerThread::CTNativeMethodsSize));
 
-    if (!choreographerCallbackClass) return;
+    if (choreographerCallbackClass.get() == nullptr) return;
 
-    jmethodID constructor = env->GetMethodID(choreographerCallbackClass, "<init>", "(J)V");
+    jmethodID constructor = env->GetMethodID(choreographerCallbackClass.get(), "<init>", "(J)V");
 
-    mJpostFrameCallback = env->GetMethodID(choreographerCallbackClass, "postFrameCallback", "()V");
+    mJpostFrameCallback =
+            env->GetMethodID(choreographerCallbackClass.get(), "postFrameCallback", "()V");
 
-    mJterminate = env->GetMethodID(choreographerCallbackClass, "terminate", "()V");
+    mJterminate = env->GetMethodID(choreographerCallbackClass.get(), "terminate", "()V");
 
-    jobject choreographerCallback =
-            env->NewObject(choreographerCallbackClass, constructor, reinterpret_cast<jlong>(this));
+    ScopedLocalRef<jobject> choreographerCallback(env,
+                                                  env->NewObject(choreographerCallbackClass.get(),
+                                                                 constructor,
+                                                                 reinterpret_cast<jlong>(this)));
 
-    mJobj = env->NewGlobalRef(choreographerCallback);
+    mJobj = env->NewGlobalRef(choreographerCallback.get());
 
     mInitialized = true;
 }
