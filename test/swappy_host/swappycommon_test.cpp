@@ -30,6 +30,7 @@
 #include "SdkVersion.h"
 #include "Settings.h"
 #include "SimulatedClock.h"
+#include "SimulatedGpuQueue.h"
 #include "SwappyPlatform.h"
 #include "gtest/gtest.h"
 #include "swappy/swappy_common.h"
@@ -51,6 +52,7 @@ using swappy::SwappyCommon;
 using swappy::SwappyCommonSettings;
 using swappy::SwappyPlatform;
 using swappy::testing::SimulatedClock;
+using swappy::testing::SimulatedGpuQueue;
 
 constexpr auto k60HzPeriod = 16'666'667ns;
 constexpr auto k30HzPeriod = 33'333'334ns;
@@ -528,10 +530,25 @@ public:
     void runFrame(std::chrono::nanoseconds cpuWork, std::chrono::nanoseconds gpuWork,
                   std::chrono::nanoseconds swapCpuCost = 500us) {
         mClock.advanceBy(cpuWork);
-        const auto handlers = readySwapHandlers(gpuWork);
+        mGpuQueue.submit(mClock.now(), gpuWork);
+        const SwappyCommon::SwapHandlers handlers{
+                .lastFrameIsComplete =
+                        [this] {
+                            return mGpuQueue.lastFrameIsComplete(mClock.now(),
+                                                                 mSwappy->getCurrentPipelineMode());
+                        },
+                .getPrevFrameGpuTime = [this] { return mGpuQueue.lastFenceTime(mClock.now()); },
+        };
         mSwappy->onPreSwap(handlers);
         mClock.advanceBy(swapCpuCost);
         mSwappy->onPostSwap(handlers);
+    }
+
+    void runFrames(int frameCount, std::chrono::nanoseconds cpuWork,
+                   std::chrono::nanoseconds gpuWork, std::chrono::nanoseconds swapCpuCost = 500us) {
+        for (int frame = 0; frame < frameCount; ++frame) {
+            runFrame(cpuWork, gpuWork, swapCpuCost);
+        }
     }
 
 private:
@@ -570,6 +587,7 @@ private:
 
     std::shared_ptr<PlatformSharedState> mState;
     SimulatedClock mClock;
+    SimulatedGpuQueue mGpuQueue;
     std::chrono::nanoseconds mDisplayPeriod;
     std::chrono::nanoseconds mAppVsyncOffset;
     std::chrono::nanoseconds mSfToVsyncDelay;
@@ -782,6 +800,47 @@ TEST_F(SwappyCommonHostTest, InvalidPlatformRemainsInvalidAndHandlesEntryPointsS
     EXPECT_TRUE(snapshot.acquiredWindows.empty());
     EXPECT_TRUE(snapshot.releasedWindows.empty());
     EXPECT_EQ(snapshot.postFrameCallbacksCount, 0);
+}
+
+TEST_F(SwappyCommonHostTest, GpuBoundWorkloadStepsDownTo30HzAndRecoversTo60Hz) {
+    SimulatedSwappyHarness harness(makeSettings(), Clock::time_point{1s});
+    ANativeWindow window{77};
+    harness.swappy().setANativeWindow(&window);
+
+    int64_t lastReportedGpuNs = 0;
+    SwappyTracer tracer{};
+    tracer.userData = &lastReportedGpuNs;
+    tracer.postWait = [](void* data, int64_t, int64_t gpuTimeNs) {
+        *static_cast<int64_t*>(data) = gpuTimeNs;
+    };
+    harness.swappy().addTracerCallbacks(tracer);
+
+    // 4ms CPU fits inside 60Hz, while 22ms serialized GPU work overruns the 16.67ms
+    // pipelined budget and blocks lastFrameIsComplete across VSYNC boundaries.
+    harness.runFrames(150, 4ms, 22ms);
+
+    EXPECT_NEAR(harness.swappy().getSwapDuration().count(), k30HzPeriod.count(), 100);
+    EXPECT_EQ(harness.swappy().getCurrentPipelineMode(), PipelineMode::On);
+    EXPECT_EQ(lastReportedGpuNs, std::chrono::nanoseconds(22ms).count());
+
+    harness.runFrames(150, 4ms, 4ms);
+
+    EXPECT_EQ(harness.swappy().getSwapDuration(), k60HzPeriod);
+    EXPECT_EQ(lastReportedGpuNs, std::chrono::nanoseconds(4ms).count());
+}
+
+TEST_F(SwappyCommonHostTest, UnpipelinedGpuOverrunSlipsFrameAndRestoresPipelineModeAt60Hz) {
+    SimulatedSwappyHarness harness(makeSettings(), Clock::time_point{1s});
+    harness.runFrames(150, 2ms, 2ms);
+    ASSERT_EQ(harness.swappy().getCurrentPipelineMode(), PipelineMode::Off);
+
+    // In PipelineMode::Off, 5ms CPU + 14ms GPU (19ms sequential) exceeds 16.67ms in
+    // onPostSwap's waitForNextFrame, while pipelined max(5ms, 14ms) + 1ms = 15ms fits
+    // 60Hz, so SwapSlower restores PipelineMode::On without dropping to 30Hz.
+    harness.runFrames(150, 5ms, 14ms);
+
+    EXPECT_EQ(harness.swappy().getCurrentPipelineMode(), PipelineMode::On);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), k60HzPeriod);
 }
 
 } // namespace
