@@ -76,8 +76,11 @@ SwappyDisplayManager::SwappyDisplayManager(JavaVM* vm, jobject mainActivity) : m
         return;
     }
 
-    JNIEnv* env;
-    mJVM->AttachCurrentThread(&env, nullptr);
+    ScopedJniEnv jniEnv(mJVM);
+    JNIEnv* env = jniEnv.get();
+    if (env == nullptr) {
+        return;
+    }
 
     ScopedLocalRef<jclass>
             swappyDisplayManagerClass(env,
@@ -92,10 +95,21 @@ SwappyDisplayManager::SwappyDisplayManager(JavaVM* vm, jobject mainActivity) : m
 
     jmethodID constructor = env->GetMethodID(swappyDisplayManagerClass.get(), "<init>",
                                              "(JLandroid/app/Activity;)V");
+    if (!isUsableResult(env, constructor, "SwappyDisplayManager.<init>")) {
+        return;
+    }
     mSetPreferredDisplayModeId =
             env->GetMethodID(swappyDisplayManagerClass.get(), "setPreferredDisplayModeId", "(I)V");
+    if (!isUsableResult(env, mSetPreferredDisplayModeId,
+                        "SwappyDisplayManager.setPreferredDisplayModeId")) {
+        return;
+    }
     mEnableRefreshCallbackForwarding = env->GetMethodID(swappyDisplayManagerClass.get(),
                                                         "enableRefreshCallbackForwarding", "()V");
+    if (!isUsableResult(env, mEnableRefreshCallbackForwarding,
+                        "SwappyDisplayManager.enableRefreshCallbackForwarding")) {
+        return;
+    }
     jmethodID disableRenderAhead =
             env->GetMethodID(swappyDisplayManagerClass.get(), "disableRenderAhead", "()V");
     if (env->ExceptionCheck()) {
@@ -103,12 +117,22 @@ SwappyDisplayManager::SwappyDisplayManager(JavaVM* vm, jobject mainActivity) : m
         disableRenderAhead = nullptr;
     }
     mTerminate = env->GetMethodID(swappyDisplayManagerClass.get(), "terminate", "()V");
+    if (!isUsableResult(env, mTerminate, "SwappyDisplayManager.terminate")) {
+        return;
+    }
     ScopedLocalRef<jobject> swappyDisplayManager(env,
                                                  env->NewObject(swappyDisplayManagerClass.get(),
-                                                                constructor, (jlong)this,
+                                                                constructor,
+                                                                reinterpret_cast<jlong>(this),
                                                                 mainActivity));
+    if (!isUsableResult(env, swappyDisplayManager.get(), "SwappyDisplayManager instance")) {
+        return;
+    }
     mJthis = env->NewGlobalRef(swappyDisplayManager.get());
-    if (mJthis != nullptr && disableRenderAhead != nullptr) {
+    if (mJthis == nullptr) {
+        return;
+    }
+    if (disableRenderAhead != nullptr) {
         env->CallVoidMethod(mJthis, disableRenderAhead);
         if (env->ExceptionCheck()) {
             env->ExceptionClear();
@@ -122,10 +146,14 @@ SwappyDisplayManager::~SwappyDisplayManager() {
     if (!mInitialized) {
         return;
     }
-    JNIEnv* env;
-    mJVM->AttachCurrentThread(&env, nullptr);
+    ScopedJniEnv jniEnv(mJVM);
+    JNIEnv* env = jniEnv.get();
+    if (env == nullptr) {
+        return;
+    }
 
     env->CallVoidMethod(mJthis, mTerminate);
+    consumePendingException(env, "SwappyDisplayManager.terminate");
     env->DeleteGlobalRef(mJthis);
 }
 
@@ -144,20 +172,28 @@ void SwappyDisplayManager::setPreferredDisplayModeId(int index) {
     if (!mInitialized) {
         return;
     }
-    JNIEnv* env;
-    mJVM->AttachCurrentThread(&env, nullptr);
+    ScopedJniEnv jniEnv(mJVM);
+    JNIEnv* env = jniEnv.get();
+    if (env == nullptr) {
+        return;
+    }
 
     env->CallVoidMethod(mJthis, mSetPreferredDisplayModeId, index);
+    consumePendingException(env, "SwappyDisplayManager.setPreferredDisplayModeId");
 }
 
 void SwappyDisplayManager::enableRefreshCallbackForwarding() {
     if (!mInitialized || mEnableRefreshCallbackForwarding == nullptr) {
         return;
     }
-    JNIEnv* env;
-    mJVM->AttachCurrentThread(&env, nullptr);
+    ScopedJniEnv jniEnv(mJVM);
+    JNIEnv* env = jniEnv.get();
+    if (env == nullptr) {
+        return;
+    }
 
     env->CallVoidMethod(mJthis, mEnableRefreshCallbackForwarding);
+    consumePendingException(env, "SwappyDisplayManager.enableRefreshCallbackForwarding");
 }
 
 // Helper class to wrap JNI entry points to SwappyDisplayManager

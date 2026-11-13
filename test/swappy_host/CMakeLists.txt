@@ -112,6 +112,7 @@ include_directories(SYSTEM ${AGDK_HOST_JNI_INCLUDE_DIRS})
 list(APPEND SWAPPY_HOST_COMMON_SOURCES
   jniutil_test.cpp
   jniutil_no_dex_test.cpp
+  scoped_jni_env_test.cpp
 )
 
 set(SWAPPY_HOST_TEST_SOURCES

@@ -320,8 +320,11 @@ JavaChoreographerThread::JavaChoreographerThread(JavaVM* vm, jobject jactivity,
     if (!vm || !jactivity) {
         return;
     }
-    JNIEnv* env;
-    mJVM->AttachCurrentThread(&env, nullptr);
+    ScopedJniEnv jniEnv(mJVM);
+    JNIEnv* env = jniEnv.get();
+    if (env == nullptr) {
+        return;
+    }
 
     ScopedLocalRef<jclass>
             choreographerCallbackClass(env,
@@ -335,18 +338,33 @@ JavaChoreographerThread::JavaChoreographerThread(JavaVM* vm, jobject jactivity,
     if (choreographerCallbackClass.get() == nullptr) return;
 
     jmethodID constructor = env->GetMethodID(choreographerCallbackClass.get(), "<init>", "(J)V");
+    if (!isUsableResult(env, constructor, "ChoreographerCallback.<init>")) {
+        return;
+    }
 
     mJpostFrameCallback =
             env->GetMethodID(choreographerCallbackClass.get(), "postFrameCallback", "()V");
+    if (!isUsableResult(env, mJpostFrameCallback, "ChoreographerCallback.postFrameCallback")) {
+        return;
+    }
 
     mJterminate = env->GetMethodID(choreographerCallbackClass.get(), "terminate", "()V");
+    if (!isUsableResult(env, mJterminate, "ChoreographerCallback.terminate")) {
+        return;
+    }
 
     ScopedLocalRef<jobject> choreographerCallback(env,
                                                   env->NewObject(choreographerCallbackClass.get(),
                                                                  constructor,
                                                                  reinterpret_cast<jlong>(this)));
+    if (!isUsableResult(env, choreographerCallback.get(), "ChoreographerCallback instance")) {
+        return;
+    }
 
     mJobj = env->NewGlobalRef(choreographerCallback.get());
+    if (mJobj == nullptr) {
+        return;
+    }
 
     mInitialized = true;
 }
@@ -358,28 +376,24 @@ JavaChoreographerThread::~JavaChoreographerThread() {
         return;
     }
 
-    JNIEnv* env;
-    // Check if we need to attach and only detach if we do.
-    jint result = mJVM->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_2);
-    if (result != JNI_OK) {
-        if (result == JNI_EVERSION) {
-            result = mJVM->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_1);
-        }
-        if (result == JNI_EDETACHED) {
-            mJVM->AttachCurrentThread(&env, nullptr);
-        }
+    ScopedJniEnv jniEnv(mJVM);
+    JNIEnv* env = jniEnv.get();
+    if (env == nullptr) {
+        return;
     }
     env->CallVoidMethod(mJobj, mJterminate);
+    consumePendingException(env, "ChoreographerCallback.terminate");
     env->DeleteGlobalRef(mJobj);
-    if (result == JNI_EDETACHED) {
-        mJVM->DetachCurrentThread();
-    }
 }
 
 void JavaChoreographerThread::scheduleNextFrameCallback() {
-    JNIEnv* env;
-    mJVM->AttachCurrentThread(&env, nullptr);
+    ScopedJniEnv jniEnv(mJVM);
+    JNIEnv* env = jniEnv.get();
+    if (env == nullptr) {
+        return;
+    }
     env->CallVoidMethod(mJobj, mJpostFrameCallback);
+    consumePendingException(env, "ChoreographerCallback.postFrameCallback");
 }
 
 void JavaChoreographerThread::onChoreographer(jlong cookie) {

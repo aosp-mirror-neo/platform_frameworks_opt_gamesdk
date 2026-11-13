@@ -30,6 +30,57 @@ namespace swappy {
 
 using gamesdk::ScopedLocalRef;
 
+// Resolves the current thread's JNIEnv*, attaching to `jvm` when the thread is
+// detached and detaching on scope exit only when this guard attached it.
+class ScopedJniEnv {
+public:
+    explicit ScopedJniEnv(JavaVM* jvm) {
+        if (jvm == nullptr) {
+            return;
+        }
+        const jint result = jvm->GetEnv(reinterpret_cast<void**>(&mEnv), JNI_VERSION_1_6);
+        if (result == JNI_OK) {
+            return;
+        }
+        if (result != JNI_EDETACHED) {
+            mEnv = nullptr;
+            return;
+        }
+#ifdef __ANDROID__
+        const jint attachResult = jvm->AttachCurrentThread(&mEnv, nullptr);
+#else
+        const jint attachResult =
+                jvm->AttachCurrentThread(reinterpret_cast<void**>(&mEnv), nullptr);
+#endif
+        if (attachResult == JNI_OK) {
+            mJvmToDetach = jvm;
+        } else {
+            mEnv = nullptr;
+        }
+    }
+
+    ~ScopedJniEnv() {
+        if (mJvmToDetach != nullptr) {
+            if (mEnv != nullptr && mEnv->ExceptionCheck()) {
+                mEnv->ExceptionClear();
+                SWAPPY_LOGE("Cleared unhandled JNI exception before DetachCurrentThread");
+            }
+            mJvmToDetach->DetachCurrentThread();
+        }
+    }
+
+    ScopedJniEnv(const ScopedJniEnv&) = delete;
+    ScopedJniEnv& operator=(const ScopedJniEnv&) = delete;
+
+    JNIEnv* get() const noexcept {
+        return mEnv;
+    }
+
+private:
+    JavaVM* mJvmToDetach = nullptr;
+    JNIEnv* mEnv = nullptr;
+};
+
 // Logs and clears the exception left pending by the JNI call described by
 // `operation`, so that no exception ever leaks to the caller of Swappy.
 // Returns whether an exception was pending.

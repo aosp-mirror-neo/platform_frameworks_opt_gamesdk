@@ -240,12 +240,7 @@ struct DeviceIdentifier {
     }
 };
 
-bool isDeviceUnsupported(JavaVM* jvm) {
-    if (jvm == nullptr) {
-        return false;
-    }
-    JNIEnv* env = nullptr;
-    jvm->AttachCurrentThread(&env, nullptr);
+bool isDeviceUnsupported(JNIEnv* env) {
     if (env == nullptr) {
         return false;
     }
@@ -406,7 +401,7 @@ public:
             return;
         }
 
-        if (isDeviceUnsupported(mJVM)) {
+        if (isDeviceUnsupported(env)) {
             SWAPPY_LOGE("Device is unsupported");
             return;
         }
@@ -425,10 +420,9 @@ public:
         mDisplayManager.reset();
 
         if (mJactivity != nullptr && mJVM != nullptr) {
-            JNIEnv* env = nullptr;
-            mJVM->AttachCurrentThread(&env, nullptr);
-            if (env != nullptr) {
-                env->DeleteGlobalRef(mJactivity);
+            ScopedJniEnv jniEnv(mJVM);
+            if (jniEnv.get() != nullptr) {
+                jniEnv.get()->DeleteGlobalRef(mJactivity);
             }
         }
 
@@ -501,8 +495,8 @@ private:
         if (mJVM == nullptr || mJactivity == nullptr) {
             return;
         }
-        JNIEnv* env = nullptr;
-        mJVM->AttachCurrentThread(&env, nullptr);
+        ScopedJniEnv jniEnv(mJVM);
+        JNIEnv* env = jniEnv.get();
         if (env == nullptr) {
             return;
         }

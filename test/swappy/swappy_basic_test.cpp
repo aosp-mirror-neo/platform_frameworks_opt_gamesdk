@@ -483,8 +483,38 @@ static jboolean MockIsInstanceOf(JNIEnv* env, jobject obj, jclass clazz) {
 
 static _JNIEnv* gMockEnv = nullptr;
 static std::mutex gTestSerializationMutex;
+static std::atomic<jint> gMockGetEnvResult{JNI_OK};
+static std::atomic<int> gAttachCurrentThreadCalls{0};
+static std::atomic<int> gDetachCurrentThreadCalls{0};
+static std::mutex gMockAttachedThreadsMutex;
+static std::vector<std::thread::id> gMockAttachedThreads;
+
+static void clearMockAttachedThreads() {
+    std::lock_guard<std::mutex> lock(gMockAttachedThreadsMutex);
+    gMockAttachedThreads.clear();
+}
+
+static size_t mockDynamicallyAttachedThreadCount() {
+    std::lock_guard<std::mutex> lock(gMockAttachedThreadsMutex);
+    return gMockAttachedThreads.size();
+}
 
 static jint MockAttachCurrentThread(JavaVM*, JNIEnv** env, void*) {
+    gAttachCurrentThreadCalls++;
+    {
+        std::lock_guard<std::mutex> lock(gMockAttachedThreadsMutex);
+        const std::thread::id tid = std::this_thread::get_id();
+        bool alreadyRecorded = false;
+        for (const std::thread::id& existing : gMockAttachedThreads) {
+            if (existing == tid) {
+                alreadyRecorded = true;
+                break;
+            }
+        }
+        if (!alreadyRecorded) {
+            gMockAttachedThreads.push_back(tid);
+        }
+    }
     if (env && gMockEnv) {
         *env = gMockEnv;
     }
@@ -492,13 +522,35 @@ static jint MockAttachCurrentThread(JavaVM*, JNIEnv** env, void*) {
 }
 
 static jint MockGetEnv(JavaVM*, void** env, jint) {
-    if (env && gMockEnv) {
-        *env = gMockEnv;
+    jint result = gMockGetEnvResult.load();
+    {
+        std::lock_guard<std::mutex> lock(gMockAttachedThreadsMutex);
+        const std::thread::id tid = std::this_thread::get_id();
+        for (const std::thread::id& existing : gMockAttachedThreads) {
+            if (existing == tid) {
+                result = JNI_OK;
+                break;
+            }
+        }
     }
-    return JNI_OK;
+    if (env) {
+        *env = (result == JNI_OK) ? gMockEnv : nullptr;
+    }
+    return result;
 }
 
 static jint MockDetachCurrentThread(JavaVM*) {
+    gDetachCurrentThreadCalls++;
+    {
+        std::lock_guard<std::mutex> lock(gMockAttachedThreadsMutex);
+        const std::thread::id tid = std::this_thread::get_id();
+        for (auto it = gMockAttachedThreads.begin(); it != gMockAttachedThreads.end(); ++it) {
+            if (*it == tid) {
+                gMockAttachedThreads.erase(it);
+                break;
+            }
+        }
+    }
     return JNI_OK;
 }
 
@@ -642,6 +694,10 @@ public:
         gMockJni = &mMockJni;
         gCreatedLocalRefs = 0;
         gDeletedLocalRefs = 0;
+        gMockGetEnvResult = JNI_OK;
+        gAttachCurrentThreadCalls = 0;
+        gDetachCurrentThreadCalls = 0;
+        clearMockAttachedThreads();
 
         ON_CALL(mMockJni, FindClass(testing::_, testing::_))
                 .WillByDefault(testing::Return(reinterpret_cast<jclass>(0x1)));
@@ -788,6 +844,7 @@ public:
     }
 
     void teardownMockJni() {
+        clearMockAttachedThreads();
         gMockJni = nullptr;
         gMockEnv = nullptr;
     }
@@ -874,6 +931,30 @@ public:
                     if (object != nullptr) {
                         mDeletedGlobalRefs++;
                     }
+                }));
+    }
+
+    // Configures SwappyDisplayManager to report 120Hz (mode 1) and 60Hz (mode 2)
+    // so requesting a 60Hz swap interval triggers setPreferredDisplayModeId().
+    void configureDualModeDisplayManager() {
+        ON_CALL(mMockJni, CallFloatMethodV(testing::_, testing::_, testing::_, testing::_))
+                .WillByDefault(testing::Return(120.0f));
+        const jmethodID kSwappyDisplayManagerCtor = reinterpret_cast<jmethodID>(0x21);
+        ON_CALL(mMockJni, NewObjectV(testing::_, testing::_, kSwappyDisplayManagerCtor, testing::_))
+                .WillByDefault(testing::Invoke([](JNIEnv*, jclass, jmethodID, va_list args) {
+                    va_list copy;
+                    va_copy(copy, args);
+                    jlong cookie = va_arg(copy, jlong);
+                    va_end(copy);
+                    if (cookie != 0) {
+                        auto periods =
+                                std::make_shared<swappy::SwappyDisplayManager::RefreshPeriodMap>();
+                        (*periods)[std::chrono::nanoseconds(8'333'333)] = 1;
+                        (*periods)[std::chrono::nanoseconds(16'666'666)] = 2;
+                        swappy::SwappyDisplayManagerJNI::onSetSupportedRefreshPeriods(cookie,
+                                                                                      periods);
+                    }
+                    return reinterpret_cast<jobject>(0x8);
                 }));
     }
 
@@ -3304,6 +3385,12 @@ TEST_F(AImageReaderEGLSwapchainTest, RefreshRateCallbacksReleaseLocalRefsOnSdk37
     const int netLocalRefsAfterInit = createdAfterInit - gDeletedLocalRefs.load();
     EXPECT_EQ(netLocalRefsAfterInit, 0);
 
+    // Simulate NDKChoreographerThread invoking refresh-rate callbacks from a
+    // native pthread that is not attached to the JVM.
+    gMockGetEnvResult = JNI_EDETACHED;
+    gAttachCurrentThreadCalls = 0;
+    gDetachCurrentThreadCalls = 0;
+
     // Exceed ART's 512-entry JNI local reference table limit across callbacks.
     constexpr int kCallbackIterations = 600;
     for (int i = 0; i < kCallbackIterations; ++i) {
@@ -3312,9 +3399,14 @@ TEST_F(AImageReaderEGLSwapchainTest, RefreshRateCallbacksReleaseLocalRefsOnSdk37
 
     EXPECT_GT(gCreatedLocalRefs.load(), createdAfterInit);
     EXPECT_EQ(gCreatedLocalRefs.load() - gDeletedLocalRefs.load(), 0);
+    EXPECT_EQ(kCallbackIterations, gAttachCurrentThreadCalls.load());
+    EXPECT_EQ(kCallbackIterations, gDetachCurrentThreadCalls.load());
 
+    gMockGetEnvResult = JNI_OK;
     cleanupMockNDKChoreographer();
     SwappyGL_destroy();
+    // Already-attached threads must not be detached on teardown.
+    EXPECT_EQ(kCallbackIterations, gDetachCurrentThreadCalls.load());
     EXPECT_EQ(gCreatedLocalRefs.load(), gDeletedLocalRefs.load());
 }
 
@@ -3347,6 +3439,175 @@ TEST_F(AImageReaderEGLSwapchainTest,
 
     cleanupMockNDKChoreographer();
     SwappyGL_destroy();
+    EXPECT_EQ(gCreatedLocalRefs.load(), gDeletedLocalRefs.load());
+}
+
+TEST_F(AImageReaderEGLSwapchainTest,
+       DestroyOnDetachedThreadDetachesDisplayManagerAndPlatformOnSdk37) {
+    setupMockJni(37);
+    setupMockNDKChoreographer();
+    buildEGLForTest();
+
+    ASSERT_TRUE(SwappyGL_init(gMockEnv, reinterpret_cast<jobject>(0x1234)));
+
+    gMockGetEnvResult = JNI_EDETACHED;
+    gAttachCurrentThreadCalls = 0;
+    gDetachCurrentThreadCalls = 0;
+
+    cleanupMockNDKChoreographer();
+    SwappyGL_destroy();
+
+    EXPECT_EQ(gAttachCurrentThreadCalls.load(), 2);
+    EXPECT_EQ(gDetachCurrentThreadCalls.load(), 2);
+    EXPECT_EQ(mockDynamicallyAttachedThreadCount(), 0U);
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, DisplayManagerOperationsOnDetachedThreadDetachCleanlyOnSdk29) {
+    setupMockJni(29);
+    configureDualModeDisplayManager();
+    setupMockNDKChoreographer();
+    buildEGLForTest();
+
+    gMockGetEnvResult = JNI_EDETACHED;
+    ASSERT_TRUE(SwappyGL_init(gMockEnv, reinterpret_cast<jobject>(0x1234)));
+    EXPECT_EQ(gAttachCurrentThreadCalls.load(), 1);
+    EXPECT_EQ(gDetachCurrentThreadCalls.load(), 1);
+
+    gAttachCurrentThreadCalls = 0;
+    gDetachCurrentThreadCalls = 0;
+    ASSERT_TRUE(SwappyGL_setWindow(mWindow));
+    SwappyGL_setSwapIntervalNS(SWAPPY_SWAP_60FPS);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    SwappyGL_onChoreographer(1'000'000);
+#pragma clang diagnostic pop
+    EXPECT_TRUE(SwappyGL_swap(mDisplay, mSurface));
+    EXPECT_EQ(gAttachCurrentThreadCalls.load(), 2);
+    EXPECT_EQ(gDetachCurrentThreadCalls.load(), 2);
+
+    gAttachCurrentThreadCalls = 0;
+    gDetachCurrentThreadCalls = 0;
+    cleanupMockNDKChoreographer();
+    SwappyGL_destroy();
+
+    EXPECT_EQ(gAttachCurrentThreadCalls.load(), 2);
+    EXPECT_EQ(gDetachCurrentThreadCalls.load(), 2);
+    EXPECT_EQ(mockDynamicallyAttachedThreadCount(), 0U);
+}
+
+TEST_F(AImageReaderEGLSwapchainTest,
+       JavaChoreographerOperationsOnDetachedThreadDetachCleanlyOnSdk23) {
+    setupMockJni(23);
+    setupMockChoreographer();
+    buildEGLForTest();
+
+    gMockGetEnvResult = JNI_EDETACHED;
+    ASSERT_TRUE(SwappyGL_init(gMockEnv, reinterpret_cast<jobject>(0x1234)));
+    EXPECT_EQ(gAttachCurrentThreadCalls.load(), 1);
+    EXPECT_EQ(gDetachCurrentThreadCalls.load(), 1);
+
+    gAttachCurrentThreadCalls = 0;
+    gDetachCurrentThreadCalls = 0;
+    ASSERT_TRUE(SwappyGL_setWindow(mWindow));
+    SwappyGL_setSwapIntervalNS(SWAPPY_SWAP_60FPS);
+    EXPECT_TRUE(SwappyGL_swap(mDisplay, mSurface));
+    // Frame 0 sets mTargetFrame = 1 without waiting; swapping a second frame
+    // blocks until the detached mock Choreographer thread runs nOnChoreographer.
+    EXPECT_TRUE(SwappyGL_swap(mDisplay, mSurface));
+
+    cleanupMockChoreographer();
+    EXPECT_GE(gAttachCurrentThreadCalls.load(), 2);
+    EXPECT_EQ(gAttachCurrentThreadCalls.load(), gDetachCurrentThreadCalls.load());
+    EXPECT_EQ(mockDynamicallyAttachedThreadCount(), 0U);
+
+    gAttachCurrentThreadCalls = 0;
+    gDetachCurrentThreadCalls = 0;
+    SwappyGL_destroy();
+
+    EXPECT_EQ(gAttachCurrentThreadCalls.load(), 2);
+    EXPECT_EQ(gDetachCurrentThreadCalls.load(), 2);
+    EXPECT_EQ(mockDynamicallyAttachedThreadCount(), 0U);
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, InitFailsGracefullyWhenDisplayManagerCtorThrowsOnSdk29) {
+    setupMockJni(29);
+    trackGlobalRefs();
+    const jmethodID kSwappyDisplayManagerCtor = reinterpret_cast<jmethodID>(0x21);
+    ON_CALL(mMockJni, NewObjectV(testing::_, testing::_, kSwappyDisplayManagerCtor, testing::_))
+            .WillByDefault(testing::Invoke([this](JNIEnv*, jclass, jmethodID, va_list) -> jobject {
+                mPendingException = true;
+                return nullptr;
+            }));
+    setupMockNDKChoreographer();
+    buildEGLForTest();
+
+    EXPECT_FALSE(SwappyGL_init(gMockEnv, reinterpret_cast<jobject>(0x1234)));
+    EXPECT_FALSE(mPendingException.load());
+
+    cleanupMockNDKChoreographer();
+    SwappyGL_destroy();
+    EXPECT_EQ(mCreatedGlobalRefs.load(), mDeletedGlobalRefs.load());
+}
+
+TEST_F(AImageReaderEGLSwapchainTest,
+       InitFailsGracefullyWhenDisplayManagerMethodLookupFailsOnSdk29) {
+    setupMockJni(29);
+    trackGlobalRefs();
+    ON_CALL(mMockJni, GetMethodID(testing::_, testing::_, testing::StrEq("terminate"), testing::_))
+            .WillByDefault(testing::Invoke([this](JNIEnv*, jclass, const char*, const char*) {
+                mPendingException = true;
+                return static_cast<jmethodID>(nullptr);
+            }));
+    setupMockNDKChoreographer();
+    buildEGLForTest();
+
+    EXPECT_FALSE(SwappyGL_init(gMockEnv, reinterpret_cast<jobject>(0x1234)));
+    EXPECT_FALSE(mPendingException.load());
+
+    cleanupMockNDKChoreographer();
+    SwappyGL_destroy();
+    EXPECT_EQ(mCreatedGlobalRefs.load(), mDeletedGlobalRefs.load());
+}
+
+TEST_F(AImageReaderEGLSwapchainTest,
+       InitFallsBackGracefullyWhenJavaChoreographerCtorThrowsOnSdk23) {
+    setupMockJni(23);
+    setupMockChoreographer();
+    trackGlobalRefs();
+    ON_CALL(mMockJni,
+            NewObjectV(testing::_, testing::_, reinterpret_cast<jmethodID>(0x100), testing::_))
+            .WillByDefault(testing::Invoke([this](JNIEnv*, jclass, jmethodID, va_list) -> jobject {
+                mPendingException = true;
+                return nullptr;
+            }));
+    buildEGLForTest();
+
+    EXPECT_TRUE(SwappyGL_init(gMockEnv, reinterpret_cast<jobject>(0x1234)));
+    EXPECT_FALSE(mPendingException.load());
+
+    SwappyGL_destroy();
+    EXPECT_EQ(mCreatedGlobalRefs.load(), mDeletedGlobalRefs.load());
+    EXPECT_EQ(gCreatedLocalRefs.load(), gDeletedLocalRefs.load());
+}
+
+TEST_F(AImageReaderEGLSwapchainTest,
+       InitFallsBackGracefullyWhenJavaChoreographerMethodLookupFailsOnSdk23) {
+    setupMockJni(23);
+    setupMockChoreographer();
+    trackGlobalRefs();
+    ON_CALL(mMockJni,
+            GetMethodID(testing::_, testing::_, testing::StrEq("postFrameCallback"), testing::_))
+            .WillByDefault(testing::Invoke([this](JNIEnv*, jclass, const char*, const char*) {
+                mPendingException = true;
+                return static_cast<jmethodID>(nullptr);
+            }));
+    buildEGLForTest();
+
+    EXPECT_TRUE(SwappyGL_init(gMockEnv, reinterpret_cast<jobject>(0x1234)));
+    EXPECT_FALSE(mPendingException.load());
+
+    SwappyGL_destroy();
+    EXPECT_EQ(mCreatedGlobalRefs.load(), mDeletedGlobalRefs.load());
     EXPECT_EQ(gCreatedLocalRefs.load(), gDeletedLocalRefs.load());
 }
 
