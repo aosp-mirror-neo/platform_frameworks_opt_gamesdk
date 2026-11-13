@@ -156,6 +156,21 @@ void Mock_AChoreographer_postFrameCallbackDelayed(AChoreographer* choreographer,
     });
 }
 
+bool triggerMockRefreshRateCallback(int64_t vsyncPeriodNanos) {
+    AChoreographer_refreshRateCallback callback = nullptr;
+    void* data = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_refreshRateMutex);
+        callback = g_refreshRateCallback;
+        data = g_refreshRateData;
+    }
+    if (callback == nullptr) {
+        return false;
+    }
+    callback(vsyncPeriodNanos, data);
+    return true;
+}
+
 void Mock_AChoreographer_registerRefreshRateCallback(AChoreographer* choreographer,
                                                      AChoreographer_refreshRateCallback callback,
                                                      void* data) {
@@ -328,9 +343,15 @@ public:
 };
 
 static MockJNI* gMockJni = nullptr;
+static std::atomic<int> gCreatedLocalRefs{0};
+static std::atomic<int> gDeletedLocalRefs{0};
 
 static jclass MockFindClass(JNIEnv* env, const char* name) {
-    return gMockJni->FindClass(env, name);
+    jclass res = gMockJni->FindClass(env, name);
+    if (res != nullptr) {
+        gCreatedLocalRefs++;
+    }
+    return res;
 }
 static jmethodID MockGetMethodID(JNIEnv* env, jclass clazz, const char* name, const char* sig) {
     return gMockJni->GetMethodID(env, clazz, name, sig);
@@ -342,7 +363,11 @@ static jint MockGetStaticIntField(JNIEnv* env, jclass clazz, jfieldID fieldID) {
     return gMockJni->GetStaticIntField(env, clazz, fieldID);
 }
 static jobject MockCallObjectMethodV(JNIEnv* env, jobject obj, jmethodID methodID, va_list args) {
-    return gMockJni->CallObjectMethodV(env, obj, methodID, args);
+    jobject res = gMockJni->CallObjectMethodV(env, obj, methodID, args);
+    if (res != nullptr) {
+        gCreatedLocalRefs++;
+    }
+    return res;
 }
 static jfloat MockCallFloatMethodV(JNIEnv* env, jobject obj, jmethodID methodID, va_list args) {
     return gMockJni->CallFloatMethodV(env, obj, methodID, args);
@@ -357,7 +382,11 @@ static jboolean MockExceptionCheck(JNIEnv* env) {
     return gMockJni->ExceptionCheck(env);
 }
 static jthrowable MockExceptionOccurred(JNIEnv* env) {
-    return gMockJni->ExceptionOccurred(env);
+    jthrowable res = gMockJni->ExceptionOccurred(env);
+    if (res != nullptr) {
+        gCreatedLocalRefs++;
+    }
+    return res;
 }
 static void MockExceptionClear(JNIEnv* env) {
     gMockJni->ExceptionClear(env);
@@ -372,7 +401,11 @@ static void MockDeleteGlobalRef(JNIEnv* env, jobject obj) {
     gMockJni->DeleteGlobalRef(env, obj);
 }
 static jobject MockGetStaticObjectField(JNIEnv* env, jclass clazz, jfieldID fieldID) {
-    return gMockJni->GetStaticObjectField(env, clazz, fieldID);
+    jobject res = gMockJni->GetStaticObjectField(env, clazz, fieldID);
+    if (res != nullptr) {
+        gCreatedLocalRefs++;
+    }
+    return res;
 }
 static const char* MockGetStringUTFChars(JNIEnv* env, jstring string, jboolean* isCopy) {
     return gMockJni->GetStringUTFChars(env, string, isCopy);
@@ -384,16 +417,31 @@ static void MockReleaseStringUTFChars(JNIEnv* env, jstring string, const char* u
     gMockJni->ReleaseStringUTFChars(env, string, utf);
 }
 static void MockDeleteLocalRef(JNIEnv* env, jobject localRef) {
+    if (localRef != nullptr) {
+        gDeletedLocalRefs++;
+    }
     gMockJni->DeleteLocalRef(env, localRef);
 }
 static jclass MockGetObjectClass(JNIEnv* env, jobject obj) {
-    return gMockJni->GetObjectClass(env, obj);
+    jclass res = gMockJni->GetObjectClass(env, obj);
+    if (res != nullptr) {
+        gCreatedLocalRefs++;
+    }
+    return res;
 }
 static jstring MockNewStringUTF(JNIEnv* env, const char* bytes) {
-    return gMockJni->NewStringUTF(env, bytes);
+    jstring res = gMockJni->NewStringUTF(env, bytes);
+    if (res != nullptr) {
+        gCreatedLocalRefs++;
+    }
+    return res;
 }
 static jobject MockNewObjectV(JNIEnv* env, jclass clazz, jmethodID methodID, va_list args) {
-    return gMockJni->NewObjectV(env, clazz, methodID, args);
+    jobject res = gMockJni->NewObjectV(env, clazz, methodID, args);
+    if (res != nullptr) {
+        gCreatedLocalRefs++;
+    }
+    return res;
 }
 static jint MockRegisterNatives(JNIEnv* env, jclass clazz, const JNINativeMethod* methods,
                                 jint nMethods) {
@@ -552,6 +600,8 @@ public:
     // after calling this method.
     void setupMockJni(int sdkVersion) {
         gMockJni = &mMockJni;
+        gCreatedLocalRefs = 0;
+        gDeletedLocalRefs = 0;
 
         ON_CALL(mMockJni, FindClass(testing::_, testing::_))
                 .WillByDefault(testing::Return(reinterpret_cast<jclass>(0x1)));
@@ -1537,8 +1587,8 @@ static VkResult TestInterceptBeginCommandBuffer(VkCommandBuffer commandBuffer,
     if (gVulkanLib == nullptr) {
         gVulkanLib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
     }
-    auto real_vkBeginCommandBuffer = reinterpret_cast<PFN_vkBeginCommandBuffer>(
-            dlsym(gVulkanLib, "vkBeginCommandBuffer"));
+    auto real_vkBeginCommandBuffer =
+            reinterpret_cast<PFN_vkBeginCommandBuffer>(dlsym(gVulkanLib, "vkBeginCommandBuffer"));
     return real_vkBeginCommandBuffer(commandBuffer, pBeginInfo);
 }
 
@@ -1563,11 +1613,10 @@ static void TestVkFunctionProvider_Close() {
     }
 }
 
-static SwappyVkFunctionProvider gTestVkFunctionProvider = {
-    .init = TestVkFunctionProvider_Init,
-    .getProcAddr = TestVkFunctionProvider_GetProcAddr,
-    .close = TestVkFunctionProvider_Close
-};
+static SwappyVkFunctionProvider gTestVkFunctionProvider =
+        {.init = TestVkFunctionProvider_Init,
+         .getProcAddr = TestVkFunctionProvider_GetProcAddr,
+         .close = TestVkFunctionProvider_Close};
 
 TEST_F(AImageReaderVulkanSwapchainTest, CommandBufferFlags_DoNotUseSimultaneousBit) {
     setupMockJni(23);
@@ -2285,6 +2334,9 @@ public:
     }
 
     void TearDown() override {
+        cleanupMockChoreographer();
+        cleanupMockNDKChoreographer();
+        SwappyGL_destroy();
         cleanUpEGLForTest();
         AImageReaderSwapchainTestBase::TearDown();
     }
@@ -2492,6 +2544,28 @@ TEST_F(AImageReaderVulkanSwapchainTest, RenderingLoopSDK37) {
     }
 
     vkDestroySemaphore(mDevice, imageAvailableSemaphore, nullptr);
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, RefreshRateCallbacksReleaseLocalRefsOnSdk37) {
+    setupMockJni(37);
+    setupMockNDKChoreographer();
+    buildEGLForTest();
+
+    ASSERT_TRUE(SwappyGL_init(gMockEnv, reinterpret_cast<jobject>(0x1234)));
+    const int createdAfterInit = gCreatedLocalRefs.load();
+    const int netLocalRefsAfterInit = createdAfterInit - gDeletedLocalRefs.load();
+
+    // Exceed ART's 512-entry JNI local reference table limit across callbacks.
+    constexpr int kCallbackIterations = 600;
+    for (int i = 0; i < kCallbackIterations; ++i) {
+        ASSERT_TRUE(triggerMockRefreshRateCallback(11'111'111));
+    }
+
+    EXPECT_GT(gCreatedLocalRefs.load(), createdAfterInit);
+    EXPECT_EQ(gCreatedLocalRefs.load() - gDeletedLocalRefs.load(), netLocalRefsAfterInit);
+
+    cleanupMockNDKChoreographer();
+    SwappyGL_destroy();
 }
 
 TEST_F(AImageReaderEGLSwapchainTest, RenderingLoopSDK37) {

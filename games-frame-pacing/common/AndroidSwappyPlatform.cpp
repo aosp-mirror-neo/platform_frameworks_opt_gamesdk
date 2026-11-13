@@ -30,6 +30,7 @@
 #include "ChoreographerThread.h"
 #include "Settings.h"
 #include "SwappyDisplayManager.h"
+#include "SwappyJniUtils.h"
 #include "swappy/swappy_common.h"
 
 #define LOG_TAG "SwappyCommon"
@@ -54,21 +55,21 @@ using PFN_ANativeWindow_setFrameRate = int32_t (*)(ANativeWindow* window, float 
                                                    int8_t compatibility);
 
 SdkVersion getSdkVersion(JNIEnv* env) {
-    const jclass buildClass = env->FindClass("android/os/Build$VERSION");
-    if (env->ExceptionCheck()) {
+    ScopedLocalRef<jclass> buildClass(env, env->FindClass("android/os/Build$VERSION"));
+    if (env->ExceptionCheck() || buildClass.get() == nullptr) {
         env->ExceptionClear();
         SWAPPY_LOGE("Failed to get Build.VERSION class");
         return SdkVersion{0, 0};
     }
 
-    const jfieldID sdkInt = env->GetStaticFieldID(buildClass, "SDK_INT", "I");
+    const jfieldID sdkInt = env->GetStaticFieldID(buildClass.get(), "SDK_INT", "I");
     if (env->ExceptionCheck()) {
         env->ExceptionClear();
         SWAPPY_LOGE("Failed to get Build.VERSION.SDK_INT field");
         return SdkVersion{0, 0};
     }
 
-    const jint sdk = env->GetStaticIntField(buildClass, sdkInt);
+    const jint sdk = env->GetStaticIntField(buildClass.get(), sdkInt);
     if (env->ExceptionCheck()) {
         env->ExceptionClear();
         SWAPPY_LOGE("Failed to get SDK version");
@@ -77,13 +78,14 @@ SdkVersion getSdkVersion(JNIEnv* env) {
 
     jint sdkPreview = 0;
     if (sdk >= 23) {
-        const jfieldID previewSdkInt = env->GetStaticFieldID(buildClass, "PREVIEW_SDK_INT", "I");
+        const jfieldID previewSdkInt =
+                env->GetStaticFieldID(buildClass.get(), "PREVIEW_SDK_INT", "I");
         if (env->ExceptionCheck()) {
             env->ExceptionClear();
             SWAPPY_LOGE("Failed to get Build.VERSION.PREVIEW_SDK_INT field");
         }
 
-        sdkPreview = env->GetStaticIntField(buildClass, previewSdkInt);
+        sdkPreview = env->GetStaticIntField(buildClass.get(), previewSdkInt);
         if (env->ExceptionCheck()) {
             env->ExceptionClear();
             SWAPPY_LOGE("Failed to get preview SDK version");
@@ -99,49 +101,45 @@ bool getSettingsFromApp(JNIEnv* env, jobject jactivity, SwappyCommonSettings* ou
         return false;
     }
 
-    SWAPPY_LOGI("Swappy version %d.%d", SWAPPY_MAJOR_VERSION, SWAPPY_MINOR_VERSION);
+    ScopedLocalRef<jclass> activityClass(env, env->FindClass("android/app/NativeActivity"));
+    ScopedLocalRef<jclass> windowManagerClass(env, env->FindClass("android/view/WindowManager"));
+    ScopedLocalRef<jclass> displayClass(env, env->FindClass("android/view/Display"));
 
-    out->sdkVersion = getSdkVersion(env);
+    jmethodID getWindowManager = env->GetMethodID(activityClass.get(), "getWindowManager",
+                                                  "()Landroid/view/WindowManager;");
 
-    jclass activityClass = env->FindClass("android/app/NativeActivity");
-    jclass windowManagerClass = env->FindClass("android/view/WindowManager");
-    jclass displayClass = env->FindClass("android/view/Display");
+    jmethodID getDefaultDisplay = env->GetMethodID(windowManagerClass.get(), "getDefaultDisplay",
+                                                   "()Landroid/view/Display;");
 
-    jmethodID getWindowManager =
-            env->GetMethodID(activityClass, "getWindowManager", "()Landroid/view/WindowManager;");
+    ScopedLocalRef<jobject> wm(env, env->CallObjectMethod(jactivity, getWindowManager));
+    ScopedLocalRef<jobject> display(env, env->CallObjectMethod(wm.get(), getDefaultDisplay));
 
-    jmethodID getDefaultDisplay =
-            env->GetMethodID(windowManagerClass, "getDefaultDisplay", "()Landroid/view/Display;");
+    jmethodID getRefreshRate = env->GetMethodID(displayClass.get(), "getRefreshRate", "()F");
 
-    jobject wm = env->CallObjectMethod(jactivity, getWindowManager);
-    jobject display = env->CallObjectMethod(wm, getDefaultDisplay);
-
-    jmethodID getRefreshRate = env->GetMethodID(displayClass, "getRefreshRate", "()F");
-
-    const float refreshRateHz = env->CallFloatMethod(display, getRefreshRate);
+    const float refreshRateHz = env->CallFloatMethod(display.get(), getRefreshRate);
 
     jmethodID getAppVsyncOffsetNanos =
-            env->GetMethodID(displayClass, "getAppVsyncOffsetNanos", "()J");
+            env->GetMethodID(displayClass.get(), "getAppVsyncOffsetNanos", "()J");
 
     // getAppVsyncOffsetNanos was only added in API 21.
     // Return gracefully if this device doesn't support it.
-    if (getAppVsyncOffsetNanos == 0 || env->ExceptionOccurred()) {
+    if (getAppVsyncOffsetNanos == 0 || env->ExceptionCheck()) {
         SWAPPY_LOGE("Error while getting method: getAppVsyncOffsetNanos");
         env->ExceptionClear();
         return false;
     }
-    const long appVsyncOffsetNanos = env->CallLongMethod(display, getAppVsyncOffsetNanos);
+    const long appVsyncOffsetNanos = env->CallLongMethod(display.get(), getAppVsyncOffsetNanos);
 
     jmethodID getPresentationDeadlineNanos =
-            env->GetMethodID(displayClass, "getPresentationDeadlineNanos", "()J");
+            env->GetMethodID(displayClass.get(), "getPresentationDeadlineNanos", "()J");
 
-    if (getPresentationDeadlineNanos == 0 || env->ExceptionOccurred()) {
+    if (getPresentationDeadlineNanos == 0 || env->ExceptionCheck()) {
         SWAPPY_LOGE("Error while getting method: getPresentationDeadlineNanos");
         return false;
     }
 
     const long vsyncPresentationDeadlineNanos =
-            env->CallLongMethod(display, getPresentationDeadlineNanos);
+            env->CallLongMethod(display.get(), getPresentationDeadlineNanos);
 
     constexpr long kOneMsInNs = 1000 * 1000;
     constexpr long kOneSInNs = kOneMsInNs * 1000;
@@ -166,17 +164,17 @@ std::string getStaticStringField(JNIEnv* env, jclass clz, const char* name) {
         return "";
     }
 
-    const jstring jstr = static_cast<jstring>(env->GetStaticObjectField(clz, fieldId));
-    if (env->ExceptionCheck()) {
+    ScopedLocalRef<jstring> jstr(env,
+                                 static_cast<jstring>(env->GetStaticObjectField(clz, fieldId)));
+    if (env->ExceptionCheck() || jstr.get() == nullptr) {
         env->ExceptionClear();
         SWAPPY_LOGE("Failed to get string %s", name);
         return "";
     }
-    const char* cstr = env->GetStringUTFChars(jstr, nullptr);
-    const jsize length = env->GetStringUTFLength(jstr);
+    const char* cstr = env->GetStringUTFChars(jstr.get(), nullptr);
+    const jsize length = env->GetStringUTFLength(jstr.get());
     std::string retValue(cstr, length);
-    env->ReleaseStringUTFChars(jstr, cstr);
-    env->DeleteLocalRef(jstr);
+    env->ReleaseStringUTFChars(jstr.get(), cstr);
     return retValue;
 }
 
@@ -210,24 +208,24 @@ bool isDeviceUnsupported(JavaVM* jvm) {
 
     static const std::vector<DeviceIdentifier> kUnsupportedDevices = {{"OPPO", "A37", ""}};
 
-    const jclass buildClass = env->FindClass("android/os/Build");
-    if (env->ExceptionCheck()) {
+    ScopedLocalRef<jclass> buildClass(env, env->FindClass("android/os/Build"));
+    if (env->ExceptionCheck() || buildClass.get() == nullptr) {
         env->ExceptionClear();
         SWAPPY_LOGE("Failed to get Build class");
         return false;
     }
 
-    const std::string manufacturer = getStaticStringField(env, buildClass, "MANUFACTURER");
+    const std::string manufacturer = getStaticStringField(env, buildClass.get(), "MANUFACTURER");
     if (manufacturer.empty()) {
         return false;
     }
 
-    const std::string model = getStaticStringField(env, buildClass, "MODEL");
+    const std::string model = getStaticStringField(env, buildClass.get(), "MODEL");
     if (model.empty()) {
         return false;
     }
 
-    const std::string display = getStaticStringField(env, buildClass, "DISPLAY");
+    const std::string display = getStaticStringField(env, buildClass.get(), "DISPLAY");
     if (display.empty()) {
         return false;
     }
@@ -322,6 +320,8 @@ private:
 class AndroidSwappyPlatform final : public AndroidChoreographerPlatform {
 public:
     AndroidSwappyPlatform(JNIEnv* env, jobject jactivity) {
+        SWAPPY_LOGI("Swappy version %d.%d", SWAPPY_MAJOR_VERSION, SWAPPY_MINOR_VERSION);
+
         if (env == nullptr || jactivity == nullptr) {
             return;
         }
@@ -335,6 +335,7 @@ public:
             return;
         }
 
+        mSettings.sdkVersion = getSdkVersion(env);
         if (!getSettingsFromApp(env, mJactivity, &mSettings)) {
             return;
         }

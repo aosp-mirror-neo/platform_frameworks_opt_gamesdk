@@ -27,6 +27,7 @@
 #include "JNIUtil.h"
 #include "RefreshPeriodSet.h"
 #include "Settings.h"
+#include "SwappyJniUtils.h"
 #include "SwappyLog.h"
 
 namespace swappy {
@@ -78,23 +79,29 @@ SwappyDisplayManager::SwappyDisplayManager(JavaVM* vm, jobject mainActivity) : m
     JNIEnv* env;
     mJVM->AttachCurrentThread(&env, nullptr);
 
-    jclass swappyDisplayManagerClass =
-            gamesdk::loadClass(env, mainActivity, SwappyDisplayManager::SDM_CLASS,
-                               (JNINativeMethod*)SwappyDisplayManager::SDMNativeMethods,
-                               SwappyDisplayManager::SDMNativeMethodsSize);
+    ScopedLocalRef<jclass>
+            swappyDisplayManagerClass(env,
+                                      gamesdk::loadClass(env, mainActivity,
+                                                         SwappyDisplayManager::SDM_CLASS,
+                                                         (JNINativeMethod*)SwappyDisplayManager::
+                                                                 SDMNativeMethods,
+                                                         SwappyDisplayManager::
+                                                                 SDMNativeMethodsSize));
 
-    if (!swappyDisplayManagerClass) return;
+    if (swappyDisplayManagerClass.get() == nullptr) return;
 
-    jmethodID constructor =
-            env->GetMethodID(swappyDisplayManagerClass, "<init>", "(JLandroid/app/Activity;)V");
+    jmethodID constructor = env->GetMethodID(swappyDisplayManagerClass.get(), "<init>",
+                                             "(JLandroid/app/Activity;)V");
     mSetPreferredDisplayModeId =
-            env->GetMethodID(swappyDisplayManagerClass, "setPreferredDisplayModeId", "(I)V");
-    mEnableRefreshCallbackForwarding =
-            env->GetMethodID(swappyDisplayManagerClass, "enableRefreshCallbackForwarding", "()V");
-    mTerminate = env->GetMethodID(swappyDisplayManagerClass, "terminate", "()V");
-    jobject swappyDisplayManager =
-            env->NewObject(swappyDisplayManagerClass, constructor, (jlong)this, mainActivity);
-    mJthis = env->NewGlobalRef(swappyDisplayManager);
+            env->GetMethodID(swappyDisplayManagerClass.get(), "setPreferredDisplayModeId", "(I)V");
+    mEnableRefreshCallbackForwarding = env->GetMethodID(swappyDisplayManagerClass.get(),
+                                                        "enableRefreshCallbackForwarding", "()V");
+    mTerminate = env->GetMethodID(swappyDisplayManagerClass.get(), "terminate", "()V");
+    ScopedLocalRef<jobject> swappyDisplayManager(env,
+                                                 env->NewObject(swappyDisplayManagerClass.get(),
+                                                                constructor, (jlong)this,
+                                                                mainActivity));
+    mJthis = env->NewGlobalRef(swappyDisplayManager.get());
 
     mInitialized = true;
 }
