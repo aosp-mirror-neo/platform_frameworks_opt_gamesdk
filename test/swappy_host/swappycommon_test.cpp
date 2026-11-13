@@ -26,18 +26,15 @@
 #include <vector>
 
 #include "Clock.h"
+#include "FakeSwappyPlatform.h"
 #include "RefreshPeriodSet.h"
-#include "SdkVersion.h"
 #include "Settings.h"
 #include "SimulatedClock.h"
+#include "SimulatedDisplayPanel.h"
 #include "SimulatedGpuQueue.h"
 #include "SwappyPlatform.h"
 #include "gtest/gtest.h"
 #include "swappy/swappy_common.h"
-
-struct ANativeWindow {
-    int id = 0;
-};
 
 namespace {
 
@@ -46,13 +43,20 @@ using swappy::Clock;
 using swappy::insertRefreshPeriod;
 using swappy::PipelineMode;
 using swappy::RefreshPeriodMap;
-using swappy::SdkVersion;
 using swappy::Settings;
 using swappy::SwappyCommon;
 using swappy::SwappyCommonSettings;
 using swappy::SwappyPlatform;
+using swappy::testing::DisplayPanelModel;
+using swappy::testing::FakeSwappyPlatform;
+using swappy::testing::makeTestSwappySettings;
+using swappy::testing::PlatformSharedState;
+using swappy::testing::PlatformSnapshot;
 using swappy::testing::SimulatedClock;
+using swappy::testing::SimulatedDisplayPanel;
 using swappy::testing::SimulatedGpuQueue;
+using swappy::testing::snapshotPlatformState;
+using swappy::testing::VsyncPanelTimeline;
 
 constexpr auto k60HzPeriod = 16'666'667ns;
 constexpr auto k30HzPeriod = 33'333'334ns;
@@ -61,59 +65,13 @@ constexpr auto kFastTickPeriod = 1ms;
 
 SwappyCommonSettings makeSettings(std::chrono::nanoseconds refreshPeriod = k60HzPeriod,
                                   int sdkInt = 33) {
-    return SwappyCommonSettings{
-            .sdkVersion = SdkVersion{sdkInt, 0},
-            .refreshPeriod = refreshPeriod,
-            .appVsyncOffset = 1'000'000ns,
-            .sfVsyncOffset = 2'000'000ns,
-    };
+    return makeTestSwappySettings(refreshPeriod, sdkInt);
 }
 
 SwappyCommon::SwapHandlers readySwapHandlers(std::chrono::nanoseconds gpuTime = 4ms) {
     return SwappyCommon::SwapHandlers{
             .lastFrameIsComplete = [] { return true; },
             .getPrevFrameGpuTime = [gpuTime] { return gpuTime; },
-    };
-}
-
-struct PlatformSharedState {
-    std::mutex mutex;
-    bool valid = true;
-    bool startsWithExternalChoreographer = false;
-    bool choreographerInitialized = true;
-    bool displayManagerInitialized = true;
-    bool supportsSetFrameRate = true;
-    SwappyCommonSettings initialSettings = makeSettings();
-    std::shared_ptr<RefreshPeriodMap> supportedPeriods;
-
-    SwappyPlatform::ChoreographerCallback onChoreographer;
-    std::vector<ANativeWindow*> acquiredWindows;
-    std::vector<ANativeWindow*> releasedWindows;
-    std::vector<std::pair<ANativeWindow*, float>> frameRateVotes;
-    std::vector<int> preferredModeIds;
-    int postFrameCallbacksCount = 0;
-    int switchToExternalChoreographerCount = 0;
-    bool choreographerCallbackArmed = false;
-};
-
-struct PlatformSnapshot {
-    std::vector<ANativeWindow*> acquiredWindows;
-    std::vector<ANativeWindow*> releasedWindows;
-    std::vector<std::pair<ANativeWindow*, float>> frameRateVotes;
-    std::vector<int> preferredModeIds;
-    int postFrameCallbacksCount = 0;
-    int switchToExternalChoreographerCount = 0;
-};
-
-PlatformSnapshot snapshotPlatformState(PlatformSharedState& state) {
-    std::lock_guard<std::mutex> lock(state.mutex);
-    return PlatformSnapshot{
-            .acquiredWindows = state.acquiredWindows,
-            .releasedWindows = state.releasedWindows,
-            .frameRateVotes = state.frameRateVotes,
-            .preferredModeIds = state.preferredModeIds,
-            .postFrameCallbacksCount = state.postFrameCallbacksCount,
-            .switchToExternalChoreographerCount = state.switchToExternalChoreographerCount,
     };
 }
 
@@ -143,86 +101,6 @@ PlatformSnapshot snapshotPlatformState(PlatformSharedState& state) {
     }
     return true;
 }
-
-class FakeSwappyPlatform final : public SwappyPlatform {
-public:
-    explicit FakeSwappyPlatform(std::shared_ptr<PlatformSharedState> state)
-          : mState(std::move(state)) {}
-
-    [[nodiscard]] bool isValid() const override {
-        std::lock_guard<std::mutex> lock(mState->mutex);
-        return mState->valid;
-    }
-
-    [[nodiscard]] SwappyCommonSettings getInitialSettings() const override {
-        std::lock_guard<std::mutex> lock(mState->mutex);
-        return mState->initialSettings;
-    }
-
-    [[nodiscard]] bool startsWithExternalChoreographer() const override {
-        std::lock_guard<std::mutex> lock(mState->mutex);
-        return mState->startsWithExternalChoreographer;
-    }
-
-    [[nodiscard]] bool initializeChoreographer(ChoreographerCallback onChoreographer) override {
-        std::lock_guard<std::mutex> lock(mState->mutex);
-        if (!mState->choreographerInitialized) {
-            return false;
-        }
-        mState->onChoreographer = std::move(onChoreographer);
-        return true;
-    }
-
-    void postFrameCallbacks() override {
-        std::lock_guard<std::mutex> lock(mState->mutex);
-        ++mState->postFrameCallbacksCount;
-        mState->choreographerCallbackArmed = true;
-    }
-
-    void switchToExternalChoreographer(ChoreographerCallback onChoreographer) override {
-        std::lock_guard<std::mutex> lock(mState->mutex);
-        ++mState->switchToExternalChoreographerCount;
-        mState->onChoreographer = std::move(onChoreographer);
-    }
-
-    [[nodiscard]] bool initializeDisplayManager() override {
-        std::lock_guard<std::mutex> lock(mState->mutex);
-        return mState->displayManagerInitialized;
-    }
-
-    void acquireWindow(ANativeWindow* window) override {
-        std::lock_guard<std::mutex> lock(mState->mutex);
-        mState->acquiredWindows.push_back(window);
-    }
-
-    void releaseWindow(ANativeWindow* window) override {
-        std::lock_guard<std::mutex> lock(mState->mutex);
-        mState->releasedWindows.push_back(window);
-    }
-
-    [[nodiscard]] bool supportsSetFrameRate() const override {
-        std::lock_guard<std::mutex> lock(mState->mutex);
-        return mState->supportsSetFrameRate;
-    }
-
-    void setFrameRate(ANativeWindow* window, float frameRate) override {
-        std::lock_guard<std::mutex> lock(mState->mutex);
-        mState->frameRateVotes.emplace_back(window, frameRate);
-    }
-
-    [[nodiscard]] std::shared_ptr<RefreshPeriodMap> getSupportedRefreshPeriods() override {
-        std::lock_guard<std::mutex> lock(mState->mutex);
-        return mState->supportedPeriods;
-    }
-
-    void setPreferredDisplayModeId(int modeId) override {
-        std::lock_guard<std::mutex> lock(mState->mutex);
-        mState->preferredModeIds.push_back(modeId);
-    }
-
-private:
-    std::shared_ptr<PlatformSharedState> mState;
-};
 
 class SwappyCommonHostTest : public ::testing::Test {
 protected:
@@ -491,16 +369,20 @@ TEST_F(SwappyCommonHostTest, TracerCallbacksInvokeAndRemoveCleanly) {
 class SimulatedSwappyHarness {
 public:
     explicit SimulatedSwappyHarness(SwappyCommonSettings settings = makeSettings(),
-                                    Clock::time_point initialTime = Clock::time_point{})
+                                    Clock::time_point initialTime = Clock::time_point{},
+                                    DisplayPanelModel panelModel = DisplayPanelModel::openLoop(),
+                                    bool supportsSetFrameRate = true)
           : mState(std::make_shared<PlatformSharedState>()),
             mClock(initialTime),
-            mDisplayPeriod(settings.refreshPeriod),
-            mAppVsyncOffset(settings.appVsyncOffset),
-            mSfToVsyncDelay(settings.refreshPeriod - settings.sfVsyncOffset) {
-        mState->initialSettings = settings;
-        mClock.setVsyncCallbacks([this](Clock::time_point
-                                                current) { return nextVsyncAfter(current); },
-                                 [this](Clock::time_point) { deliverVsync(); });
+            mTimeline(mState, settings, &mClock) {
+        {
+            std::lock_guard<std::mutex> lock(mState->mutex);
+            mState->supportsSetFrameRate = supportsSetFrameRate;
+            mState->panel = SimulatedDisplayPanel(settings.refreshPeriod, std::move(panelModel));
+        }
+        mClock.setVsyncCallbacks(
+                [this](Clock::time_point current) { return mTimeline.nextVsyncAfter(current); },
+                [this](Clock::time_point vsyncTime) { mTimeline.deliverVsync(vsyncTime); });
 
         mSwappy = std::make_unique<SwappyCommon>(std::make_unique<FakeSwappyPlatform>(mState),
                                                  mClock);
@@ -551,46 +433,20 @@ public:
         }
     }
 
+    [[nodiscard]] std::chrono::nanoseconds displayPeriod() const {
+        return mTimeline.displayPeriod();
+    }
+
+    void triggerPassiveDisplayRateChange(std::chrono::nanoseconds newRefreshPeriod) {
+        mTimeline.triggerPassiveDisplayRateChange(newRefreshPeriod);
+        EXPECT_TRUE(mClock.waitForWorkersSettled());
+    }
+
 private:
-    std::optional<Clock::time_point> nextVsyncAfter(Clock::time_point current) const {
-        std::lock_guard<std::mutex> lock(mState->mutex);
-        if (!mState->choreographerCallbackArmed || mDisplayPeriod <= 0ns) {
-            return std::nullopt;
-        }
-        const int64_t periodNs = mDisplayPeriod.count();
-        const int64_t offsetNs = mAppVsyncOffset.count();
-        const int64_t nowNs = current.time_since_epoch().count();
-        const int64_t adjusted = nowNs - offsetNs;
-        int64_t k = adjusted / periodNs;
-        if (adjusted % periodNs < 0) {
-            --k;
-        }
-        int64_t nextNs = (k + 1) * periodNs + offsetNs;
-        while (nextNs <= nowNs) {
-            nextNs += periodNs;
-        }
-        return Clock::time_point(std::chrono::nanoseconds(nextNs));
-    }
-
-    void deliverVsync() {
-        SwappyPlatform::ChoreographerCallback callback;
-        {
-            std::lock_guard<std::mutex> lock(mState->mutex);
-            if (!mState->choreographerCallbackArmed || !mState->onChoreographer) {
-                return;
-            }
-            mState->choreographerCallbackArmed = false;
-            callback = mState->onChoreographer;
-        }
-        callback(mSfToVsyncDelay);
-    }
-
     std::shared_ptr<PlatformSharedState> mState;
     SimulatedClock mClock;
     SimulatedGpuQueue mGpuQueue;
-    std::chrono::nanoseconds mDisplayPeriod;
-    std::chrono::nanoseconds mAppVsyncOffset;
-    std::chrono::nanoseconds mSfToVsyncDelay;
+    VsyncPanelTimeline mTimeline;
     std::unique_ptr<SwappyCommon> mSwappy;
 };
 
@@ -841,6 +697,149 @@ TEST_F(SwappyCommonHostTest, UnpipelinedGpuOverrunSlipsFrameAndRestoresPipelineM
 
     EXPECT_EQ(harness.swappy().getCurrentPipelineMode(), PipelineMode::On);
     EXPECT_EQ(harness.swappy().getSwapDuration(), k60HzPeriod);
+}
+
+TEST_F(SwappyCommonHostTest, ContinuousArrPanelCollapsesSwapIntervalToOneAtVotedRate) {
+    SimulatedSwappyHarness harness(makeSettings(k120HzPeriod, 36), Clock::time_point{1s},
+                                   DisplayPanelModel::continuousArr(24, 120, 2));
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    ANativeWindow window{101};
+    harness.swappy().setANativeWindow(&window);
+
+    // 4ms CPU + 19ms GPU => 20ms pipelined hint (50.0 Hz vote). Once the ARR panel
+    // switches to 50 Hz (20ms period), Swappy paces at swapInterval=1 (20ms == refreshPeriod).
+    harness.runFrames(200, 4ms, 19ms);
+
+    EXPECT_EQ(harness.displayPeriod(), 20'000'000ns);
+    EXPECT_EQ(harness.swappy().getRefreshPeriod(), 20'000'000ns);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), 20'000'000ns);
+}
+
+TEST_F(SwappyCommonHostTest, TeDivisor240HzPanelAppliesRateSwitchAfterVsyncLatency) {
+    SimulatedSwappyHarness harness(makeSettings(k120HzPeriod, 36), Clock::time_point{1s},
+                                   DisplayPanelModel::teDivisor240Hz(/*applyLatencyVsyncs=*/3));
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    ANativeWindow window{102};
+    harness.swappy().setANativeWindow(&window);
+
+    // Frame 1's onPostSwap votes 60 Hz (mAutoSwapInterval=2, remainingVsyncs=3); Frame 2
+    // waits 2 VSYNCs (remainingVsyncs: 3 -> 1), keeping the panel at 120 Hz until Frame 3.
+    harness.runFrame(2ms, 2ms);
+    harness.runFrame(2ms, 2ms);
+    EXPECT_EQ(harness.displayPeriod(), k120HzPeriod);
+
+    harness.runFrame(2ms, 2ms);
+    EXPECT_EQ(harness.displayPeriod(), k60HzPeriod);
+
+    // A 19ms GPU load (20ms pipelined hint => 50 Hz vote) snaps to the 48 Hz TE divisor
+    // (20,833,333 ns) and runs at swapInterval=1 on that 48 Hz refresh period.
+    harness.runFrames(200, 4ms, 19ms);
+    EXPECT_EQ(harness.displayPeriod(), 20'833'333ns);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), 20'833'333ns);
+}
+
+TEST_F(SwappyCommonHostTest,
+       RepeatedVotesResolvingToSamePanelPeriodDoNotResetApplyLatencyCountdown) {
+    SimulatedSwappyHarness harness(makeSettings(k120HzPeriod, 36), Clock::time_point{1s},
+                                   DisplayPanelModel::teDivisor240Hz(/*applyLatencyVsyncs=*/7));
+    ANativeWindow window{103};
+    harness.swappy().setANativeWindow(&window);
+
+    // Distinct swapDuration floors (~55.6 Hz, ~52.6 Hz, 50.0 Hz) each exceed the 0.1 Hz
+    // vote deadband and emit setFrameRate calls across 6 elapsed VSYNCs (3 VSYNCs/frame),
+    // all resolving to 20,833,333 ns without restarting the 7-VSYNC apply countdown.
+    Settings::getInstance()->setSwapDuration(18'000'000);
+    harness.runFrame(2ms, 2ms);
+
+    Settings::getInstance()->setSwapDuration(19'000'000);
+    harness.runFrame(2ms, 2ms);
+
+    Settings::getInstance()->setSwapDuration(20'000'000);
+    harness.runFrame(2ms, 2ms);
+    EXPECT_EQ(harness.displayPeriod(), k120HzPeriod);
+
+    harness.runFrame(2ms, 2ms);
+    const auto snapshot = snapshotPlatformState(*harness.platformState());
+    EXPECT_GE(snapshot.frameRateVotes.size(), 3u);
+    EXPECT_EQ(harness.displayPeriod(), 20'833'333ns);
+}
+
+TEST_F(SwappyCommonHostTest, DiscretePanelSwitchesLegacyModeIdAndHandlesPassiveThermalCap) {
+    SimulatedSwappyHarness harness(makeSettings(k120HzPeriod, 29), Clock::time_point{1s},
+                                   DisplayPanelModel::discrete60And120Hz(1),
+                                   /*supportsSetFrameRate=*/false);
+    Settings::getInstance()->setSwapDuration(k120HzPeriod.count());
+
+    // 4ms CPU + 20ms GPU (21ms pipelined hint => ~47.6 Hz): on discrete {120Hz, 60Hz},
+    // 120Hz*3 = 25ms (40fps) beats 60Hz*2 = 33.3ms (30fps), keeping mode 1 (120Hz) at interval=3.
+    harness.runFrames(350, 4ms, 20ms);
+    EXPECT_EQ(harness.displayPeriod(), k120HzPeriod);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), 3 * k120HzPeriod);
+
+    // Simulate an OS thermal policy capping the physical panel from 120Hz down to 60Hz.
+    harness.triggerPassiveDisplayRateChange(k60HzPeriod);
+    harness.runFrames(150, 4ms, 20ms);
+
+    EXPECT_EQ(harness.displayPeriod(), k60HzPeriod);
+    EXPECT_EQ(harness.swappy().getRefreshPeriod(), k60HzPeriod);
+    EXPECT_NEAR(harness.swappy().getSwapDuration().count(), (2 * k60HzPeriod).count(), 100);
+}
+
+TEST_F(SwappyCommonHostTest, PanelRateSwitchAdvancesNextVsyncByFullNewRefreshPeriod) {
+    auto state = std::make_shared<PlatformSharedState>();
+    state->panel =
+            SimulatedDisplayPanel(k120HzPeriod,
+                                  DisplayPanelModel::discrete60And120Hz(/*applyLatencyVsyncs=*/1));
+    state->choreographerCallbackArmed = true;
+    state->onChoreographer = [](std::optional<std::chrono::nanoseconds>) {};
+    VsyncPanelTimeline timeline(state, makeSettings(k120HzPeriod, 36));
+
+    const auto switchVsync = timeline.nextVsyncAfter(Clock::time_point{1s});
+    ASSERT_TRUE(switchVsync.has_value());
+    state->panel.scheduleSwitch(k60HzPeriod);
+    timeline.deliverVsync(*switchVsync);
+
+    state->choreographerCallbackArmed = true;
+    const auto postSwitchVsync = timeline.nextVsyncAfter(*switchVsync);
+    ASSERT_TRUE(postSwitchVsync.has_value());
+    EXPECT_EQ(*postSwitchVsync - *switchVsync, k60HzPeriod);
+}
+
+TEST_F(SwappyCommonHostTest, DiscretePanelSetFrameRateSelectsModeMatchingTargetMultiple) {
+    SimulatedSwappyHarness harness(makeSettings(k120HzPeriod, 36), Clock::time_point{1s},
+                                   DisplayPanelModel::discrete60And120Hz(1));
+    Settings::getInstance()->setSwapDuration(k120HzPeriod.count());
+    ANativeWindow window{104};
+    harness.swappy().setANativeWindow(&window);
+
+    // Under setFrameRate (~47.6 Hz vote), 120Hz*3 (25ms) beats 60Hz*2 (33.3ms), keeping 120Hz;
+    // a 30fps floor (30.0 Hz vote) switches the discrete panel to 60Hz at interval=2.
+    harness.runFrames(200, 4ms, 20ms);
+    EXPECT_EQ(harness.displayPeriod(), k120HzPeriod);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), 3 * k120HzPeriod);
+
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_30FPS);
+    harness.runFrames(4, 3ms, 3ms);
+    EXPECT_EQ(harness.displayPeriod(), k60HzPeriod);
+    EXPECT_NEAR(harness.swappy().getSwapDuration().count(), (2 * k60HzPeriod).count(), 100);
+}
+
+TEST_F(SwappyCommonHostTest, DiscreteLegacyPanelSelects60HzModeIdFor30HzTarget) {
+    SimulatedSwappyHarness harness(makeSettings(k120HzPeriod, 29), Clock::time_point{1s},
+                                   DisplayPanelModel::discrete60And120Hz(1),
+                                   /*supportsSetFrameRate=*/false);
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_30FPS);
+
+    // First swap votes mode 2 (60Hz) for the 30fps swapDuration floor, switching the
+    // panel to 60Hz and pacing at swapInterval=2 (~33.33ms).
+    harness.runFrames(4, 3ms, 3ms);
+
+    const auto snapshot = snapshotPlatformState(*harness.platformState());
+    ASSERT_FALSE(snapshot.preferredModeIds.empty());
+    EXPECT_EQ(snapshot.preferredModeIds.back(), 2);
+    EXPECT_EQ(harness.displayPeriod(), k60HzPeriod);
+    EXPECT_EQ(harness.swappy().getRefreshPeriod(), k60HzPeriod);
+    EXPECT_NEAR(harness.swappy().getSwapDuration().count(), (2 * k60HzPeriod).count(), 100);
 }
 
 } // namespace
