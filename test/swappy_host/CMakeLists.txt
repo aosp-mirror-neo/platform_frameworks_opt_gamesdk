@@ -74,6 +74,46 @@ set(SWAPPY_HOST_COMMON_SOURCES
   ../../games-frame-pacing/common/swappy_c.cpp
 )
 
+set(AGDK_HOST_JNI_INCLUDE_DIRS)
+foreach(CANDIDATE_REL
+    "../../../prebuilts/jdk/jdk21"
+    "../../../../../prebuilts/jdk/jdk21"
+    "../../../prebuilts/jdk/jdk17"
+    "../../../../../prebuilts/jdk/jdk17")
+  if(UNIX AND NOT APPLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/linux-x86/include/jni.h")
+    set(AGDK_HOST_JNI_INCLUDE_DIRS
+      "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/linux-x86/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/linux-x86/include/linux")
+    break()
+  elseif(APPLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/darwin-arm64/include/jni.h")
+    set(AGDK_HOST_JNI_INCLUDE_DIRS
+      "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/darwin-arm64/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/darwin-arm64/include/darwin")
+    break()
+  elseif(APPLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/darwin-x86/include/jni.h")
+    set(AGDK_HOST_JNI_INCLUDE_DIRS
+      "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/darwin-x86/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/darwin-x86/include/darwin")
+    break()
+  elseif(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/windows-x86/include/jni.h")
+    set(AGDK_HOST_JNI_INCLUDE_DIRS
+      "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/windows-x86/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/${CANDIDATE_REL}/windows-x86/include/win32")
+    break()
+  endif()
+endforeach()
+
+if(NOT AGDK_HOST_JNI_INCLUDE_DIRS)
+  find_package(JNI REQUIRED)
+  set(AGDK_HOST_JNI_INCLUDE_DIRS ${JNI_INCLUDE_DIRS})
+endif()
+
+include_directories(SYSTEM ${AGDK_HOST_JNI_INCLUDE_DIRS})
+list(APPEND SWAPPY_HOST_COMMON_SOURCES
+  jniutil_test.cpp
+  jniutil_no_dex_test.cpp
+)
+
 set(SWAPPY_HOST_TEST_SOURCES
   ${SWAPPY_HOST_COMMON_SOURCES}
   ../common/trace_test.cpp

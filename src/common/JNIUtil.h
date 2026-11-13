@@ -18,12 +18,14 @@
 
 #include <jni.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <string>
 
 #include "Log.h"
+#include "ScopedLocalRef.h"
 #include "system_utils.h"
 
 // The code in this file will dynamically load Java classes from a binary
@@ -43,9 +45,35 @@ extern const char _binary_classes_dex_end;
 
 namespace gamesdk {
 
+inline bool clearAndDescribePendingException(JNIEnv* env) {
+    if (!env->ExceptionCheck()) {
+        return false;
+    }
+    env->ExceptionDescribe();
+    env->ExceptionClear();
+    return true;
+}
+
+inline ScopedLocalRef<jclass> loadClassWithLoader(JNIEnv* env, jobject classLoaderObj,
+                                                  jmethodID loadClassMethod, jstring className,
+                                                  bool describeException) {
+    ScopedLocalRef<jclass> loadedClass(env,
+                                       static_cast<jclass>(env->CallObjectMethod(classLoaderObj,
+                                                                                 loadClassMethod,
+                                                                                 className)));
+    if (env->ExceptionCheck()) {
+        if (describeException) {
+            env->ExceptionDescribe();
+        }
+        env->ExceptionClear();
+        return ScopedLocalRef<jclass>(env, nullptr);
+    }
+    return loadedClass;
+}
+
 #ifndef ANDROIDGAMESDK_NO_BINARY_DEX_LINKAGE
 
-static bool saveBytesToFile(std::string fileName, const char* bytes, size_t size) {
+inline bool saveBytesToFile(std::string fileName, const char* bytes, size_t size) {
     std::ofstream save_file(fileName, std::ios::binary);
     if (save_file.good()) {
         save_file.write(bytes, size);
@@ -54,52 +82,217 @@ static bool saveBytesToFile(std::string fileName, const char* bytes, size_t size
     return false;
 }
 
-static bool deleteFile(std::string fileName) {
+inline bool deleteFile(std::string fileName) {
     if (remove(fileName.c_str()) != 0)
         return false;
     else
         return true;
 }
 
-static bool createTempFile(JNIEnv* env, jobject activity, const char* ext,
-                           std::string& tempFileName) {
-    bool result = false;
-    jclass activityClass = env->GetObjectClass(activity);
-    jmethodID getCacheDir = env->GetMethodID(activityClass, "getCacheDir", "()Ljava/io/File;");
-    jobject cacheDir = env->CallObjectMethod(activity, getCacheDir);
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-    } else {
-        jclass fileClass = env->FindClass("java/io/File");
-        jmethodID createTempFile =
-                env->GetStaticMethodID(fileClass, "createTempFile",
-                                       "(Ljava/lang/String;Ljava/lang/String;Ljava/"
-                                       "io/File;)Ljava/io/File;");
-        jstring prefix = env->NewStringUTF("ags");
-        jstring suffix = env->NewStringUTF(ext);
-        jobject tempFile =
-                env->CallStaticObjectMethod(fileClass, createTempFile, prefix, suffix, cacheDir);
-        if (env->ExceptionCheck()) {
-            env->ExceptionDescribe();
-            env->ExceptionClear();
-        } else {
-            jmethodID getPath = env->GetMethodID(fileClass, "getPath", "()Ljava/lang/String;");
-            jstring pathString = (jstring)env->CallObjectMethod(tempFile, getPath);
-            if (env->ExceptionCheck()) {
-                env->ExceptionDescribe();
-                env->ExceptionClear();
-            } else {
-                const char* path = env->GetStringUTFChars(pathString, NULL);
-                tempFileName.assign(path);
-                env->ReleaseStringUTFChars(pathString, path);
-                result = true;
-            }
+inline size_t getEmbeddedDexSize() {
+    return static_cast<size_t>(reinterpret_cast<uintptr_t>(&_binary_classes_dex_end) -
+                               reinterpret_cast<uintptr_t>(&_binary_classes_dex_start));
+}
+
+class TempFileGuard {
+public:
+    explicit TempFileGuard(const std::string& path) : mPath(path) {}
+    ~TempFileGuard() {
+        if (!mPath.empty()) {
+            deleteFile(mPath);
         }
-        env->DeleteLocalRef(prefix);
-        env->DeleteLocalRef(suffix);
     }
-    return result;
+
+    TempFileGuard(const TempFileGuard&) = delete;
+    TempFileGuard& operator=(const TempFileGuard&) = delete;
+
+private:
+    std::string mPath;
+};
+
+inline bool createTempFile(JNIEnv* env, jobject activity, const char* ext,
+                           std::string& tempFileName) {
+    ScopedLocalRef<jclass> activityClass(env, env->GetObjectClass(activity));
+    if (clearAndDescribePendingException(env) || activityClass.get() == nullptr) {
+        return false;
+    }
+
+    jmethodID getCacheDir =
+            env->GetMethodID(activityClass.get(), "getCacheDir", "()Ljava/io/File;");
+    if (clearAndDescribePendingException(env) || getCacheDir == nullptr) {
+        return false;
+    }
+
+    ScopedLocalRef<jobject> cacheDir(env, env->CallObjectMethod(activity, getCacheDir));
+    if (clearAndDescribePendingException(env)) {
+        return false;
+    }
+
+    ScopedLocalRef<jclass> fileClass(env, env->FindClass("java/io/File"));
+    if (clearAndDescribePendingException(env) || fileClass.get() == nullptr) {
+        return false;
+    }
+
+    jmethodID createTempFileMethod =
+            env->GetStaticMethodID(fileClass.get(), "createTempFile",
+                                   "(Ljava/lang/String;Ljava/lang/String;Ljava/"
+                                   "io/File;)Ljava/io/File;");
+    if (clearAndDescribePendingException(env) || createTempFileMethod == nullptr) {
+        return false;
+    }
+
+    ScopedLocalRef<jstring> prefix(env, env->NewStringUTF("ags"));
+    if (clearAndDescribePendingException(env) || prefix.get() == nullptr) {
+        return false;
+    }
+
+    ScopedLocalRef<jstring> suffix(env, env->NewStringUTF(ext));
+    if (clearAndDescribePendingException(env) || suffix.get() == nullptr) {
+        return false;
+    }
+
+    ScopedLocalRef<jobject> tempFile(env,
+                                     env->CallStaticObjectMethod(fileClass.get(),
+                                                                 createTempFileMethod, prefix.get(),
+                                                                 suffix.get(), cacheDir.get()));
+    if (clearAndDescribePendingException(env) || tempFile.get() == nullptr) {
+        return false;
+    }
+
+    jmethodID getPath = env->GetMethodID(fileClass.get(), "getPath", "()Ljava/lang/String;");
+    if (clearAndDescribePendingException(env) || getPath == nullptr) {
+        return false;
+    }
+
+    ScopedLocalRef<jstring> pathString(env,
+                                       static_cast<jstring>(
+                                               env->CallObjectMethod(tempFile.get(), getPath)));
+    if (clearAndDescribePendingException(env) || pathString.get() == nullptr) {
+        return false;
+    }
+
+    const char* path = env->GetStringUTFChars(pathString.get(), nullptr);
+    if (clearAndDescribePendingException(env) || path == nullptr) {
+        return false;
+    }
+    tempFileName.assign(path);
+    env->ReleaseStringUTFChars(pathString.get(), path);
+    return true;
+}
+
+inline ScopedLocalRef<jclass> loadClassWithInMemoryDexLoader(JNIEnv* env,
+                                                             jclass inMemoryLoaderClass,
+                                                             jobject parentClassLoader,
+                                                             jmethodID loadClassMethod,
+                                                             jstring className, const char* name) {
+    jmethodID constructor = env->GetMethodID(inMemoryLoaderClass, "<init>",
+                                             "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
+    if (clearAndDescribePendingException(env) || constructor == nullptr) {
+        return ScopedLocalRef<jclass>(env, nullptr);
+    }
+
+    ScopedLocalRef<jobject> byteBuffer(env,
+                                       env->NewDirectByteBuffer(const_cast<char*>(
+                                                                        &_binary_classes_dex_start),
+                                                                static_cast<jlong>(
+                                                                        getEmbeddedDexSize())));
+    if (clearAndDescribePendingException(env) || byteBuffer.get() == nullptr) {
+        return ScopedLocalRef<jclass>(env, nullptr);
+    }
+
+    ScopedLocalRef<jobject> dexLoader(env,
+                                      env->NewObject(inMemoryLoaderClass, constructor,
+                                                     byteBuffer.get(), parentClassLoader));
+    if (clearAndDescribePendingException(env) || dexLoader.get() == nullptr) {
+        return ScopedLocalRef<jclass>(env, nullptr);
+    }
+
+    ScopedLocalRef<jclass> targetClass =
+            loadClassWithLoader(env, dexLoader.get(), loadClassMethod, className,
+                                /*describeException=*/true);
+    if (targetClass.get() == nullptr) {
+        ALOGE("Unable to find %s class", name);
+    }
+    return targetClass;
+}
+
+inline ScopedLocalRef<jclass> loadClassWithPathDexLoader(JNIEnv* env, jobject activity,
+                                                         jobject parentClassLoader,
+                                                         jmethodID loadClassMethod,
+                                                         jstring className, const char* name) {
+    ScopedLocalRef<jstring> pathLoaderName(env, env->NewStringUTF("dalvik/system/PathClassLoader"));
+    if (clearAndDescribePendingException(env) || pathLoaderName.get() == nullptr) {
+        return ScopedLocalRef<jclass>(env, nullptr);
+    }
+    ScopedLocalRef<jclass> pathLoaderClass =
+            loadClassWithLoader(env, parentClassLoader, loadClassMethod, pathLoaderName.get(),
+                                /*describeException=*/true);
+    if (pathLoaderClass.get() == nullptr) {
+        ALOGE("Unable to find dalvik/system/PathClassLoader.");
+        return ScopedLocalRef<jclass>(env, nullptr);
+    }
+
+    jmethodID constructor = env->GetMethodID(pathLoaderClass.get(), "<init>",
+                                             "(Ljava/lang/String;Ljava/lang/ClassLoader;)V");
+    if (clearAndDescribePendingException(env) || constructor == nullptr) {
+        return ScopedLocalRef<jclass>(env, nullptr);
+    }
+
+    std::string tempPath;
+    if (!createTempFile(env, activity, ".dex", tempPath)) {
+        ALOGE("Unable to create a temporary file to store DEX with "
+              "Java classes.");
+        return ScopedLocalRef<jclass>(env, nullptr);
+    }
+    TempFileGuard tempFileGuard(tempPath);
+
+    if (!saveBytesToFile(tempPath, &_binary_classes_dex_start, getEmbeddedDexSize())) {
+        ALOGE("Unable to write to %s file.", tempPath.c_str());
+        return ScopedLocalRef<jclass>(env, nullptr);
+    }
+
+    ScopedLocalRef<jstring> dexPathString(env, env->NewStringUTF(tempPath.c_str()));
+    if (clearAndDescribePendingException(env) || dexPathString.get() == nullptr) {
+        return ScopedLocalRef<jclass>(env, nullptr);
+    }
+    ScopedLocalRef<jobject> dexLoader(env,
+                                      env->NewObject(pathLoaderClass.get(), constructor,
+                                                     dexPathString.get(), parentClassLoader));
+    if (clearAndDescribePendingException(env) || dexLoader.get() == nullptr) {
+        return ScopedLocalRef<jclass>(env, nullptr);
+    }
+
+    ScopedLocalRef<jclass> targetClass =
+            loadClassWithLoader(env, dexLoader.get(), loadClassMethod, className,
+                                /*describeException=*/true);
+    if (targetClass.get() == nullptr) {
+        ALOGE("Unable to find %s class", name);
+    }
+    return targetClass;
+}
+
+inline ScopedLocalRef<jclass> loadClassFromDexBytes(JNIEnv* env, jobject activity,
+                                                    jobject parentClassLoader,
+                                                    jmethodID loadClassMethod, jstring className,
+                                                    const char* name) {
+    const int sdkVersion = gamesdk::GetSystemPropAsInt("ro.build.version.sdk");
+    if (sdkVersion >= 26) {
+        ScopedLocalRef<jstring> inMemoryLoaderName(env,
+                                                   env->NewStringUTF(
+                                                           "dalvik/system/InMemoryDexClassLoader"));
+        if (clearAndDescribePendingException(env) || inMemoryLoaderName.get() == nullptr) {
+            return ScopedLocalRef<jclass>(env, nullptr);
+        }
+        ScopedLocalRef<jclass> inMemoryLoaderClass =
+                loadClassWithLoader(env, parentClassLoader, loadClassMethod,
+                                    inMemoryLoaderName.get(), /*describeException=*/false);
+        if (inMemoryLoaderClass.get() != nullptr) {
+            return loadClassWithInMemoryDexLoader(env, inMemoryLoaderClass.get(), parentClassLoader,
+                                                  loadClassMethod, className, name);
+        }
+    }
+    return loadClassWithPathDexLoader(env, activity, parentClassLoader, loadClassMethod, className,
+                                      name);
 }
 
 #endif // #ifndef ANDROIDGAMESDK_NO_BINARY_DEX_LINKAGE
@@ -107,123 +300,77 @@ static bool createTempFile(JNIEnv* env, jobject activity, const char* ext,
 static jclass loadClass(JNIEnv* env, jobject activity, const char* name,
                         JNINativeMethod* nativeMethods, size_t nativeMethodsSize) {
     /*
-     *   1. Get a classloader from actvity
+     *   1. Get a classloader from activity
      *   2. Try to create the requested class from the activity classloader
-     *   3. If step 2 not successful then get a classloder for dex bytes (in
-     * memory or file)
-     *   4. If step 3 is  successful then register native methods
+     *   3. If step 2 not successful then get a classloader for dex bytes (in
+     *      memory or file)
+     *   4. If step 2 or step 3 is successful then register native methods
      */
     if (!env || !activity || !name) {
         return nullptr;
     }
-    jclass activityClass = env->GetObjectClass(activity);
-    jclass classLoaderClass = env->FindClass("java/lang/ClassLoader");
-    jmethodID getClassLoader =
-            env->GetMethodID(activityClass, "getClassLoader", "()Ljava/lang/ClassLoader;");
-    jobject classLoaderObj = env->CallObjectMethod(activity, getClassLoader);
-    jmethodID loadClass = env->GetMethodID(classLoaderClass, "loadClass",
-                                           "(Ljava/lang/String;)Ljava/lang/Class;");
-    jstring className = env->NewStringUTF(name);
-    jclass targetClass =
-            static_cast<jclass>(env->CallObjectMethod(classLoaderObj, loadClass, className));
-    if (env->ExceptionCheck()) {
-        env->ExceptionClear();
+    if (nativeMethodsSize > 0 && !nativeMethods) {
+        return nullptr;
+    }
 
+    ScopedLocalRef<jclass> activityClass(env, env->GetObjectClass(activity));
+    if (clearAndDescribePendingException(env) || activityClass.get() == nullptr) {
+        return nullptr;
+    }
+    ScopedLocalRef<jclass> classLoaderClass(env, env->FindClass("java/lang/ClassLoader"));
+    if (clearAndDescribePendingException(env) || classLoaderClass.get() == nullptr) {
+        return nullptr;
+    }
+    jmethodID getClassLoader =
+            env->GetMethodID(activityClass.get(), "getClassLoader", "()Ljava/lang/ClassLoader;");
+    if (clearAndDescribePendingException(env) || getClassLoader == nullptr) {
+        return nullptr;
+    }
+    ScopedLocalRef<jobject> classLoaderObj(env, env->CallObjectMethod(activity, getClassLoader));
+    if (clearAndDescribePendingException(env) || classLoaderObj.get() == nullptr) {
+        return nullptr;
+    }
+    jmethodID loadClassMethod = env->GetMethodID(classLoaderClass.get(), "loadClass",
+                                                 "(Ljava/lang/String;)Ljava/lang/Class;");
+    if (clearAndDescribePendingException(env) || loadClassMethod == nullptr) {
+        return nullptr;
+    }
+    ScopedLocalRef<jstring> className(env, env->NewStringUTF(name));
+    if (clearAndDescribePendingException(env) || className.get() == nullptr) {
+        return nullptr;
+    }
+
+    ScopedLocalRef<jclass> targetClass =
+            loadClassWithLoader(env, classLoaderObj.get(), loadClassMethod, className.get(),
+                                /*describeException=*/false);
+    bool loadedFromDexBytes = false;
+    if (targetClass.get() == nullptr) {
 #ifdef ANDROIDGAMESDK_NO_BINARY_DEX_LINKAGE
         ALOGE("Couldn't find class %s and ANDROIDGAMESDK_NO_BINARY_DEX_LINKAGE "
               "is defined",
               name);
+        return nullptr;
 #else
-        jstring dexLoaderClassName = env->NewStringUTF("dalvik/system/InMemoryDexClassLoader");
-        jclass imclassloaderClass = static_cast<jclass>(
-                env->CallObjectMethod(classLoaderObj, loadClass, dexLoaderClassName));
-        env->DeleteLocalRef(dexLoaderClassName);
-
-        int sdkVersion = gamesdk::GetSystemPropAsInt("ro.build.version.sdk");
-
-        if (env->ExceptionCheck() || !imclassloaderClass || sdkVersion < 26) {
-            env->ExceptionClear();
-            // For older SDK versions <26, where InMemoryDexClassLoader is not
-            // available
-            dexLoaderClassName = env->NewStringUTF("dalvik/system/PathClassLoader");
-            imclassloaderClass = static_cast<jclass>(
-                    env->CallObjectMethod(classLoaderObj, loadClass, dexLoaderClassName));
-            env->DeleteLocalRef(dexLoaderClassName);
-            if (env->ExceptionCheck() || !imclassloaderClass) {
-                env->ExceptionDescribe();
-                env->ExceptionClear();
-                ALOGE("Unable to find dalvik/system/PathClassLoader.");
-                targetClass = nullptr;
-            } else {
-                jmethodID constructor =
-                        env->GetMethodID(imclassloaderClass, "<init>",
-                                         "(Ljava/lang/String;Ljava/lang/ClassLoader;)V");
-                std::string tempPath;
-                if (!createTempFile(env, activity, ".dex", tempPath)) {
-                    ALOGE("Unable to create a temporary file to store DEX with "
-                          "Java classes.");
-                } else {
-                    size_t dex_file_size =
-                            (size_t)(&_binary_classes_dex_end - &_binary_classes_dex_start);
-                    if (!saveBytesToFile(tempPath, &_binary_classes_dex_start, dex_file_size)) {
-                        ALOGE("Unable to write to %s file.", tempPath.c_str());
-                    } else {
-                        jstring dexPathString = env->NewStringUTF(tempPath.c_str());
-                        jobject imclassloaderObj = env->NewObject(imclassloaderClass, constructor,
-                                                                  dexPathString, classLoaderObj);
-                        env->DeleteLocalRef(dexPathString);
-                        targetClass = static_cast<jclass>(
-                                env->CallObjectMethod(imclassloaderObj, loadClass, className));
-                        if (env->ExceptionCheck()) {
-                            env->ExceptionDescribe();
-                            env->ExceptionClear();
-                            ALOGE("Unable to find %s class", name);
-                        } else {
-                            env->RegisterNatives(targetClass, nativeMethods, nativeMethodsSize);
-                            ALOGI("Using internal %s class from dex bytes.", name);
-                        }
-                        if (imclassloaderObj) {
-                            env->DeleteLocalRef(imclassloaderObj);
-                        }
-                    }
-                    deleteFile(tempPath);
-                }
-            }
-        } else {
-            jmethodID constructor =
-                    env->GetMethodID(imclassloaderClass, "<init>",
-                                     "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
-
-            size_t dex_file_size = (size_t)(&_binary_classes_dex_end - &_binary_classes_dex_start);
-            auto byteBuffer =
-                    env->NewDirectByteBuffer((void*)&_binary_classes_dex_start, dex_file_size);
-            jobject imclassloaderObj =
-                    env->NewObject(imclassloaderClass, constructor, byteBuffer, classLoaderObj);
-
-            targetClass = static_cast<jclass>(
-                    env->CallObjectMethod(imclassloaderObj, loadClass, className));
-            if (env->ExceptionCheck()) {
-                env->ExceptionDescribe();
-                env->ExceptionClear();
-                ALOGE("Unable to find %s class", name);
-            } else {
-                env->RegisterNatives(targetClass, nativeMethods, nativeMethodsSize);
-                ALOGI("Using internal %s class from dex bytes.", name);
-            }
-            if (imclassloaderObj) {
-                env->DeleteLocalRef(imclassloaderObj);
-            }
+        targetClass = loadClassFromDexBytes(env, activity, classLoaderObj.get(), loadClassMethod,
+                                            className.get(), name);
+        if (targetClass.get() == nullptr) {
+            return nullptr;
         }
-        if (imclassloaderClass) {
-            env->DeleteLocalRef(imclassloaderClass);
-        }
+        loadedFromDexBytes = true;
 #endif // #ifdef ANDROIDGAMESDK_NO_BINARY_DEX_LINKAGE
-    } else {
-        // Register the native methods loaded by the classLoaderClass
-        env->RegisterNatives(targetClass, nativeMethods, nativeMethodsSize);
     }
-    env->DeleteLocalRef(className);
-    return targetClass;
+
+    if (nativeMethodsSize > 0) {
+        const jint registerResult = env->RegisterNatives(targetClass.get(), nativeMethods,
+                                                         static_cast<jint>(nativeMethodsSize));
+        if (clearAndDescribePendingException(env) || registerResult != JNI_OK) {
+            return nullptr;
+        }
+    }
+    if (loadedFromDexBytes) {
+        ALOGI("Using internal %s class from dex bytes.", name);
+    }
+    return targetClass.release();
 }
 
 } // namespace gamesdk

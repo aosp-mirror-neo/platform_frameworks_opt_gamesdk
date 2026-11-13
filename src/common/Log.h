@@ -16,13 +16,26 @@
 
 #pragma once
 
+#ifdef __ANDROID__
 #include <android/log.h>
+#else
+#include <cstdio>
+#endif
 
 #include <string>
 
+#ifdef __ANDROID__
 #define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define ALOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#else
+#define ALOGE(...)                                               \
+    do {                                                         \
+        if (false) (void)std::snprintf(nullptr, 0, __VA_ARGS__); \
+    } while (0)
+#define ALOGW(...) ALOGE(__VA_ARGS__)
+#define ALOGI(...) ALOGE(__VA_ARGS__)
+#endif
 #define ALOGW_ONCE_IF(cond, ...)     \
     do {                             \
         if (cond) {                  \
@@ -46,7 +59,7 @@
         }                                                      \
     } while (0)
 
-#ifndef NDEBUG
+#if !defined(NDEBUG) && defined(__ANDROID__)
 #define ALOGV(...) __android_log_print(ANDROID_LOG_VERBOSE, LOG_TAG, __VA_ARGS__)
 #else
 #define ALOGV(...)

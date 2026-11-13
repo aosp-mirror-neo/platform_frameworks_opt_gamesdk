@@ -329,10 +329,13 @@ public:
     MOCK_METHOD(jlong, CallLongMethodV, (JNIEnv*, jobject, jmethodID, va_list));
     MOCK_METHOD(jboolean, ExceptionCheck, (JNIEnv*));
     MOCK_METHOD(jthrowable, ExceptionOccurred, (JNIEnv*));
+    MOCK_METHOD(void, ExceptionDescribe, (JNIEnv*));
     MOCK_METHOD(void, ExceptionClear, (JNIEnv*));
     MOCK_METHOD(jint, GetJavaVM, (JNIEnv*, JavaVM**));
     MOCK_METHOD(jobject, NewGlobalRef, (JNIEnv*, jobject));
     MOCK_METHOD(void, DeleteGlobalRef, (JNIEnv*, jobject));
+    MOCK_METHOD(jmethodID, GetStaticMethodID, (JNIEnv*, jclass, const char*, const char*));
+    MOCK_METHOD(jobject, CallStaticObjectMethodV, (JNIEnv*, jclass, jmethodID, va_list));
     MOCK_METHOD(jobject, GetStaticObjectField, (JNIEnv*, jclass, jfieldID));
     MOCK_METHOD(const char*, GetStringUTFChars, (JNIEnv*, jstring, jboolean*));
     MOCK_METHOD(jsize, GetStringUTFLength, (JNIEnv*, jstring));
@@ -341,6 +344,7 @@ public:
     MOCK_METHOD(jclass, GetObjectClass, (JNIEnv*, jobject));
     MOCK_METHOD(jstring, NewStringUTF, (JNIEnv*, const char*));
     MOCK_METHOD(jobject, NewObjectV, (JNIEnv*, jclass, jmethodID, va_list));
+    MOCK_METHOD(jobject, NewDirectByteBuffer, (JNIEnv*, void*, jlong));
     MOCK_METHOD(jint, RegisterNatives, (JNIEnv*, jclass, const JNINativeMethod*, jint));
     MOCK_METHOD(void, CallVoidMethodV, (JNIEnv*, jobject, jmethodID, va_list));
     MOCK_METHOD(jboolean, IsInstanceOf, (JNIEnv*, jobject, jclass));
@@ -392,6 +396,9 @@ static jthrowable MockExceptionOccurred(JNIEnv* env) {
     }
     return res;
 }
+static void MockExceptionDescribe(JNIEnv* env) {
+    gMockJni->ExceptionDescribe(env);
+}
 static void MockExceptionClear(JNIEnv* env) {
     gMockJni->ExceptionClear(env);
 }
@@ -403,6 +410,18 @@ static jobject MockNewGlobalRef(JNIEnv* env, jobject obj) {
 }
 static void MockDeleteGlobalRef(JNIEnv* env, jobject obj) {
     gMockJni->DeleteGlobalRef(env, obj);
+}
+static jmethodID MockGetStaticMethodID(JNIEnv* env, jclass clazz, const char* name,
+                                       const char* sig) {
+    return gMockJni->GetStaticMethodID(env, clazz, name, sig);
+}
+static jobject MockCallStaticObjectMethodV(JNIEnv* env, jclass clazz, jmethodID methodID,
+                                           va_list args) {
+    jobject res = gMockJni->CallStaticObjectMethodV(env, clazz, methodID, args);
+    if (res != nullptr) {
+        gCreatedLocalRefs++;
+    }
+    return res;
 }
 static jobject MockGetStaticObjectField(JNIEnv* env, jclass clazz, jfieldID fieldID) {
     jobject res = gMockJni->GetStaticObjectField(env, clazz, fieldID);
@@ -442,6 +461,13 @@ static jstring MockNewStringUTF(JNIEnv* env, const char* bytes) {
 }
 static jobject MockNewObjectV(JNIEnv* env, jclass clazz, jmethodID methodID, va_list args) {
     jobject res = gMockJni->NewObjectV(env, clazz, methodID, args);
+    if (res != nullptr) {
+        gCreatedLocalRefs++;
+    }
+    return res;
+}
+static jobject MockNewDirectByteBuffer(JNIEnv* env, void* address, jlong capacity) {
+    jobject res = gMockJni->NewDirectByteBuffer(env, address, capacity);
     if (res != nullptr) {
         gCreatedLocalRefs++;
     }
@@ -678,6 +704,10 @@ public:
                                               testing::Return(JNI_OK)));
         ON_CALL(mMockJni, NewGlobalRef(testing::_, testing::_))
                 .WillByDefault(testing::ReturnArg<1>());
+        ON_CALL(mMockJni, GetStaticMethodID(testing::_, testing::_, testing::_, testing::_))
+                .WillByDefault(testing::Return(reinterpret_cast<jmethodID>(0x12)));
+        ON_CALL(mMockJni, CallStaticObjectMethodV(testing::_, testing::_, testing::_, testing::_))
+                .WillByDefault(testing::Return(reinterpret_cast<jobject>(0x13)));
         ON_CALL(mMockJni, GetStaticObjectField(testing::_, testing::_, testing::_))
                 .WillByDefault(testing::Return(reinterpret_cast<jobject>(0x5)));
         ON_CALL(mMockJni, GetStringUTFChars(testing::_, testing::_, testing::_))
@@ -688,6 +718,8 @@ public:
                 .WillByDefault(testing::Return(reinterpret_cast<jclass>(0x6)));
         ON_CALL(mMockJni, NewStringUTF(testing::_, testing::_))
                 .WillByDefault(testing::Return(reinterpret_cast<jstring>(0x7)));
+        ON_CALL(mMockJni, NewDirectByteBuffer(testing::_, testing::_, testing::_))
+                .WillByDefault(testing::Return(reinterpret_cast<jobject>(0x14)));
         const jmethodID kSwappyDisplayManagerConstructor = reinterpret_cast<jmethodID>(0x21);
 
         ON_CALL(mMockJni,
@@ -732,10 +764,13 @@ public:
         mJniInterface.CallVoidMethodV = MockCallVoidMethodV;
         mJniInterface.ExceptionCheck = MockExceptionCheck;
         mJniInterface.ExceptionOccurred = MockExceptionOccurred;
+        mJniInterface.ExceptionDescribe = MockExceptionDescribe;
         mJniInterface.ExceptionClear = MockExceptionClear;
         mJniInterface.GetJavaVM = MockGetJavaVM;
         mJniInterface.NewGlobalRef = MockNewGlobalRef;
         mJniInterface.DeleteGlobalRef = MockDeleteGlobalRef;
+        mJniInterface.GetStaticMethodID = MockGetStaticMethodID;
+        mJniInterface.CallStaticObjectMethodV = MockCallStaticObjectMethodV;
         mJniInterface.GetStaticObjectField = MockGetStaticObjectField;
         mJniInterface.GetStringUTFChars = MockGetStringUTFChars;
         mJniInterface.GetStringUTFLength = MockGetStringUTFLength;
@@ -744,6 +779,7 @@ public:
         mJniInterface.GetObjectClass = MockGetObjectClass;
         mJniInterface.NewStringUTF = MockNewStringUTF;
         mJniInterface.NewObjectV = MockNewObjectV;
+        mJniInterface.NewDirectByteBuffer = MockNewDirectByteBuffer;
         mJniInterface.RegisterNatives = MockRegisterNatives;
         mJniInterface.IsInstanceOf = MockIsInstanceOf;
 
@@ -844,6 +880,41 @@ public:
     void reportAsNonActivity(jobject object) {
         ON_CALL(mMockJni, IsInstanceOf(testing::_, object, testing::_))
                 .WillByDefault(testing::Return(JNI_FALSE));
+    }
+
+    // Simulates an Activity ClassLoader that throws ClassNotFoundException for
+    // `missingClassName`, forcing gamesdk::loadClass onto its embedded-DEX path.
+    void simulateMissingPrimaryClass(const char* missingClassName) {
+        const jmethodID kGetClassLoader = reinterpret_cast<jmethodID>(0x40);
+        const jobject kPrimaryLoader = reinterpret_cast<jobject>(0x41);
+        const jmethodID kLoadClass = reinterpret_cast<jmethodID>(0x42);
+        const jstring kMissingNameString = reinterpret_cast<jstring>(0x43);
+
+        ON_CALL(mMockJni,
+                GetMethodID(testing::_, testing::_, testing::StrEq("getClassLoader"), testing::_))
+                .WillByDefault(testing::Return(kGetClassLoader));
+        ON_CALL(mMockJni,
+                GetMethodID(testing::_, testing::_, testing::StrEq("loadClass"), testing::_))
+                .WillByDefault(testing::Return(kLoadClass));
+        ON_CALL(mMockJni, NewStringUTF(testing::_, testing::StrEq(missingClassName)))
+                .WillByDefault(testing::Return(kMissingNameString));
+        ON_CALL(mMockJni, CallObjectMethodV(testing::_, testing::_, kGetClassLoader, testing::_))
+                .WillByDefault(testing::Return(kPrimaryLoader));
+        ON_CALL(mMockJni, CallObjectMethodV(testing::_, testing::_, kLoadClass, testing::_))
+                .WillByDefault(
+                        testing::Invoke([this, kPrimaryLoader,
+                                         kMissingNameString](JNIEnv*, jobject loader, jmethodID,
+                                                             va_list args) -> jobject {
+                            va_list copy;
+                            va_copy(copy, args);
+                            jstring requested = va_arg(copy, jstring);
+                            va_end(copy);
+                            if (loader == kPrimaryLoader && requested == kMissingNameString) {
+                                mPendingException = true;
+                                return nullptr;
+                            }
+                            return reinterpret_cast<jobject>(0x44);
+                        }));
     }
 
     // Expectations shared by the tests that initialize Swappy with an object
@@ -3231,6 +3302,7 @@ TEST_F(AImageReaderEGLSwapchainTest, RefreshRateCallbacksReleaseLocalRefsOnSdk37
     ASSERT_TRUE(SwappyGL_init(gMockEnv, reinterpret_cast<jobject>(0x1234)));
     const int createdAfterInit = gCreatedLocalRefs.load();
     const int netLocalRefsAfterInit = createdAfterInit - gDeletedLocalRefs.load();
+    EXPECT_EQ(netLocalRefsAfterInit, 0);
 
     // Exceed ART's 512-entry JNI local reference table limit across callbacks.
     constexpr int kCallbackIterations = 600;
@@ -3239,10 +3311,43 @@ TEST_F(AImageReaderEGLSwapchainTest, RefreshRateCallbacksReleaseLocalRefsOnSdk37
     }
 
     EXPECT_GT(gCreatedLocalRefs.load(), createdAfterInit);
-    EXPECT_EQ(gCreatedLocalRefs.load() - gDeletedLocalRefs.load(), netLocalRefsAfterInit);
+    EXPECT_EQ(gCreatedLocalRefs.load() - gDeletedLocalRefs.load(), 0);
 
     cleanupMockNDKChoreographer();
     SwappyGL_destroy();
+    EXPECT_EQ(gCreatedLocalRefs.load(), gDeletedLocalRefs.load());
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, InitReleasesLocalRefsWhenLoadingDisplayManagerClassOnSdk29) {
+    setupMockJni(29);
+    setupMockNDKChoreographer();
+    buildEGLForTest();
+
+    ASSERT_TRUE(SwappyGL_init(gMockEnv, reinterpret_cast<jobject>(0x1234)));
+    EXPECT_GT(gCreatedLocalRefs.load(), 0);
+    EXPECT_EQ(gCreatedLocalRefs.load(), gDeletedLocalRefs.load());
+
+    cleanupMockNDKChoreographer();
+    SwappyGL_destroy();
+    EXPECT_EQ(gCreatedLocalRefs.load(), gDeletedLocalRefs.load());
+}
+
+TEST_F(AImageReaderEGLSwapchainTest,
+       InitReleasesLocalRefsWhenLoadingDisplayManagerFromDexBytesOnSdk29) {
+    setupMockJni(29);
+    simulateMissingPrimaryClass("com/google/androidgamesdk/SwappyDisplayManager");
+    EXPECT_CALL(mMockJni, NewDirectByteBuffer(testing::_, testing::_, testing::Gt(0)))
+            .WillOnce(testing::Return(reinterpret_cast<jobject>(0x14)));
+    setupMockNDKChoreographer();
+    buildEGLForTest();
+
+    ASSERT_TRUE(SwappyGL_init(gMockEnv, reinterpret_cast<jobject>(0x1234)));
+    EXPECT_GT(gCreatedLocalRefs.load(), 0);
+    EXPECT_EQ(gCreatedLocalRefs.load(), gDeletedLocalRefs.load());
+
+    cleanupMockNDKChoreographer();
+    SwappyGL_destroy();
+    EXPECT_EQ(gCreatedLocalRefs.load(), gDeletedLocalRefs.load());
 }
 
 TEST_F(AImageReaderEGLSwapchainTest, InitFailsGracefullyWithoutJavaVM) {

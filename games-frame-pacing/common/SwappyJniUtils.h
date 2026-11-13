@@ -18,6 +18,7 @@
 
 #include <jni.h>
 
+#include "ScopedLocalRef.h"
 #include "SwappyLog.h"
 
 #pragma push_macro("LOG_TAG")
@@ -27,52 +28,7 @@
 
 namespace swappy {
 
-// Owns a JNI local reference (jobject, jclass, jstring, jthrowable) and
-// deletes it on scope exit so native threads without a Java caller frame do
-// not exhaust ART's local reference table.
-template <typename T>
-class ScopedLocalRef {
-public:
-    ScopedLocalRef(JNIEnv* env, T ref) : mEnv(env), mRef(ref) {}
-    ~ScopedLocalRef() {
-        if (mRef != nullptr) {
-            mEnv->DeleteLocalRef(mRef);
-        }
-    }
-
-    ScopedLocalRef(const ScopedLocalRef&) = delete;
-    ScopedLocalRef& operator=(const ScopedLocalRef&) = delete;
-
-    ScopedLocalRef(ScopedLocalRef&& other) noexcept : mEnv(other.mEnv), mRef(other.mRef) {
-        other.mRef = nullptr;
-    }
-
-    ScopedLocalRef& operator=(ScopedLocalRef&& other) noexcept {
-        if (this != &other) {
-            if (mRef != nullptr) {
-                mEnv->DeleteLocalRef(mRef);
-            }
-            mEnv = other.mEnv;
-            mRef = other.mRef;
-            other.mRef = nullptr;
-        }
-        return *this;
-    }
-
-    T get() const noexcept {
-        return mRef;
-    }
-
-    T release() noexcept {
-        T ref = mRef;
-        mRef = nullptr;
-        return ref;
-    }
-
-private:
-    JNIEnv* mEnv;
-    T mRef;
-};
+using gamesdk::ScopedLocalRef;
 
 // Logs and clears the exception left pending by the JNI call described by
 // `operation`, so that no exception ever leaks to the caller of Swappy.
