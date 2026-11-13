@@ -124,6 +124,7 @@ set(SWAPPY_HOST_COMMON_SOURCES
   displayratecontroller_test.cpp
   framedurations_test.cpp
   framestatistics_test.cpp
+  pacingsim_test.cpp
   refreshperiodset_test.cpp
   swapintervalladder_test.cpp
   swappy_c_test.cpp
