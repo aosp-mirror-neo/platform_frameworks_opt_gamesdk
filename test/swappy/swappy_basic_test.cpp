@@ -2596,5 +2596,61 @@ TEST_F(AImageReaderEGLSwapchainTest, RenderingLoopSDK37) {
     SwappyGL_destroy();
 }
 
+TEST_F(AImageReaderEGLSwapchainTest, DisablesRenderAheadOnDisplayManagerInit) {
+    setupMockJni(37);
+    setupMockNDKChoreographer();
+    buildEGLForTest();
+
+    const jmethodID kDisableRenderAhead = reinterpret_cast<jmethodID>(0x30);
+    int disableRenderAheadCalls = 0;
+
+    ON_CALL(mMockJni,
+            GetMethodID(testing::_, testing::_, testing::StrEq("disableRenderAhead"),
+                        testing::StrEq("()V")))
+            .WillByDefault(testing::Return(kDisableRenderAhead));
+    ON_CALL(mMockJni, CallVoidMethodV(testing::_, testing::_, kDisableRenderAhead, testing::_))
+            .WillByDefault(testing::Invoke(
+                    [&](JNIEnv*, jobject, jmethodID, va_list) { ++disableRenderAheadCalls; }));
+
+    jobject fakeActivity = reinterpret_cast<jobject>(0x1234);
+    EXPECT_TRUE(SwappyGL_init(gMockEnv, fakeActivity));
+    EXPECT_EQ(disableRenderAheadCalls, 1);
+
+    cleanupMockNDKChoreographer();
+    SwappyGL_destroy();
+}
+
+TEST_F(AImageReaderEGLSwapchainTest, ToleratesMissingDisableRenderAheadMethod) {
+    setupMockJni(37);
+    setupMockNDKChoreographer();
+    buildEGLForTest();
+
+    bool pendingException = false;
+    int exceptionClears = 0;
+
+    ON_CALL(mMockJni,
+            GetMethodID(testing::_, testing::_, testing::StrEq("disableRenderAhead"),
+                        testing::StrEq("()V")))
+            .WillByDefault(testing::Invoke([&](JNIEnv*, jclass, const char*, const char*) {
+                pendingException = true;
+                return nullptr;
+            }));
+    ON_CALL(mMockJni, ExceptionCheck(testing::_)).WillByDefault(testing::Invoke([&](JNIEnv*) {
+        return pendingException ? JNI_TRUE : JNI_FALSE;
+    }));
+    ON_CALL(mMockJni, ExceptionClear(testing::_)).WillByDefault(testing::Invoke([&](JNIEnv*) {
+        pendingException = false;
+        ++exceptionClears;
+    }));
+
+    jobject fakeActivity = reinterpret_cast<jobject>(0x1234);
+    EXPECT_TRUE(SwappyGL_init(gMockEnv, fakeActivity));
+    EXPECT_FALSE(pendingException);
+    EXPECT_EQ(exceptionClears, 1);
+
+    cleanupMockNDKChoreographer();
+    SwappyGL_destroy();
+}
+
 } // namespace swappytest
 } // namespace android
