@@ -29,8 +29,8 @@ namespace swappy {
 
 class SwappyVkFallback : public SwappyVkBase {
 public:
-    SwappyVkFallback(JNIEnv* env, jobject jactivity, VkPhysicalDevice physicalDevice,
-                     VkDevice device, const SwappyVkFunctionProvider* provider);
+    SwappyVkFallback(std::unique_ptr<SwappyPlatform> platform, VkPhysicalDevice physicalDevice,
+                     VkDevice device, PFN_vkQueuePresentKHR pfnQueuePresentKHR);
 
     bool doGetRefreshCycleDuration(VkSwapchainKHR swapchain,
                                    uint64_t* pRefreshDuration) override final;

@@ -16,42 +16,33 @@
 
 #include "SwappyVkFallback.h"
 
+#include <utility>
+
 #define LOG_TAG "SwappyVkFallback"
 #include "SwappyLog.h"
 
 namespace swappy {
 
-SwappyVkFallback::SwappyVkFallback(JNIEnv* env, jobject jactivity, VkPhysicalDevice physicalDevice,
-                                   VkDevice device, const SwappyVkFunctionProvider* provider)
-      : SwappyVkBase(env, jactivity, physicalDevice, device, provider) {}
-
-bool SwappyVkFallback::doGetRefreshCycleDuration(VkSwapchainKHR swapchain,
-                                                 uint64_t* pRefreshDuration) {
-    if (!isEnabled()) {
-        SWAPPY_LOGE("Swappy is disabled.");
-        return false;
+SwappyVkFallback::SwappyVkFallback(std::unique_ptr<SwappyPlatform> platform,
+                                   VkPhysicalDevice physicalDevice, VkDevice device,
+                                   PFN_vkQueuePresentKHR pfnQueuePresentKHR)
+      : SwappyVkBase(std::move(platform), physicalDevice, device, pfnQueuePresentKHR) {
+    if (mCommonBase.isValid()) {
+        // Since we don't have presentation timing, we cannot achieve pipelining.
+        mCommonBase.setAutoPipelineMode(false);
     }
+}
 
+bool SwappyVkFallback::doGetRefreshCycleDuration(VkSwapchainKHR /*swapchain*/,
+                                                 uint64_t* pRefreshDuration) {
     // Since we don't have presentation timing, we cannot achieve pipelining.
     mCommonBase.setAutoPipelineMode(false);
-
-    *pRefreshDuration = mCommonBase.getRefreshPeriod().count();
-
-    // refreshRate is only used for logging, which maybe disabled.
-    [[maybe_unused]] double refreshRate = 1000000000.0 / *pRefreshDuration;
-    SWAPPY_LOGI("Returning refresh duration of %" PRIu64 " nsec (approx %f Hz)", *pRefreshDuration,
-                refreshRate);
-
+    *pRefreshDuration = reportRefreshCycleDuration();
     return true;
 }
 
 VkResult SwappyVkFallback::doQueuePresent(VkQueue queue, uint32_t queueFamilyIndex,
                                           const VkPresentInfoKHR* pPresentInfo) {
-    if (!isEnabled()) {
-        SWAPPY_LOGE("Swappy is disabled.");
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
-
     VkResult result = initializeVkSyncObjects(queue, queueFamilyIndex);
     if (result) {
         return result;

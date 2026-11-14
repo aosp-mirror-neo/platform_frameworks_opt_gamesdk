@@ -1012,7 +1012,8 @@ public:
     }
 
     void buildSwapchainForTest(std::vector<const char*>& instanceLayers,
-                               std::vector<const char*>& deviceLayers) {
+                               std::vector<const char*>& deviceLayers,
+                               std::vector<const char*> deviceExtensions = {}) {
         createVulkanInstance(instanceLayers);
         AImageReader_ImageListener listener{};
         listener.context = this;
@@ -1022,8 +1023,37 @@ public:
         createVulkanSurface();
         pickPhysicalDeviceAndQueueFamily();
 
-        createDeviceAndGetQueue(deviceLayers);
+        createDeviceAndGetQueue(deviceLayers, deviceExtensions);
         createSwapchain();
+    }
+
+    // Tells Swappy that the device supports VK_GOOGLE_display_timing, so that
+    // SwappyVk_initAndGetRefreshCycleDuration uses SwappyVkGoogleDisplayTiming.
+    void declareDisplayTimingToSwappy() {
+        uint32_t extensionCount = 0;
+        vkEnumerateDeviceExtensionProperties(mPhysicalDev, nullptr, &extensionCount, nullptr);
+        std::vector<VkExtensionProperties> availableExtensions(extensionCount);
+        vkEnumerateDeviceExtensionProperties(mPhysicalDev, nullptr, &extensionCount,
+                                             availableExtensions.data());
+
+        uint32_t requiredCount = 0;
+        SwappyVk_determineDeviceExtensions(mPhysicalDev, extensionCount, availableExtensions.data(),
+                                           &requiredCount, nullptr);
+        std::vector<std::vector<char>>
+                requiredExtensionBuffers(requiredCount,
+                                         std::vector<char>(VK_MAX_EXTENSION_NAME_SIZE));
+        std::vector<char*> requiredExtensions(requiredCount);
+        for (uint32_t i = 0; i < requiredCount; ++i) {
+            requiredExtensions[i] = requiredExtensionBuffers[i].data();
+        }
+        SwappyVk_determineDeviceExtensions(mPhysicalDev, extensionCount, availableExtensions.data(),
+                                           &requiredCount, requiredExtensions.data());
+    }
+
+    void recordFramesWithoutPresent(int frameCount) {
+        for (int i = 0; i < frameCount; ++i) {
+            SwappyVk_recordFrameStart(mPresentQueue, mSwapchain, 0);
+        }
     }
 };
 
@@ -2490,6 +2520,432 @@ TEST_F(AImageReaderEGLSwapchainTest, CApiAndStatsTest) {
     // additional threads spawned during destruction.
     cleanupMockChoreographer();
     SwappyGL_destroy();
+}
+
+namespace {
+
+class ScopedDeviceProcOverride {
+public:
+    using DeviceProcFilter = PFN_vkVoidFunction (*)(VkDevice device, const char* funcName,
+                                                    PFN_vkGetDeviceProcAddr realGetDeviceProcAddr);
+
+    explicit ScopedDeviceProcOverride(DeviceProcFilter filter,
+                                      const char* blockedGlobalFunc = nullptr) {
+        sRealGetDeviceProcAddr = nullptr;
+        sFilter = filter;
+        sBlockedGlobalFunc = blockedGlobalFunc;
+        SwappyVk_setFunctionProvider(&kProvider);
+    }
+
+    ~ScopedDeviceProcOverride() {
+        SwappyVk_setFunctionProvider(nullptr);
+        sRealGetDeviceProcAddr = nullptr;
+        sFilter = nullptr;
+        sBlockedGlobalFunc = nullptr;
+    }
+
+    ScopedDeviceProcOverride(const ScopedDeviceProcOverride&) = delete;
+    ScopedDeviceProcOverride& operator=(const ScopedDeviceProcOverride&) = delete;
+
+private:
+    static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL getDeviceProcAddr(VkDevice device,
+                                                                      const char* funcName) {
+        if (sFilter != nullptr) {
+            return sFilter(device, funcName, sRealGetDeviceProcAddr);
+        }
+        return sRealGetDeviceProcAddr != nullptr ? sRealGetDeviceProcAddr(device, funcName)
+                                                 : nullptr;
+    }
+
+    static void* getProcAddr(const char* name) {
+        if (sBlockedGlobalFunc != nullptr && strcmp(name, sBlockedGlobalFunc) == 0) {
+            return nullptr;
+        }
+        if (strcmp(name, "vkGetDeviceProcAddr") == 0) {
+            sRealGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
+                    TestVkFunctionProvider_GetProcAddr("vkGetDeviceProcAddr"));
+            if (sRealGetDeviceProcAddr == nullptr) {
+                return nullptr;
+            }
+            return reinterpret_cast<void*>(&ScopedDeviceProcOverride::getDeviceProcAddr);
+        }
+        return TestVkFunctionProvider_GetProcAddr(name);
+    }
+
+    inline static PFN_vkGetDeviceProcAddr sRealGetDeviceProcAddr = nullptr;
+    inline static DeviceProcFilter sFilter = nullptr;
+    inline static const char* sBlockedGlobalFunc = nullptr;
+    inline static const SwappyVkFunctionProvider kProvider = {
+            .init = TestVkFunctionProvider_Init,
+            .getProcAddr = &ScopedDeviceProcOverride::getProcAddr,
+            .close = TestVkFunctionProvider_Close,
+    };
+};
+
+VKAPI_ATTR VkResult VKAPI_CALL
+failingGetRefreshCycleDurationGOOGLE(VkDevice /*device*/, VkSwapchainKHR /*swapchain*/,
+                                     VkRefreshCycleDurationGOOGLE* /*pDisplayTimingProperties*/) {
+    return VK_ERROR_SURFACE_LOST_KHR;
+}
+
+} // namespace
+
+TEST_F(AImageReaderVulkanSwapchainTest, EntryPointsAreSafeOnUninitializedSwapchain) {
+    std::vector<const char*> instanceLayers;
+    std::vector<const char*> deviceLayers;
+    buildSwapchainForTest(instanceLayers, deviceLayers);
+
+    bool isEnabled = true;
+    EXPECT_FALSE(SwappyVk_isEnabled(mSwapchain, &isEnabled));
+    EXPECT_EQ(SwappyVk_getSupportedRefreshPeriodsNS(nullptr, 0, mSwapchain), 0);
+
+    SwappyVk_setWindow(mDevice, mSwapchain, mWindow);
+    SwappyVk_setSwapIntervalNS(mDevice, mSwapchain, SWAPPY_SWAP_60FPS);
+    EXPECT_EQ(SwappyVk_getSwapIntervalNS(mSwapchain), 0U);
+
+    VkPresentInfoKHR presentInfo{};
+    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = &mSwapchain;
+    uint32_t imageIndex = 0;
+    presentInfo.pImageIndices = &imageIndex;
+    EXPECT_EQ(SwappyVk_queuePresent(mPresentQueue, &presentInfo), VK_INCOMPLETE);
+    SwappyVk_setQueueFamilyIndex(mDevice, mPresentQueue, mPresentQueueFamily);
+    EXPECT_EQ(SwappyVk_queuePresent(mPresentQueue, &presentInfo), VK_ERROR_DEVICE_LOST);
+
+    SwappyTracer tracer{};
+    SwappyVk_injectTracer(&tracer);
+    SwappyVk_setAutoSwapInterval(true);
+    SwappyVk_setAutoPipelineMode(true);
+    SwappyVk_setMaxAutoSwapIntervalNS(SWAPPY_SWAP_30FPS);
+    SwappyVk_setFenceTimeoutNS(50000000);
+    EXPECT_EQ(SwappyVk_getFenceTimeoutNS(), 0U);
+    SwappyVk_enableStats(mSwapchain, true);
+    SwappyVk_getStats(mSwapchain, nullptr);
+    SwappyStats stats{};
+    SwappyVk_getStats(mSwapchain, &stats);
+    SwappyVk_recordFrameStart(mPresentQueue, mSwapchain, 0);
+    SwappyVk_clearStats(mSwapchain);
+    SwappyVk_resetFramePacing(mSwapchain);
+    SwappyVk_enableFramePacing(mSwapchain, true);
+    SwappyVk_enableBlockingWait(mSwapchain, true);
+    SwappyVk_uninjectTracer(&tracer);
+}
+
+TEST_F(AImageReaderVulkanSwapchainTest,
+       DisplayTimingInitFailsCleanlyWithValidActivityWhenDeviceProcAddrIsNull) {
+    ScopedDeviceProcOverride overrideProvider(nullptr, "vkGetDeviceProcAddr");
+
+    setenv("MOCK_VK_GOOGLE_DISPLAY_TIMING", "1", 1);
+    setupMockJni(23);
+    int newGlobalRefCalls = 0;
+    ON_CALL(mMockJni, NewGlobalRef(testing::_, testing::_))
+            .WillByDefault(testing::Invoke([&newGlobalRefCalls](JNIEnv*, jobject obj) {
+                ++newGlobalRefCalls;
+                return obj;
+            }));
+
+    std::vector<const char*> instanceLayers = {"VK_LAYER_swappy_mock"};
+    std::vector<const char*> deviceLayers = {"VK_LAYER_swappy_mock"};
+    std::vector<const char*> deviceExtensions = {VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME};
+    buildSwapchainForTest(instanceLayers, deviceLayers, deviceExtensions);
+    declareDisplayTimingToSwappy();
+
+    uint64_t refreshDuration = 0;
+    EXPECT_FALSE(SwappyVk_initAndGetRefreshCycleDuration(gMockEnv,
+                                                         reinterpret_cast<jobject>(0x1234),
+                                                         mPhysicalDev, mDevice, mSwapchain,
+                                                         &refreshDuration));
+    EXPECT_EQ(newGlobalRefCalls, 0);
+    EXPECT_EQ(gCreatedLocalRefs.load(), 0);
+
+    bool isEnabled = true;
+    EXPECT_TRUE(SwappyVk_isEnabled(mSwapchain, &isEnabled));
+    EXPECT_FALSE(isEnabled);
+
+    SwappyVk_setQueueFamilyIndex(mDevice, mPresentQueue, mPresentQueueFamily);
+    VkPresentInfoKHR presentInfo{};
+    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = &mSwapchain;
+    uint32_t imageIndex = 0;
+    presentInfo.pImageIndices = &imageIndex;
+    EXPECT_EQ(SwappyVk_queuePresent(mPresentQueue, &presentInfo), VK_ERROR_INITIALIZATION_FAILED);
+}
+
+TEST_F(AImageReaderVulkanSwapchainTest,
+       DisplayTimingInitFailsCleanlyWhenExtensionFunctionsAreMissing) {
+    ScopedDeviceProcOverride overrideProvider(
+            [](VkDevice device, const char* funcName,
+               PFN_vkGetDeviceProcAddr realGetDeviceProcAddr) -> PFN_vkVoidFunction {
+                if (strcmp(funcName, "vkGetRefreshCycleDurationGOOGLE") == 0 ||
+                    strcmp(funcName, "vkGetPastPresentationTimingGOOGLE") == 0) {
+                    return nullptr;
+                }
+                return realGetDeviceProcAddr != nullptr ? realGetDeviceProcAddr(device, funcName)
+                                                        : nullptr;
+            });
+
+    setenv("MOCK_VK_GOOGLE_DISPLAY_TIMING", "1", 1);
+    setupMockJni(23);
+    int newGlobalRefCalls = 0;
+    ON_CALL(mMockJni, NewGlobalRef(testing::_, testing::_))
+            .WillByDefault(testing::Invoke([&newGlobalRefCalls](JNIEnv*, jobject obj) {
+                ++newGlobalRefCalls;
+                return obj;
+            }));
+
+    std::vector<const char*> instanceLayers = {"VK_LAYER_swappy_mock"};
+    std::vector<const char*> deviceLayers = {"VK_LAYER_swappy_mock"};
+    std::vector<const char*> deviceExtensions = {VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME};
+    buildSwapchainForTest(instanceLayers, deviceLayers, deviceExtensions);
+    declareDisplayTimingToSwappy();
+
+    uint64_t refreshDuration = 0;
+    EXPECT_FALSE(SwappyVk_initAndGetRefreshCycleDuration(gMockEnv,
+                                                         reinterpret_cast<jobject>(0x1234),
+                                                         mPhysicalDev, mDevice, mSwapchain,
+                                                         &refreshDuration));
+    EXPECT_EQ(newGlobalRefCalls, 0);
+    EXPECT_EQ(gCreatedLocalRefs.load(), 0);
+
+    bool isEnabled = true;
+    EXPECT_TRUE(SwappyVk_isEnabled(mSwapchain, &isEnabled));
+    EXPECT_FALSE(isEnabled);
+
+    // Exceed SwappyVkGoogleDisplayTiming::MIN_FRAME_LAG (5) to verify that
+    // recordFrameStart does not invoke a null presentation-timing function.
+    recordFramesWithoutPresent(8);
+
+    SwappyVk_setQueueFamilyIndex(mDevice, mPresentQueue, mPresentQueueFamily);
+    VkPresentInfoKHR presentInfo{};
+    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = &mSwapchain;
+    uint32_t imageIndex = 0;
+    presentInfo.pImageIndices = &imageIndex;
+    EXPECT_EQ(SwappyVk_queuePresent(mPresentQueue, &presentInfo), VK_ERROR_INITIALIZATION_FAILED);
+}
+
+TEST_F(AImageReaderVulkanSwapchainTest,
+       DisplayTimingInitFailsCleanlyWhenRefreshDurationQueryFails) {
+    ScopedDeviceProcOverride overrideProvider([](VkDevice device, const char* funcName,
+                                                 PFN_vkGetDeviceProcAddr realGetDeviceProcAddr)
+                                                      -> PFN_vkVoidFunction {
+        if (strcmp(funcName, "vkGetRefreshCycleDurationGOOGLE") == 0) {
+            return reinterpret_cast<PFN_vkVoidFunction>(&failingGetRefreshCycleDurationGOOGLE);
+        }
+        return realGetDeviceProcAddr != nullptr ? realGetDeviceProcAddr(device, funcName) : nullptr;
+    });
+
+    setenv("MOCK_VK_GOOGLE_DISPLAY_TIMING", "1", 1);
+    setupMockJni(23);
+    int newGlobalRefCalls = 0;
+    ON_CALL(mMockJni, NewGlobalRef(testing::_, testing::_))
+            .WillByDefault(testing::Invoke([&newGlobalRefCalls](JNIEnv*, jobject obj) {
+                ++newGlobalRefCalls;
+                return obj;
+            }));
+
+    std::vector<const char*> instanceLayers = {"VK_LAYER_swappy_mock"};
+    std::vector<const char*> deviceLayers = {"VK_LAYER_swappy_mock"};
+    std::vector<const char*> deviceExtensions = {VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME};
+    buildSwapchainForTest(instanceLayers, deviceLayers, deviceExtensions);
+    declareDisplayTimingToSwappy();
+
+    uint64_t refreshDuration = 0;
+    EXPECT_FALSE(SwappyVk_initAndGetRefreshCycleDuration(gMockEnv,
+                                                         reinterpret_cast<jobject>(0x1234),
+                                                         mPhysicalDev, mDevice, mSwapchain,
+                                                         &refreshDuration));
+    EXPECT_EQ(newGlobalRefCalls, 0);
+    EXPECT_EQ(gCreatedLocalRefs.load(), 0);
+
+    bool isEnabled = true;
+    EXPECT_TRUE(SwappyVk_isEnabled(mSwapchain, &isEnabled));
+    EXPECT_FALSE(isEnabled);
+
+    recordFramesWithoutPresent(8);
+
+    SwappyVk_setQueueFamilyIndex(mDevice, mPresentQueue, mPresentQueueFamily);
+    VkPresentInfoKHR presentInfo{};
+    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = &mSwapchain;
+    uint32_t imageIndex = 0;
+    presentInfo.pImageIndices = &imageIndex;
+    EXPECT_EQ(SwappyVk_queuePresent(mPresentQueue, &presentInfo), VK_ERROR_INITIALIZATION_FAILED);
+}
+
+TEST_F(AImageReaderVulkanSwapchainTest, InitFailsCleanlyWhenQueuePresentProcIsNull) {
+    ScopedDeviceProcOverride overrideProvider(
+            [](VkDevice device, const char* funcName,
+               PFN_vkGetDeviceProcAddr realGetDeviceProcAddr) -> PFN_vkVoidFunction {
+                if (strcmp(funcName, "vkQueuePresentKHR") == 0) {
+                    return nullptr;
+                }
+                return realGetDeviceProcAddr != nullptr ? realGetDeviceProcAddr(device, funcName)
+                                                        : nullptr;
+            });
+
+    setupMockJni(23);
+    int newGlobalRefCalls = 0;
+    ON_CALL(mMockJni, NewGlobalRef(testing::_, testing::_))
+            .WillByDefault(testing::Invoke([&newGlobalRefCalls](JNIEnv*, jobject obj) {
+                ++newGlobalRefCalls;
+                return obj;
+            }));
+
+    std::vector<const char*> instanceLayers;
+    std::vector<const char*> deviceLayers;
+    buildSwapchainForTest(instanceLayers, deviceLayers);
+
+    uint64_t refreshDuration = 0;
+    EXPECT_FALSE(SwappyVk_initAndGetRefreshCycleDuration(gMockEnv,
+                                                         reinterpret_cast<jobject>(0x1234),
+                                                         mPhysicalDev, mDevice, mSwapchain,
+                                                         &refreshDuration));
+    EXPECT_EQ(newGlobalRefCalls, 0);
+    EXPECT_EQ(gCreatedLocalRefs.load(), 0);
+
+    bool isEnabled = true;
+    EXPECT_TRUE(SwappyVk_isEnabled(mSwapchain, &isEnabled));
+    EXPECT_FALSE(isEnabled);
+
+    SwappyVk_setQueueFamilyIndex(mDevice, mPresentQueue, mPresentQueueFamily);
+    VkPresentInfoKHR presentInfo{};
+    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = &mSwapchain;
+    uint32_t imageIndex = 0;
+    presentInfo.pImageIndices = &imageIndex;
+    EXPECT_EQ(SwappyVk_queuePresent(mPresentQueue, &presentInfo), VK_ERROR_INITIALIZATION_FAILED);
+
+    SwappyVk_destroyDevice(mDevice);
+    EXPECT_FALSE(SwappyVk_isEnabled(mSwapchain, &isEnabled));
+}
+
+TEST_F(AImageReaderVulkanSwapchainTest,
+       InitFailsCleanlyWhenVulkanSyncFunctionsOrProviderCallbacksAreMissing) {
+    setupMockJni(23);
+    std::vector<const char*> instanceLayers;
+    std::vector<const char*> deviceLayers;
+    buildSwapchainForTest(instanceLayers, deviceLayers);
+    jobject fakeActivity = reinterpret_cast<jobject>(0x1234);
+
+    static const SwappyVkFunctionProvider kNullCallbacksProvider = {
+            .init = nullptr,
+            .getProcAddr = nullptr,
+            .close = nullptr,
+    };
+    SwappyVk_setFunctionProvider(&kNullCallbacksProvider);
+    uint64_t refreshDuration = 0;
+    EXPECT_FALSE(SwappyVk_initAndGetRefreshCycleDuration(gMockEnv, fakeActivity, mPhysicalDev,
+                                                         mDevice, mSwapchain, &refreshDuration));
+    SwappyVk_destroySwapchain(mDevice, mSwapchain);
+
+    static const SwappyVkFunctionProvider kNullGetProcAddrProvider = {
+            .init = TestVkFunctionProvider_Init,
+            .getProcAddr = nullptr,
+            .close = nullptr,
+    };
+    SwappyVk_setFunctionProvider(&kNullGetProcAddrProvider);
+    EXPECT_FALSE(SwappyVk_initAndGetRefreshCycleDuration(gMockEnv, fakeActivity, mPhysicalDev,
+                                                         mDevice, mSwapchain, &refreshDuration));
+    SwappyVk_destroySwapchain(mDevice, mSwapchain);
+
+    {
+        ScopedDeviceProcOverride missingCommandPool(nullptr, "vkCreateCommandPool");
+        EXPECT_FALSE(SwappyVk_initAndGetRefreshCycleDuration(gMockEnv, fakeActivity, mPhysicalDev,
+                                                             mDevice, mSwapchain,
+                                                             &refreshDuration));
+        bool isEnabled = true;
+        EXPECT_TRUE(SwappyVk_isEnabled(mSwapchain, &isEnabled));
+        EXPECT_FALSE(isEnabled);
+
+        SwappyVk_setQueueFamilyIndex(mDevice, mPresentQueue, mPresentQueueFamily);
+        VkPresentInfoKHR presentInfo{};
+        presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        presentInfo.swapchainCount = 1;
+        presentInfo.pSwapchains = &mSwapchain;
+        uint32_t imageIndex = 0;
+        presentInfo.pImageIndices = &imageIndex;
+        EXPECT_EQ(SwappyVk_queuePresent(mPresentQueue, &presentInfo),
+                  VK_ERROR_INITIALIZATION_FAILED);
+    }
+
+    swappy::SwappyVk::getInstance().clearState();
+    EXPECT_EQ(swappy::vkCreateCommandPool, nullptr);
+    EXPECT_EQ(swappy::vkQueueSubmit, nullptr);
+}
+
+TEST_F(AImageReaderVulkanSwapchainTest, InitAndPresentRejectNullArgumentsAndHandles) {
+    setupMockJni(23);
+    std::vector<const char*> instanceLayers;
+    std::vector<const char*> deviceLayers;
+    buildSwapchainForTest(instanceLayers, deviceLayers);
+    jobject fakeActivity = reinterpret_cast<jobject>(0x1234);
+
+    uint64_t refreshDuration = 0;
+    EXPECT_FALSE(SwappyVk_initAndGetRefreshCycleDuration(gMockEnv, fakeActivity, mPhysicalDev,
+                                                         mDevice, mSwapchain, nullptr));
+    EXPECT_FALSE(SwappyVk_initAndGetRefreshCycleDuration(gMockEnv, fakeActivity, mPhysicalDev,
+                                                         VK_NULL_HANDLE, mSwapchain,
+                                                         &refreshDuration));
+    EXPECT_FALSE(SwappyVk_initAndGetRefreshCycleDuration(gMockEnv, fakeActivity, mPhysicalDev,
+                                                         mDevice, VK_NULL_HANDLE,
+                                                         &refreshDuration));
+
+    bool isEnabled = true;
+    EXPECT_FALSE(SwappyVk_isEnabled(mSwapchain, &isEnabled));
+    EXPECT_FALSE(SwappyVk_isEnabled(VK_NULL_HANDLE, &isEnabled));
+    EXPECT_FALSE(SwappyVk_isEnabled(mSwapchain, nullptr));
+
+    SwappyVk_setQueueFamilyIndex(mDevice, mPresentQueue, mPresentQueueFamily);
+    EXPECT_EQ(SwappyVk_queuePresent(mPresentQueue, nullptr), VK_ERROR_DEVICE_LOST);
+
+    VkPresentInfoKHR emptyPresentInfo{};
+    emptyPresentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    EXPECT_EQ(SwappyVk_queuePresent(mPresentQueue, &emptyPresentInfo), VK_ERROR_DEVICE_LOST);
+}
+
+TEST_F(AImageReaderVulkanSwapchainTest, EntryPointsAreSafeAfterFailedInit) {
+    setenv("MOCK_VK_GOOGLE_DISPLAY_TIMING", "1", 1);
+    setupMockJni(23);
+    std::vector<const char*> instanceLayers = {"VK_LAYER_swappy_mock"};
+    std::vector<const char*> deviceLayers = {"VK_LAYER_swappy_mock"};
+    std::vector<const char*> deviceExtensions = {VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME};
+    buildSwapchainForTest(instanceLayers, deviceLayers, deviceExtensions);
+    declareDisplayTimingToSwappy();
+
+    uint64_t refreshDuration = 0;
+    ASSERT_FALSE(SwappyVk_initAndGetRefreshCycleDuration(gMockEnv, nullptr, mPhysicalDev, mDevice,
+                                                         mSwapchain, &refreshDuration));
+    EXPECT_FALSE(SwappyVk_isEnabled(mSwapchain, nullptr));
+
+    SwappyTracer tracer{};
+    SwappyVk_injectTracer(&tracer);
+    SwappyVk_setAutoSwapInterval(true);
+    SwappyVk_setAutoPipelineMode(true);
+    SwappyVk_setMaxAutoSwapIntervalNS(SWAPPY_SWAP_30FPS);
+    SwappyVk_setFenceTimeoutNS(50000000);
+    EXPECT_EQ(SwappyVk_getFenceTimeoutNS(), 0U);
+    SwappyVk_setWindow(mDevice, mSwapchain, mWindow);
+    SwappyVk_setSwapIntervalNS(mDevice, mSwapchain, SWAPPY_SWAP_60FPS);
+    EXPECT_EQ(SwappyVk_getSwapIntervalNS(mSwapchain), 0U);
+    EXPECT_EQ(SwappyVk_getSupportedRefreshPeriodsNS(nullptr, 0, mSwapchain), 0);
+    SwappyVk_enableStats(mSwapchain, true);
+    SwappyVk_getStats(mSwapchain, nullptr);
+    recordFramesWithoutPresent(8);
+    SwappyStats stats{};
+    stats.totalFrames = 99;
+    SwappyVk_getStats(mSwapchain, &stats);
+    EXPECT_EQ(stats.totalFrames, 99U);
+    SwappyVk_clearStats(mSwapchain);
+    SwappyVk_resetFramePacing(mSwapchain);
+    SwappyVk_enableFramePacing(mSwapchain, true);
+    SwappyVk_enableBlockingWait(mSwapchain, true);
+    SwappyVk_uninjectTracer(&tracer);
 }
 
 TEST_F(AImageReaderVulkanSwapchainTest, RenderingLoopSDK37) {

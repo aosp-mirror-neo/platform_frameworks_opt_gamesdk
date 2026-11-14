@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <memory>
+
 #include "SwappyVkBase.h"
 #include "SwappyVkFallback.h"
 #include "SwappyVkGoogleDisplayTiming.h"
@@ -50,7 +52,8 @@ public:
     }
 
     ~SwappyVk() {
-        if (pFunctionProvider) {
+        perSwapchainImplementation.clear();
+        if (pFunctionProvider != nullptr && pFunctionProvider->close != nullptr) {
             pFunctionProvider->close();
         }
     }
@@ -100,8 +103,23 @@ public:
     void enableBlockingWait(VkSwapchainKHR swapchain, bool enable);
 
 private:
+    struct SwapchainEntry {
+        VkDevice device = VK_NULL_HANDLE;
+        // Non-null if and only if Swappy is enabled and swapchain initialization succeeded.
+        std::unique_ptr<SwappyVkBase> impl;
+    };
+
+    // Unlike perSwapchainImplementation[swapchain], these helpers do not insert an
+    // empty entry for a swapchain that was never initialized.
+    const SwapchainEntry* findSwapchainEntry(VkSwapchainKHR swapchain) const;
+    SwappyVkBase* findImplementation(VkSwapchainKHR swapchain) const;
+    std::unique_ptr<SwappyVkBase> createImplementation(JNIEnv* env, jobject jactivity,
+                                                       VkPhysicalDevice physicalDevice,
+                                                       VkDevice device, VkSwapchainKHR swapchain,
+                                                       uint64_t* pRefreshDuration);
+
     std::map<VkPhysicalDevice, bool> doesPhysicalDeviceHaveGoogleDisplayTiming;
-    std::map<VkSwapchainKHR, std::shared_ptr<SwappyVkBase>> perSwapchainImplementation;
+    std::map<VkSwapchainKHR, SwapchainEntry> perSwapchainImplementation;
 
     struct QueueFamilyIndex {
         VkDevice device;

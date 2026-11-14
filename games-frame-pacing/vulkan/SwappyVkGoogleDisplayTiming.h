@@ -66,8 +66,11 @@ namespace swappy {
  ***************************************************************************************************/
 class SwappyVkGoogleDisplayTiming : public SwappyVkBase {
 public:
-    SwappyVkGoogleDisplayTiming(JNIEnv* env, jobject jactivity, VkPhysicalDevice physicalDevice,
-                                VkDevice device, const SwappyVkFunctionProvider* provider);
+    SwappyVkGoogleDisplayTiming(
+            std::unique_ptr<SwappyPlatform> platform, VkPhysicalDevice physicalDevice,
+            VkDevice device, VkSwapchainKHR swapchain, PFN_vkQueuePresentKHR pfnQueuePresentKHR,
+            PFN_vkGetRefreshCycleDurationGOOGLE pfnGetRefreshCycleDurationGOOGLE,
+            PFN_vkGetPastPresentationTimingGOOGLE pfnGetPastPresentationTimingGOOGLE);
 
     bool doGetRefreshCycleDuration(VkSwapchainKHR swapchain,
                                    uint64_t* pRefreshDuration) override final;
@@ -87,7 +90,9 @@ private:
     static constexpr int MIN_FRAME_LAG = 5;
     uint32_t mPresentID = 0;
 
-    VkSwapchainKHR mSwapchain;
+    VkSwapchainKHR mSwapchain = VK_NULL_HANDLE;
+    PFN_vkGetRefreshCycleDurationGOOGLE mpfnGetRefreshCycleDurationGOOGLE = nullptr;
+    PFN_vkGetPastPresentationTimingGOOGLE mpfnGetPastPresentationTimingGOOGLE = nullptr;
 
     struct VKFrame {
         uint32_t id;

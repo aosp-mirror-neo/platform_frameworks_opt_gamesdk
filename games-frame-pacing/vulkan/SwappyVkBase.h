@@ -54,6 +54,7 @@
 #include <cstring>
 #include <list>
 #include <map>
+#include <memory>
 #include <mutex>
 
 #include "ChoreographerShim.h"
@@ -91,6 +92,7 @@ extern PFN_vkDestroyCommandPool vkDestroyCommandPool;
 extern PFN_vkCreateFence vkCreateFence;
 extern PFN_vkDestroyFence vkDestroyFence;
 extern PFN_vkWaitForFences vkWaitForFences;
+extern PFN_vkGetFenceStatus vkGetFenceStatus;
 extern PFN_vkResetFences vkResetFences;
 extern PFN_vkCreateSemaphore vkCreateSemaphore;
 extern PFN_vkDestroySemaphore vkDestroySemaphore;
@@ -104,17 +106,19 @@ extern PFN_vkEndCommandBuffer vkEndCommandBuffer;
 extern PFN_vkQueueSubmit vkQueueSubmit;
 
 void LoadVulkanFunctions(const SwappyVkFunctionProvider* pFunctionProvider);
+bool AreVulkanFunctionsLoaded();
 void ResetVulkanFunctions();
 
 class SwappyVkBase {
 public:
-    SwappyVkBase(JNIEnv* env, jobject jactivity, VkPhysicalDevice physicalDevice, VkDevice device,
-                 const SwappyVkFunctionProvider* pFunctionProvider);
+    SwappyVkBase(std::unique_ptr<SwappyPlatform> platform, VkPhysicalDevice physicalDevice,
+                 VkDevice device, PFN_vkQueuePresentKHR pfnQueuePresentKHR);
 
     virtual ~SwappyVkBase();
 
     virtual bool doGetRefreshCycleDuration(VkSwapchainKHR swapchain,
                                            uint64_t* pRefreshDuration) = 0;
+    uint64_t reportRefreshCycleDuration() const;
 
     virtual VkResult doQueuePresent(VkQueue queue, uint32_t queueFamilyIndex,
                                     const VkPresentInfoKHR* pPresentInfo) = 0;
@@ -125,8 +129,8 @@ public:
     VkResult injectFence(VkQueue queue, const VkPresentInfoKHR* pPresentInfo,
                          VkSemaphore* pSemaphore);
 
-    bool isEnabled() {
-        return mEnabled;
+    [[nodiscard]] bool isValid() {
+        return mCommonBase.isValid() && mpfnQueuePresentKHR != nullptr;
     }
 
     void setAutoSwapInterval(bool enabled);
@@ -186,19 +190,11 @@ protected:
     SwappyCommon mCommonBase;
     VkPhysicalDevice mPhysicalDevice;
     VkDevice mDevice;
-    const SwappyVkFunctionProvider* mpFunctionProvider;
-    bool mInitialized;
-    bool mEnabled;
 
     uint32_t mNextPresentID = 0;
     uint32_t mNextPresentIDToCheck = 2;
 
-    PFN_vkGetDeviceProcAddr mpfnGetDeviceProcAddr = nullptr;
     PFN_vkQueuePresentKHR mpfnQueuePresentKHR = nullptr;
-#if (not defined ANDROID_NDK_VERSION) || ANDROID_NDK_VERSION >= 15
-    PFN_vkGetRefreshCycleDurationGOOGLE mpfnGetRefreshCycleDurationGOOGLE = nullptr;
-    PFN_vkGetPastPresentationTimingGOOGLE mpfnGetPastPresentationTimingGOOGLE = nullptr;
-#endif
     // Holds VKSync objects ready to be used
     std::map<VkQueue, std::list<VkSync>> mFreeSyncPool;
 
@@ -219,7 +215,6 @@ protected:
 
     std::atomic<std::chrono::nanoseconds> mLastFenceTime = {};
 
-    void initGoogExtension();
     VkResult initializeVkSyncObjects(VkQueue queue, uint32_t queueFamilyIndex);
     void destroyVkSyncObjects();
     void reclaimSignaledFences(VkQueue queue);

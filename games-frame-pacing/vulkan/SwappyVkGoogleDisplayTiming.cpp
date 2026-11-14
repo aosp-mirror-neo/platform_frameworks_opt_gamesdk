@@ -18,6 +18,7 @@
 
 #include "SwappyVkGoogleDisplayTiming.h"
 
+#include <utility>
 #include <vector>
 
 #define LOG_TAG "SwappyVkGoogleDisplayTiming"
@@ -27,46 +28,34 @@ using std::chrono::nanoseconds;
 
 namespace swappy {
 
-SwappyVkGoogleDisplayTiming::SwappyVkGoogleDisplayTiming(JNIEnv* env, jobject jactivity,
-                                                         VkPhysicalDevice physicalDevice,
-                                                         VkDevice device,
-                                                         const SwappyVkFunctionProvider* provider)
-      : SwappyVkBase(env, jactivity, physicalDevice, device, provider) {
+SwappyVkGoogleDisplayTiming::SwappyVkGoogleDisplayTiming(
+        std::unique_ptr<SwappyPlatform> platform, VkPhysicalDevice physicalDevice, VkDevice device,
+        VkSwapchainKHR swapchain, PFN_vkQueuePresentKHR pfnQueuePresentKHR,
+        PFN_vkGetRefreshCycleDurationGOOGLE pfnGetRefreshCycleDurationGOOGLE,
+        PFN_vkGetPastPresentationTimingGOOGLE pfnGetPastPresentationTimingGOOGLE)
+      : SwappyVkBase(std::move(platform), physicalDevice, device, pfnQueuePresentKHR),
+        mSwapchain(swapchain),
+        mpfnGetRefreshCycleDurationGOOGLE(pfnGetRefreshCycleDurationGOOGLE),
+        mpfnGetPastPresentationTimingGOOGLE(pfnGetPastPresentationTimingGOOGLE) {
     mPendingFrames.reserve(MAX_FRAME_LAG + 1);
 }
 
 bool SwappyVkGoogleDisplayTiming::doGetRefreshCycleDuration(VkSwapchainKHR swapchain,
                                                             uint64_t* pRefreshDuration) {
-    if (!isEnabled()) {
-        SWAPPY_LOGE("Swappy is disabled.");
-        return false;
-    }
-
-    VkRefreshCycleDurationGOOGLE refreshCycleDuration;
+    VkRefreshCycleDurationGOOGLE refreshCycleDuration{};
     VkResult res = mpfnGetRefreshCycleDurationGOOGLE(mDevice, swapchain, &refreshCycleDuration);
     if (res != VK_SUCCESS) {
         SWAPPY_LOGE("mpfnGetRefreshCycleDurationGOOGLE failed %d", res);
         return false;
     }
 
-    *pRefreshDuration = mCommonBase.getRefreshPeriod().count();
-
-    // refreshRate is only used for logging, which maybe disabled.
-    [[maybe_unused]] double refreshRate = 1000000000.0 / *pRefreshDuration;
-    SWAPPY_LOGI("Returning refresh duration of %" PRIu64 " nsec (approx %f Hz)", *pRefreshDuration,
-                refreshRate);
-
+    *pRefreshDuration = reportRefreshCycleDuration();
     mSwapchain = swapchain;
     return true;
 }
 
 VkResult SwappyVkGoogleDisplayTiming::doQueuePresent(VkQueue queue, uint32_t queueFamilyIndex,
                                                      const VkPresentInfoKHR* pPresentInfo) {
-    if (!isEnabled()) {
-        SWAPPY_LOGE("Swappy is disabled.");
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
-
     VkResult res = initializeVkSyncObjects(queue, queueFamilyIndex);
     if (res) {
         return res;

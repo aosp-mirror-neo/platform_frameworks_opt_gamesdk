@@ -16,8 +16,7 @@
 
 #include "SwappyVkBase.h"
 
-#include "AndroidSwappyPlatform.h"
-#include "system_utils.h"
+#include <utility>
 
 #define LOG_TAG "SwappyVkBase"
 #include "SwappyLog.h"
@@ -42,8 +41,22 @@ PFN_vkBeginCommandBuffer vkBeginCommandBuffer = nullptr;
 PFN_vkEndCommandBuffer vkEndCommandBuffer = nullptr;
 PFN_vkQueueSubmit vkQueueSubmit = nullptr;
 
+bool AreVulkanFunctionsLoaded() {
+    return vkCreateCommandPool != nullptr && vkDestroyCommandPool != nullptr &&
+            vkCreateFence != nullptr && vkDestroyFence != nullptr && vkWaitForFences != nullptr &&
+            vkGetFenceStatus != nullptr && vkResetFences != nullptr &&
+            vkCreateSemaphore != nullptr && vkDestroySemaphore != nullptr &&
+            vkCreateEvent != nullptr && vkDestroyEvent != nullptr && vkCmdSetEvent != nullptr &&
+            vkAllocateCommandBuffers != nullptr && vkFreeCommandBuffers != nullptr &&
+            vkBeginCommandBuffer != nullptr && vkEndCommandBuffer != nullptr &&
+            vkQueueSubmit != nullptr;
+}
+
 void LoadVulkanFunctions(const SwappyVkFunctionProvider* pFunctionProvider) {
-    if (vkCreateCommandPool == nullptr) {
+    if (pFunctionProvider == nullptr || pFunctionProvider->getProcAddr == nullptr) {
+        return;
+    }
+    if (!AreVulkanFunctionsLoaded()) {
         vkCreateCommandPool = reinterpret_cast<PFN_vkCreateCommandPool>(
                 pFunctionProvider->getProcAddr("vkCreateCommandPool"));
         vkDestroyCommandPool = reinterpret_cast<PFN_vkDestroyCommandPool>(
@@ -101,36 +114,21 @@ void ResetVulkanFunctions() {
     vkQueueSubmit = nullptr;
 }
 
-SwappyVkBase::SwappyVkBase(JNIEnv* env, jobject jactivity, VkPhysicalDevice physicalDevice,
-                           VkDevice device, const SwappyVkFunctionProvider* pFunctionProvider)
-      : mCommonBase(createAndroidSwappyPlatform(env, jactivity)),
+SwappyVkBase::SwappyVkBase(std::unique_ptr<SwappyPlatform> platform,
+                           VkPhysicalDevice physicalDevice, VkDevice device,
+                           PFN_vkQueuePresentKHR pfnQueuePresentKHR)
+      : mCommonBase(std::move(platform)),
         mPhysicalDevice(physicalDevice),
         mDevice(device),
-        mpFunctionProvider(pFunctionProvider),
-        mInitialized(false),
-        mEnabled(false) {
-    if (!mCommonBase.isValid()) {
-        SWAPPY_LOGE("SwappyCommon could not initialize correctly.");
-        return;
-    }
+        mpfnQueuePresentKHR(pfnQueuePresentKHR) {}
 
-    mpfnGetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(
-            mpFunctionProvider->getProcAddr("vkGetDeviceProcAddr"));
-    mpfnQueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(
-            mpfnGetDeviceProcAddr(mDevice, "vkQueuePresentKHR"));
-
-    initGoogExtension();
-
-    mEnabled = !gamesdk::GetSystemPropAsBool(SWAPPY_SYSTEM_PROP_KEY_DISABLE, false);
-}
-
-void SwappyVkBase::initGoogExtension() {
-#if (not defined ANDROID_NDK_VERSION) || ANDROID_NDK_VERSION >= 15
-    mpfnGetRefreshCycleDurationGOOGLE = reinterpret_cast<PFN_vkGetRefreshCycleDurationGOOGLE>(
-            mpfnGetDeviceProcAddr(mDevice, "vkGetRefreshCycleDurationGOOGLE"));
-    mpfnGetPastPresentationTimingGOOGLE = reinterpret_cast<PFN_vkGetPastPresentationTimingGOOGLE>(
-            mpfnGetDeviceProcAddr(mDevice, "vkGetPastPresentationTimingGOOGLE"));
-#endif
+uint64_t SwappyVkBase::reportRefreshCycleDuration() const {
+    const uint64_t refreshDuration = mCommonBase.getRefreshPeriod().count();
+    // refreshRate is only used for logging, which maybe disabled.
+    [[maybe_unused]] const double refreshRate = 1000000000.0 / refreshDuration;
+    SWAPPY_LOGI("Returning refresh duration of %" PRIu64 " nsec (approx %f Hz)", refreshDuration,
+                refreshRate);
+    return refreshDuration;
 }
 
 SwappyVkBase::~SwappyVkBase() {
