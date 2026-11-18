@@ -150,7 +150,9 @@ private:
     void waitUntilTargetFrame();
     void waitOneFrame();
     void setPreferredDisplayModeId(int index) REQUIRES(mMutex);
-    void setPreferredRefreshPeriod(std::chrono::nanoseconds frameTime) REQUIRES(mMutex);
+    // The returned periods pointer stays valid while mMutex is held.
+    [[nodiscard]] VotableRefreshPeriods votableRefreshPeriods() const REQUIRES(mMutex);
+    void applyRefreshRateVote(const RefreshRateVote& vote) REQUIRES(mMutex);
     void refreshSupportedRefreshPeriods() EXCLUDES(mMutex);
     void updateDisplayTimings();
     void applyNextTimingSettings() REQUIRES(mMutex);
@@ -240,7 +242,6 @@ private:
 
     ANativeWindow* mWindow GUARDED_BY(mMutex) = nullptr;
     bool mWindowChanged GUARDED_BY(mMutex) = false;
-    DisplayRateController mDisplayRateController GUARDED_BY(mMutex);
 
     // Callback for last latency recorded - used for buffer stuffing fix.
     // Latency is returned in number of V-syncs

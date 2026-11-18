@@ -31,6 +31,7 @@ namespace {
 
 constexpr nanoseconds k60Hz = 16666667ns;
 constexpr nanoseconds k120Hz = 8333333ns;
+constexpr VotableRefreshPeriods kSetFrameRateVotable{.usesSetFrameRate = true};
 
 // Enough 60 Hz frames to span strictly more than FrameDurations' 2 s sample
 // window (> 120 intervals), so hasEnoughSamples() is satisfied.
@@ -46,6 +47,13 @@ TimePoint feed(FrameDurations& durations, TimePoint start, int count, nanosecond
     return now;
 }
 
+RefreshPeriodMap makePhysical60And120HzPeriods() {
+    RefreshPeriodMap periods;
+    insertRefreshPeriod(periods, k120Hz, 1);
+    insertRefreshPeriod(periods, k60Hz, 2);
+    return periods;
+}
+
 } // namespace
 
 TEST(ClassicPacingImplTest, InsufficientSamplesReturnsEmptyDecision) {
@@ -56,12 +64,12 @@ TEST(ClassicPacingImplTest, InsufficientSamplesReturnsEmptyDecision) {
 
     const PacingResult result =
             pacing.updateSwapInterval(state.autoSwapInterval, state.pipelineMode, durations, k60Hz,
-                                      0ns, 50ms, true);
+                                      0ns, 50ms, true, kSetFrameRateVotable);
 
     EXPECT_FALSE(result.configChanged);
     EXPECT_EQ(result.autoSwapInterval, 2);
     EXPECT_EQ(result.pipelineMode, PipelineMode::Off);
-    EXPECT_EQ(result.preferredRefreshPeriodHint, 0ns);
+    EXPECT_FALSE(result.vote.emitted());
     EXPECT_FALSE(durations.hasEnoughSamples());
 }
 
@@ -74,12 +82,13 @@ TEST(ClassicPacingImplTest, OverBudgetAdvancesIntervalAndClearsDurations) {
 
     const PacingResult result =
             pacing.updateSwapInterval(state.autoSwapInterval, state.pipelineMode, durations, k60Hz,
-                                      0ns, 50ms, true);
+                                      0ns, 50ms, true, kSetFrameRateVotable);
 
     EXPECT_TRUE(result.configChanged);
     EXPECT_EQ(result.autoSwapInterval, 2);
     EXPECT_EQ(result.pipelineMode, PipelineMode::On);
-    EXPECT_EQ(result.preferredRefreshPeriodHint, 22ms + FRAME_MARGIN);
+    ASSERT_TRUE(result.vote.frameRateHz.has_value());
+    EXPECT_NEAR(*result.vote.frameRateHz, 1e9f / 23'000'000.f, 0.05f);
     EXPECT_FALSE(durations.hasEnoughSamples());
 }
 
@@ -92,12 +101,13 @@ TEST(ClassicPacingImplTest, SteadyStatePreservesDurations) {
 
     const PacingResult result =
             pacing.updateSwapInterval(state.autoSwapInterval, state.pipelineMode, durations, k60Hz,
-                                      0ns, 50ms, true);
+                                      0ns, 50ms, true, kSetFrameRateVotable);
 
     EXPECT_FALSE(result.configChanged);
     EXPECT_EQ(result.autoSwapInterval, 1);
     EXPECT_EQ(result.pipelineMode, PipelineMode::Off);
-    EXPECT_EQ(result.preferredRefreshPeriodHint, 8ms + FRAME_MARGIN);
+    ASSERT_TRUE(result.vote.frameRateHz.has_value());
+    EXPECT_NEAR(*result.vote.frameRateHz, 1e9f / 9'000'000.f, 0.05f);
     EXPECT_TRUE(durations.hasEnoughSamples());
 }
 
@@ -112,16 +122,17 @@ TEST(ClassicPacingImplTest, MissedFramesWithinBudgetRestoresPipeliningWithoutCle
 
     const PacingResult result =
             pacing.updateSwapInterval(state.autoSwapInterval, state.pipelineMode, durations, k60Hz,
-                                      0ns, 50ms, true);
+                                      0ns, 50ms, true, kSetFrameRateVotable);
 
     EXPECT_FALSE(result.configChanged);
     EXPECT_EQ(result.autoSwapInterval, 2);
     EXPECT_EQ(result.pipelineMode, PipelineMode::On);
-    EXPECT_EQ(result.preferredRefreshPeriodHint, 22ms + FRAME_MARGIN);
+    ASSERT_TRUE(result.vote.frameRateHz.has_value());
+    EXPECT_NEAR(*result.vote.frameRateHz, 1e9f / 23'000'000.f, 0.05f);
     EXPECT_TRUE(durations.hasEnoughSamples());
 }
 
-TEST(ClassicPacingImplTest, DisplayTimingChangeUsesMeasuredPipelineFrameTime) {
+TEST(ClassicPacingImplTest, DisplayTimingChangeUsesMeasuredPipelineFrameTimeAndInitialVote) {
     ClassicPacingImplementation pacing;
     LadderState state = {1, PipelineMode::On};
     FrameDurations durations;
@@ -135,12 +146,14 @@ TEST(ClassicPacingImplTest, DisplayTimingChangeUsesMeasuredPipelineFrameTime) {
 
     const PacingResult result =
             pacing.onDisplayTimingsChanged(state.autoSwapInterval, state.pipelineMode, durations,
-                                           change);
+                                           change, kSetFrameRateVotable);
 
     EXPECT_FALSE(result.configChanged);
     EXPECT_EQ(result.autoSwapInterval, 3);
     EXPECT_EQ(result.pipelineMode, PipelineMode::On);
-    EXPECT_EQ(result.preferredRefreshPeriodHint, 0ns);
+    ASSERT_TRUE(result.vote.frameRateHz.has_value());
+    EXPECT_NEAR(*result.vote.frameRateHz, 120.0f, 0.05f);
+    EXPECT_FALSE(durations.hasEnoughSamples());
 }
 
 TEST(ClassicPacingImplTest, DisplayTimingChangeFallsBackWhenNoSamples) {
@@ -160,7 +173,34 @@ TEST(ClassicPacingImplTest, DisplayTimingChangeFallsBackWhenNoSamples) {
     EXPECT_FALSE(result.configChanged);
     EXPECT_EQ(result.autoSwapInterval, 2);
     EXPECT_EQ(result.pipelineMode, PipelineMode::On);
-    EXPECT_EQ(result.preferredRefreshPeriodHint, 0ns);
+    EXPECT_FALSE(result.vote.emitted());
+}
+
+TEST(ClassicPacingImplTest, DisplayTimingChangeSelectsLegacyDisplayModeAndWindowChangeRearmsVote) {
+    ClassicPacingImplementation pacing;
+    const RefreshPeriodMap periods = makePhysical60And120HzPeriods();
+    const VotableRefreshPeriods legacyVotable{.periods = &periods, .usesSetFrameRate = false};
+
+    FrameDurations durations;
+    TimingChange change{
+            .newRefreshPeriod = k120Hz,
+            .swapDuration = k60Hz,
+            .swapDurationChanged = true,
+    };
+    const PacingResult modeResult =
+            pacing.onDisplayTimingsChanged(1, PipelineMode::On, durations, change, legacyVotable);
+    EXPECT_EQ(modeResult.autoSwapInterval, 2);
+    ASSERT_TRUE(modeResult.vote.displayModeId.has_value());
+    EXPECT_EQ(*modeResult.vote.displayModeId, 2);
+
+    const RefreshRateVote firstArrVote =
+            pacing.voteRefreshPeriod(k60Hz, k60Hz, kSetFrameRateVotable);
+    ASSERT_TRUE(firstArrVote.frameRateHz.has_value());
+    EXPECT_EQ(firstArrVote.traceValue, 60);
+    EXPECT_FALSE(pacing.voteRefreshPeriod(k60Hz, k60Hz, kSetFrameRateVotable).emitted());
+
+    pacing.onWindowChanged();
+    EXPECT_TRUE(pacing.voteRefreshPeriod(k60Hz, k60Hz, kSetFrameRateVotable).emitted());
 }
 
 TEST(ClassicPacingImplTest, PolymorphicInvocationThroughPacingImplementation) {
@@ -176,7 +216,10 @@ TEST(ClassicPacingImplTest, PolymorphicInvocationThroughPacingImplementation) {
     EXPECT_TRUE(result.configChanged);
     EXPECT_EQ(result.autoSwapInterval, 2);
 
-    // Verify polymorphic onDisplayTimingsChanged()
+    // Verify polymorphic onWindowChanged(), voteRefreshPeriod(), and onDisplayTimingsChanged()
+    impl->onWindowChanged();
+    EXPECT_TRUE(impl->voteRefreshPeriod(k60Hz, k60Hz, kSetFrameRateVotable).emitted());
+
     TimingChange change;
     change.newRefreshPeriod = k60Hz;
     change.swapDuration = 33333334ns;

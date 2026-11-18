@@ -17,7 +17,6 @@
 #include "SwappyCommon.h"
 
 #include <algorithm>
-#include <cmath>
 #include <utility>
 
 #include "ClassicPacingImpl.h"
@@ -236,7 +235,8 @@ void SwappyCommon::updateDisplayTimings() {
     }
     if (mFramePacingResetRequested) {
         // In case of reset, just issue the update for setting refresh period.
-        setPreferredRefreshPeriod(mInitialRefreshPeriod);
+        applyRefreshRateVote(mPacingImpl->voteRefreshPeriod(mInitialRefreshPeriod, mSwapDuration,
+                                                            votableRefreshPeriods()));
         mFramePacingResetRequested = false;
         return;
     }
@@ -260,35 +260,24 @@ void SwappyCommon::applyNextTimingSettings() {
         return;
     }
 
+    const bool swapDurationChanged = mSwapDuration != mNextTimingSettings.swapDuration;
     const TimingChange change{
+            .oldRefreshPeriod = mCommonSettings.refreshPeriod,
             .newRefreshPeriod = mNextTimingSettings.refreshPeriod,
-            .swapDuration = mSwapDuration,
+            .swapDuration = mNextTimingSettings.swapDuration,
+            .swapDurationChanged = swapDurationChanged,
+            .autoSwapIntervalEnabled = mAutoSwapIntervalEnabled,
     };
     mWindowChanged = false;
     mCommonSettings.refreshPeriod = mNextTimingSettings.refreshPeriod;
+    mSwapDuration = mNextTimingSettings.swapDuration;
 
     const PacingResult timingResult =
             mPacingImpl->onDisplayTimingsChanged(mAutoSwapInterval, mPipelineMode, mFrameDurations,
-                                                 change);
+                                                 change, votableRefreshPeriods());
     mAutoSwapInterval = timingResult.autoSwapInterval;
     mPipelineMode = timingResult.pipelineMode;
-
-    const bool swapIntervalValid = mNextTimingSettings.refreshPeriod * mAutoSwapInterval >=
-            mNextTimingSettings.swapDuration;
-    const bool swapIntervalChangedBySettings = mSwapDuration != mNextTimingSettings.swapDuration;
-
-    mSwapDuration = mNextTimingSettings.swapDuration;
-    if (!mAutoSwapIntervalEnabled || swapIntervalChangedBySettings || !swapIntervalValid) {
-        mAutoSwapInterval = calculateSwapInterval(mSwapDuration, mCommonSettings.refreshPeriod);
-        mPipelineMode = PipelineMode::On;
-        setPreferredRefreshPeriod(mSwapDuration);
-    }
-
-    if (!mDisplayRateController.hasVoted()) {
-        setPreferredRefreshPeriod(mSwapDuration);
-    }
-
-    mFrameDurations.clear();
+    applyRefreshRateVote(timingResult.vote);
 
     TRACE_INT("mSwapDuration", int(mSwapDuration.count()));
     TRACE_INT("mAutoSwapInterval", mAutoSwapInterval);
@@ -416,15 +405,13 @@ bool SwappyCommon::updateSwapInterval() {
             mPacingImpl->updateSwapInterval(mAutoSwapInterval, mPipelineMode, mFrameDurations,
                                             mCommonSettings.refreshPeriod, mSwapDuration,
                                             mAutoSwapIntervalThreshold.load(),
-                                            mPipelineModeAutoMode);
+                                            mPipelineModeAutoMode, votableRefreshPeriods());
 
     // Applied unconditionally: swapSlower() can restore pipelining without
     // reporting a config change.
     mAutoSwapInterval = result.autoSwapInterval;
     mPipelineMode = result.pipelineMode;
-    if (result.preferredRefreshPeriodHint.count() > 0) {
-        setPreferredRefreshPeriod(result.preferredRefreshPeriodHint);
-    }
+    applyRefreshRateVote(result.vote);
 
     return result.configChanged;
 }
@@ -529,26 +516,25 @@ void SwappyCommon::setPreferredDisplayModeId(int modeId) {
     mPlatform->setPreferredDisplayModeId(modeId);
 }
 
-void SwappyCommon::setPreferredRefreshPeriod(nanoseconds frameTime) {
-    if (mPlatform && mPlatform->supportsSetFrameRate() && mWindow) {
-        const auto votedHz = mDisplayRateController.voteFrameRateHz(frameTime, mSwapDuration);
-        if (votedHz.has_value()) {
-            mPlatform->setFrameRate(mWindow, *votedHz);
-        }
+VotableRefreshPeriods SwappyCommon::votableRefreshPeriods() const {
+    if (!mPlatform) {
+        return VotableRefreshPeriods{};
+    }
+    return VotableRefreshPeriods{
+            .periods = mSupportedRefreshPeriods.get(),
+            .usesSetFrameRate = mPlatform->supportsSetFrameRate() && mWindow != nullptr,
+    };
+}
 
-        TRACE_INT("preferredRefreshPeriod",
-                  static_cast<int>(std::lround(mDisplayRateController.lastVotedFrameRateHz())));
-    } else {
-        if (!mPlatform || !mSupportedRefreshPeriods) {
-            return;
-        }
-        const auto selection =
-                mDisplayRateController.selectDisplayMode(mSupportedRefreshPeriods.get(), frameTime,
-                                                         mSwapDuration);
-        TRACE_INT("preferredRefreshPeriod", selection.refreshPeriod.count());
-        if (selection.changed) {
-            setPreferredDisplayModeId(selection.modeId);
-        }
+void SwappyCommon::applyRefreshRateVote(const RefreshRateVote& vote) {
+    if (vote.frameRateHz.has_value() && mPlatform && mWindow) {
+        mPlatform->setFrameRate(mWindow, *vote.frameRateHz);
+    }
+    if (vote.displayModeId.has_value()) {
+        setPreferredDisplayModeId(*vote.displayModeId);
+    }
+    if (vote.traceValue.has_value()) {
+        TRACE_INT("preferredRefreshPeriod", *vote.traceValue);
     }
 }
 
@@ -683,7 +669,7 @@ void SwappyCommon::setANativeWindow(ANativeWindow* window) {
             mPlatform->acquireWindow(mWindow);
         }
         mWindowChanged = true;
-        mDisplayRateController.onWindowChanged();
+        mPacingImpl->onWindowChanged();
     }
 }
 

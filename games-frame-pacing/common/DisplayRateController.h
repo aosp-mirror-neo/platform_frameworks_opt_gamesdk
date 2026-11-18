@@ -113,4 +113,13 @@ private:
     int mLastModeId = -1;
 };
 
+// Platform refresh-rate voting path and currently reported refresh periods.
+struct VotableRefreshPeriods {
+    // Non-owning pointer; null until the platform reports refresh periods.
+    const RefreshPeriodMap* periods = nullptr;
+    // True when ANativeWindow_setFrameRate is active on a bound window; false
+    // selects physical Display.Modes via preferredDisplayModeId.
+    bool usesSetFrameRate = false;
+};
+
 } // namespace swappy

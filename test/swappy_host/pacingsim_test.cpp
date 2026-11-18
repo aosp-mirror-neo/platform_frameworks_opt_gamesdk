@@ -36,12 +36,13 @@ namespace {
 
 using namespace std::chrono_literals;
 using swappy::ClassicPacingImplementation;
-using swappy::DisplayRateController;
 using swappy::FrameDuration;
 using swappy::FrameDurations;
 using swappy::PacingResult;
 using swappy::PipelineMode;
+using swappy::RefreshRateVote;
 using swappy::TimingChange;
+using swappy::VotableRefreshPeriods;
 using swappy::testing::DisplayPanelModel;
 using swappy::testing::SimulatedDisplayPanel;
 using swappy::testing::SimulatedGpuQueue;
@@ -223,27 +224,35 @@ private:
         mDurations.add(FrameDuration{cpuTime, gpuTime, frameMissed}, mNow);
     }
 
+    [[nodiscard]] VotableRefreshPeriods votablePeriods() const noexcept {
+        return VotableRefreshPeriods{
+                .periods = mPanel.supportedPeriods().get(),
+                .usesSetFrameRate = true,
+        };
+    }
+
+    void applyVote(const RefreshRateVote& vote) {
+        if (vote.frameRateHz.has_value()) {
+            mPanel.onFrameRateVote(*vote.frameRateHz);
+        }
+        if (vote.displayModeId.has_value()) {
+            mPanel.onModeIdVote(*vote.displayModeId);
+        }
+    }
+
     void updateSwapInterval() {
         const int32_t previousInterval = mAutoSwapInterval;
         const PacingResult result =
                 mPacing.updateSwapInterval(mAutoSwapInterval, mPipelineMode, mDurations,
                                            mRefreshPeriod, mSwapDuration,
                                            kAutoSwapIntervalThreshold,
-                                           /*pipelineModeAutoMode=*/true);
+                                           /*pipelineModeAutoMode=*/true, votablePeriods());
         mAutoSwapInterval = result.autoSwapInterval;
         mPipelineMode = result.pipelineMode;
         if (result.configChanged && mAutoSwapInterval != previousInterval) {
             ++mIntervalTransitions;
         }
-        if (result.preferredRefreshPeriodHint > 0ns) {
-            issueRefreshRateVote(result.preferredRefreshPeriodHint);
-        }
-    }
-
-    void issueRefreshRateVote(std::chrono::nanoseconds targetPeriod) {
-        if (const auto votedHz = mRateController.voteFrameRateHz(targetPeriod, mSwapDuration)) {
-            mPanel.onFrameRateVote(*votedHz);
-        }
+        applyVote(result.vote);
     }
 
     void advanceClockTo(FrameDurations::TimePoint target) {
@@ -267,9 +276,8 @@ private:
 
     void updateDisplayTimings() {
         const auto newPeriod = mPanel.activePeriod();
-        const bool swapIntervalChangedBySettings = mSwapDuration != mConfig.swapDuration;
-        if (!mTimingSettingsNeedUpdate && newPeriod == mRefreshPeriod &&
-            !swapIntervalChangedBySettings) {
+        const bool swapDurationChanged = mSwapDuration != mConfig.swapDuration;
+        if (!mTimingSettingsNeedUpdate && newPeriod == mRefreshPeriod && !swapDurationChanged) {
             return;
         }
         mTimingSettingsNeedUpdate = false;
@@ -279,33 +287,25 @@ private:
         const TimingChange change{
                 .oldRefreshPeriod = mRefreshPeriod,
                 .newRefreshPeriod = newPeriod,
-                .swapDuration = mSwapDuration,
+                .swapDuration = mConfig.swapDuration,
+                .swapDurationChanged = swapDurationChanged,
+                .autoSwapIntervalEnabled = true,
         };
         mRefreshPeriod = newPeriod;
+        mSwapDuration = mConfig.swapDuration;
         if (panelPeriodChanged) {
             ++mPanelTransitions;
         }
 
         const PacingResult timingResult =
                 mPacing.onDisplayTimingsChanged(mAutoSwapInterval, mPipelineMode, mDurations,
-                                                change);
+                                                change, votablePeriods());
         mAutoSwapInterval = timingResult.autoSwapInterval;
         mPipelineMode = timingResult.pipelineMode;
-
-        const bool swapIntervalValid = mRefreshPeriod * mAutoSwapInterval >= mConfig.swapDuration;
-        mSwapDuration = mConfig.swapDuration;
-        if (swapIntervalChangedBySettings || !swapIntervalValid) {
-            mAutoSwapInterval = swappy::calculateSwapInterval(mSwapDuration, mRefreshPeriod);
-            mPipelineMode = PipelineMode::On;
-            issueRefreshRateVote(mSwapDuration);
-        }
-        if (!mRateController.hasVoted()) {
-            issueRefreshRateVote(mSwapDuration);
-        }
+        applyVote(timingResult.vote);
         if (mAutoSwapInterval != previousInterval) {
             ++mIntervalTransitions;
         }
-        mDurations.clear();
     }
 
     void startFrame() {
@@ -321,7 +321,6 @@ private:
 
     FrameDurations mDurations;
     ClassicPacingImplementation mPacing;
-    DisplayRateController mRateController;
     SimulatedGpuQueue mGpuQueue;
 
     FrameDurations::TimePoint mNow{};
