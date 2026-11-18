@@ -140,16 +140,22 @@ bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
     bool presentationTimeIsNeeded;
 
     // We do not want to hold the mutex while waiting, so make a local copy of
-    // the flags.
-    mMutex.lock();
-    bool localAutoSwapIntervalEnabled = mAutoSwapIntervalEnabled;
-    PipelineMode localPipelineMode = mPipelineMode;
-    bool localFramePacingEnabled = mFramePacingEnabled;
-
-    // We do the blocking wait when pacing or request by the app when not
-    // pacing.
-    bool localBlockingWaitEnabled = mBlockingWaitEnabled || mFramePacingEnabled;
-    mMutex.unlock();
+    // the flags and current pacing configuration.
+    nanoseconds pacedPeriod;
+    PipelineMode localPipelineMode;
+    bool localAutoSwapIntervalEnabled;
+    bool localFramePacingEnabled;
+    bool localBlockingWaitEnabled;
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        pacedPeriod = mCommonSettings.refreshPeriod * mAutoSwapInterval;
+        localPipelineMode = mActiveSwapPipelineMode.value_or(mPipelineMode);
+        localAutoSwapIntervalEnabled = mAutoSwapIntervalEnabled;
+        localFramePacingEnabled = mFramePacingEnabled;
+        // We do the blocking wait when pacing or request by the app when not
+        // pacing.
+        localBlockingWaitEnabled = mBlockingWaitEnabled || mFramePacingEnabled;
+    }
 
     const nanoseconds cpuTime =
             mStartFrameTime.has_value() ? (mClock.now() - *mStartFrameTime) : 0ns;
@@ -161,8 +167,7 @@ bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
     // if we are running slower than the threshold (if auto swap interval is
     // enabled) there is no point to sleep,
     // just let the app run as fast as it can
-    if (mCommonSettings.refreshPeriod * mAutoSwapInterval <= mAutoSwapIntervalThreshold.load() ||
-        !localAutoSwapIntervalEnabled) {
+    if (pacedPeriod <= mAutoSwapIntervalThreshold.load() || !localAutoSwapIntervalEnabled) {
         if (localFramePacingEnabled) {
             waitUntilTargetFrame();
             std::lock_guard<std::mutex> lock(mWaitingMutex);
@@ -177,7 +182,9 @@ bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
             }
         }
 
-        mPresentationTime += lateFrames * mCommonSettings.refreshPeriod;
+        if (lateFrames > 0) {
+            mPresentationTime += lateFrames * getRefreshPeriod();
+        }
         presentationTimeIsNeeded = localFramePacingEnabled;
     } else {
         if (localFramePacingEnabled) {
@@ -217,11 +224,6 @@ bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
 }
 
 void SwappyCommon::updateDisplayTimings() {
-    // grab a pointer to the latest supported refresh rates
-    if (mPlatform) {
-        mSupportedRefreshPeriods = mPlatform->getSupportedRefreshPeriods();
-    }
-
     std::lock_guard<std::mutex> lock(mMutex);
     SWAPPY_LOGW_ONCE_IF(!mWindow,
                         "ANativeWindow not configured, frame rate will not be "
@@ -247,6 +249,10 @@ void SwappyCommon::updateDisplayTimings() {
         return;
     }
 
+    applyNextTimingSettings();
+}
+
+void SwappyCommon::applyNextTimingSettings() {
     mTimingSettingsNeedUpdate = false;
 
     if (!mWindowChanged && mCommonSettings.refreshPeriod == mNextTimingSettings.refreshPeriod &&
@@ -295,13 +301,21 @@ void SwappyCommon::onPreSwap(const SwapHandlers& h) {
         mPlatform->postFrameCallbacks();
     }
 
+    PipelineMode pipelineMode;
+    nanoseconds pacedPeriod;
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mActiveSwapPipelineMode = mPipelineMode;
+        pipelineMode = mPipelineMode;
+        pacedPeriod = mCommonSettings.refreshPeriod * mAutoSwapInterval;
+    }
+
     // for non pipeline mode where both cpu and gpu work is done at the same
     // stage wait for next frame will happen after swap
-    if (mPipelineMode == PipelineMode::On) {
+    if (pipelineMode == PipelineMode::On) {
         mPresentationTimeNeeded = waitForNextFrame(h);
     } else {
-        mPresentationTimeNeeded = (mCommonSettings.refreshPeriod * mAutoSwapInterval <=
-                                   mAutoSwapIntervalThreshold.load());
+        mPresentationTimeNeeded = (pacedPeriod <= mAutoSwapIntervalThreshold.load());
     }
 
     mSwapTime = mClock.now();
@@ -313,12 +327,24 @@ void SwappyCommon::onPostSwap(const SwapHandlers& h) {
 
     updateMeasuredSwapDuration(mClock.now() - mSwapTime);
 
-    if (mPipelineMode == PipelineMode::Off) {
+    PipelineMode swapPipelineMode;
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        swapPipelineMode = mActiveSwapPipelineMode.value_or(mPipelineMode);
+    }
+    if (swapPipelineMode == PipelineMode::Off) {
         waitForNextFrame(h);
     }
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mActiveSwapPipelineMode.reset();
+    }
+
+    refreshSupportedRefreshPeriods();
 
     if (updateSwapInterval()) {
         swapIntervalChangedCallbacks();
+        std::lock_guard<std::mutex> lock(mMutex);
         TRACE_INT("mPipelineMode", static_cast<int>(mPipelineMode));
         TRACE_INT("mAutoSwapInterval", mAutoSwapInterval);
     }
@@ -338,15 +364,26 @@ void SwappyCommon::updateMeasuredSwapDuration(nanoseconds duration) {
     // as app startup, which can cause some stuttering as the smoothing catches
     // up with the actual duration. By clamping, we reduce the maximum error
     // which reduces the calibration time.
-    if (mMeasuredSwapDuration.load() > (mCommonSettings.refreshPeriod / 2)) {
-        mMeasuredSwapDuration.store(mCommonSettings.refreshPeriod / 2);
+    const nanoseconds halfRefreshPeriod = getRefreshPeriod() / 2;
+    if (mMeasuredSwapDuration.load() > halfRefreshPeriod) {
+        mMeasuredSwapDuration.store(halfRefreshPeriod);
     }
 }
 
-nanoseconds SwappyCommon::getSwapDuration() {
+nanoseconds SwappyCommon::getSwapDuration() const {
     std::lock_guard<std::mutex> lock(mMutex);
     return mAutoSwapInterval * mCommonSettings.refreshPeriod;
-};
+}
+
+SwappyCommon::PipelineMode SwappyCommon::getCurrentPipelineMode() const {
+    std::lock_guard<std::mutex> lock(mMutex);
+    return mActiveSwapPipelineMode.value_or(mPipelineMode);
+}
+
+nanoseconds SwappyCommon::getRefreshPeriod() const {
+    std::lock_guard<std::mutex> lock(mMutex);
+    return mCommonSettings.refreshPeriod;
+}
 
 void SwappyCommon::addFrameDuration(FrameDuration duration, bool previousFrameMissed) {
     SWAPPY_LOGV("cpuTime = %.2f", duration.getCpuTime().count() / 1e6f);
@@ -517,8 +554,9 @@ void SwappyCommon::setPreferredRefreshPeriod(nanoseconds frameTime) {
 
 void SwappyCommon::onSettingsChanged() {
     std::lock_guard<std::mutex> lock(mMutex);
-
-    TimingSettings timingSettings = TimingSettings::from(*Settings::getInstance());
+    // Settings::mMutex is a leaf lock released before notifyListeners(), so
+    // reading inside mMutex linearizes concurrent Settings updates safely.
+    const TimingSettings timingSettings = TimingSettings::from(*Settings::getInstance());
 
     // If display timings has changed, cache the update and apply them on the
     // next frame
@@ -544,14 +582,24 @@ void SwappyCommon::startFrame() {
     // Whether to add a wait to fix buffer stuffing.
     bool waitFrame = false;
 
-    const int intervals = (mPipelineMode == PipelineMode::On) ? 2 : 1;
+    nanoseconds refreshPeriod;
+    int32_t autoSwapInterval;
+    PipelineMode pipelineMode;
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        refreshPeriod = mCommonSettings.refreshPeriod;
+        autoSwapInterval = mAutoSwapInterval;
+        pipelineMode = mPipelineMode;
+    }
+
+    const int intervals = (pipelineMode == PipelineMode::On) ? 2 : 1;
 
     // Use frame statistics to fix any buffer stuffing
     if (mBufferStuffingFixWait > 0 && mLastLatencyRecorded) {
         int32_t lastLatency = mLastLatencyRecorded();
-        int expectedLatency = mAutoSwapInterval * intervals;
-        if (sfToVsyncDelay) {
-            expectedLatency += *sfToVsyncDelay / mCommonSettings.refreshPeriod;
+        int expectedLatency = autoSwapInterval * intervals;
+        if (sfToVsyncDelay && refreshPeriod > 0ns) {
+            expectedLatency += *sfToVsyncDelay / refreshPeriod;
         }
         TRACE_INT("ExpectedLatency", expectedLatency);
         if (mBufferStuffingFixCounter == 0) {
@@ -570,21 +618,20 @@ void SwappyCommon::startFrame() {
             TRACE_INT("BufferStuffingFix", mBufferStuffingFixCounter);
         }
     }
-    mTargetFrame = currentFrame + mAutoSwapInterval;
+    mTargetFrame = currentFrame + autoSwapInterval;
     if (waitFrame) mTargetFrame += 1;
 
     // If available, use the SF to Vsync delay to target the specific
     // vsync instead of guessing when the vsync is going to be
     if (sfToVsyncDelay) {
-        currentFrameTimestamp += *sfToVsyncDelay - mCommonSettings.refreshPeriod / 2 -
-                mMeasuredSwapDuration.load() - 1ms;
+        currentFrameTimestamp +=
+                *sfToVsyncDelay - refreshPeriod / 2 - mMeasuredSwapDuration.load() - 1ms;
     }
 
     // We compute the target time as now
     //   + the time the buffer will be on the GPU and in the queue to the
     //   compositor (1 swap period)
-    mPresentationTime =
-            currentFrameTimestamp + (mAutoSwapInterval * intervals) * mCommonSettings.refreshPeriod;
+    mPresentationTime = currentFrameTimestamp + (autoSwapInterval * intervals) * refreshPeriod;
 
     mStartFrameTime = mClock.now();
     mCPUTracer.startTrace();
@@ -640,12 +687,26 @@ void SwappyCommon::setANativeWindow(ANativeWindow* window) {
     }
 }
 
-int SwappyCommon::getSupportedRefreshPeriodsNS(uint64_t* out_refreshrates, int allocated_entries) {
-    if (mPlatform) {
-        mSupportedRefreshPeriods = mPlatform->getSupportedRefreshPeriods();
+void SwappyCommon::refreshSupportedRefreshPeriods() {
+    if (!mPlatform) {
+        return;
     }
+    // The display manager blocks this query until it reports its modes, so it
+    // runs before mMutex is taken.
+    auto supportedRefreshPeriods = mPlatform->getSupportedRefreshPeriods();
+    std::lock_guard<std::mutex> lock(mMutex);
+    mSupportedRefreshPeriods = std::move(supportedRefreshPeriods);
+}
 
-    return copyRefreshPeriods(mSupportedRefreshPeriods.get(), out_refreshrates, allocated_entries);
+int SwappyCommon::getSupportedRefreshPeriodsNS(uint64_t* out_refreshrates, int allocated_entries) {
+    refreshSupportedRefreshPeriods();
+
+    std::shared_ptr<RefreshPeriodMap> supportedRefreshPeriods;
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        supportedRefreshPeriods = mSupportedRefreshPeriods;
+    }
+    return copyRefreshPeriods(supportedRefreshPeriods.get(), out_refreshrates, allocated_entries);
 }
 
 void SwappyCommon::resetFramePacing() {

@@ -61,7 +61,7 @@ public:
 
     ~SwappyCommon();
 
-    std::chrono::nanoseconds getSwapDuration();
+    std::chrono::nanoseconds getSwapDuration() const;
 
     void onChoreographer(int64_t frameTimeNanos);
 
@@ -73,9 +73,7 @@ public:
 
     void onPostSwap(const SwapHandlers& h);
 
-    PipelineMode getCurrentPipelineMode() {
-        return mPipelineMode;
-    }
+    PipelineMode getCurrentPipelineMode() const;
 
     template <typename... T>
     struct Tracer {
@@ -97,9 +95,7 @@ public:
     Clock::time_point getPresentationTime() {
         return mPresentationTime;
     }
-    std::chrono::nanoseconds getRefreshPeriod() const {
-        return mCommonSettings.refreshPeriod;
-    }
+    std::chrono::nanoseconds getRefreshPeriod() const;
 
     bool isValid() {
         return mValid;
@@ -155,7 +151,9 @@ private:
     void waitOneFrame();
     void setPreferredDisplayModeId(int index) REQUIRES(mMutex);
     void setPreferredRefreshPeriod(std::chrono::nanoseconds frameTime) REQUIRES(mMutex);
+    void refreshSupportedRefreshPeriods() EXCLUDES(mMutex);
     void updateDisplayTimings();
+    void applyNextTimingSettings() REQUIRES(mMutex);
 
     // Waits for the next frame, considering both Choreographer and the prior
     // frame's completion
@@ -164,7 +162,9 @@ private:
     std::unique_ptr<SwappyPlatform> mPlatform;
     const Clock& mClock;
 
-    SwappyCommonSettings mCommonSettings{};
+    mutable std::mutex mMutex;
+
+    SwappyCommonSettings mCommonSettings GUARDED_BY(mMutex){};
 
     std::unique_ptr<ChoreographerFilter> mChoreographerFilter;
 
@@ -179,15 +179,13 @@ private:
 
     Clock::time_point mSwapTime{};
 
-    std::mutex mMutex;
-
     FrameDurations mFrameDurations GUARDED_BY(mMutex);
 
     bool mAutoSwapIntervalEnabled GUARDED_BY(mMutex) = true;
     bool mPipelineModeAutoMode GUARDED_BY(mMutex) = true;
 
-    std::chrono::nanoseconds mSwapDuration = 0ns;
-    int32_t mAutoSwapInterval;
+    std::chrono::nanoseconds mSwapDuration GUARDED_BY(mMutex) = 0ns;
+    int32_t mAutoSwapInterval GUARDED_BY(mMutex);
     std::atomic<std::chrono::nanoseconds> mAutoSwapIntervalThreshold = {50ms}; // 20FPS
 
     std::optional<Clock::time_point> mStartFrameTime;
@@ -206,13 +204,14 @@ private:
     int32_t mTargetFrame = 0;
     Clock::time_point mPresentationTime;
     bool mPresentationTimeNeeded;
-    PipelineMode mPipelineMode = PipelineMode::On;
+    PipelineMode mPipelineMode GUARDED_BY(mMutex) = PipelineMode::On;
+    std::optional<PipelineMode> mActiveSwapPipelineMode GUARDED_BY(mMutex);
 
     bool mValid;
 
     std::chrono::nanoseconds mFenceTimeout = std::chrono::nanoseconds(50ms);
 
-    std::shared_ptr<RefreshPeriodMap> mSupportedRefreshPeriods;
+    std::shared_ptr<RefreshPeriodMap> mSupportedRefreshPeriods GUARDED_BY(mMutex);
 
     struct TimingSettings {
         std::chrono::nanoseconds refreshPeriod = {};
@@ -266,7 +265,8 @@ private:
     bool mFramePacingEnabled GUARDED_BY(mMutex) = true;
     bool mBlockingWaitEnabled GUARDED_BY(mMutex) = true;
 
-    std::unique_ptr<PacingImplementation> mPacingImpl = PacingImplementation::create();
+    std::unique_ptr<PacingImplementation> mPacingImpl GUARDED_BY(mMutex) =
+            PacingImplementation::create();
 };
 
 } // namespace swappy

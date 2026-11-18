@@ -16,12 +16,14 @@
 
 #include "SwappyCommon.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -100,6 +102,125 @@ SwappyCommon::SwapHandlers readySwapHandlers(std::chrono::nanoseconds gpuTime = 
         }
     }
     return true;
+}
+
+[[nodiscard]] bool exerciseConcurrentPacingReaders(SwappyCommon& swappy,
+                                                   const SwappyCommon& constSwappy, int swapCount) {
+    std::atomic<bool> readerReady{false};
+    std::atomic<bool> startSignal{false};
+    std::atomic<bool> stopSignal{false};
+    std::atomic<bool> observedInvalidState{false};
+
+    std::thread reader([&constSwappy, &readerReady, &startSignal, &stopSignal,
+                        &observedInvalidState] {
+        readerReady.store(true, std::memory_order_release);
+        while (!startSignal.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        do {
+            const auto refreshPeriod = constSwappy.getRefreshPeriod();
+            const auto swapDuration = constSwappy.getSwapDuration();
+            const auto pipelineMode = constSwappy.getCurrentPipelineMode();
+            if ((refreshPeriod != kFastTickPeriod && refreshPeriod != 2 * kFastTickPeriod) ||
+                swapDuration < kFastTickPeriod ||
+                (pipelineMode != PipelineMode::On && pipelineMode != PipelineMode::Off)) {
+                observedInvalidState.store(true, std::memory_order_relaxed);
+            }
+        } while (!stopSignal.load(std::memory_order_acquire));
+    });
+
+    const auto handlers = readySwapHandlers(200us);
+    while (!readerReady.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    startSignal.store(true, std::memory_order_release);
+    for (int i = 0; i < swapCount; ++i) {
+        const auto nextPeriod = (i % 2 == 0) ? (2 * kFastTickPeriod) : kFastTickPeriod;
+        Settings::getInstance()->setDisplayTimings({nextPeriod, 0ns, 0ns});
+        swappy.setAutoSwapInterval(false);
+        swappy.setAutoSwapInterval(true);
+        swappy.setAutoPipelineMode((i % 2) == 0);
+        swappy.onPreSwap(handlers);
+        swappy.onPostSwap(handlers);
+    }
+    stopSignal.store(true, std::memory_order_release);
+    reader.join();
+
+    return !observedInvalidState.load(std::memory_order_relaxed);
+}
+
+[[nodiscard]] bool exerciseConcurrentSupportedRefreshPeriodQueries(SwappyCommon& swappy,
+                                                                   int swapCount,
+                                                                   int expectedPeriodCount) {
+    std::atomic<bool> readerReady{false};
+    std::atomic<bool> startSignal{false};
+    std::atomic<bool> stopSignal{false};
+    std::atomic<bool> observedUnexpectedCount{false};
+
+    std::thread reader([&swappy, &readerReady, &startSignal, &stopSignal, &observedUnexpectedCount,
+                        expectedPeriodCount] {
+        readerReady.store(true, std::memory_order_release);
+        while (!startSignal.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        do {
+            if (swappy.getSupportedRefreshPeriodsNS(nullptr, 0) != expectedPeriodCount) {
+                observedUnexpectedCount.store(true, std::memory_order_relaxed);
+            }
+        } while (!stopSignal.load(std::memory_order_acquire));
+    });
+
+    const auto handlers = readySwapHandlers(200us);
+    while (!readerReady.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    startSignal.store(true, std::memory_order_release);
+    for (int i = 0; i < swapCount; ++i) {
+        swappy.onPreSwap(handlers);
+        swappy.onPostSwap(handlers);
+    }
+    stopSignal.store(true, std::memory_order_release);
+    reader.join();
+
+    return !observedUnexpectedCount.load(std::memory_order_relaxed);
+}
+
+void runConcurrentSettingsUpdateRound(SwappyCommon& swappy,
+                                      const SwappyCommon::SwapHandlers& handlers) {
+    Settings::getInstance()->setDisplayTimings({2 * kFastTickPeriod, 0ns, 0ns});
+    Settings::getInstance()->setSwapDuration(std::chrono::nanoseconds(2 * kFastTickPeriod).count());
+    swappy.onPreSwap(handlers);
+    swappy.onPostSwap(handlers);
+
+    std::atomic<bool> writerReady{false};
+    std::atomic<bool> startSignal{false};
+    std::thread displayWriter([&writerReady, &startSignal] {
+        writerReady.store(true, std::memory_order_release);
+        while (!startSignal.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        Settings::getInstance()->setDisplayTimings({kFastTickPeriod, 0ns, 0ns});
+    });
+
+    while (!writerReady.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    startSignal.store(true, std::memory_order_release);
+    Settings::getInstance()->setSwapDuration(std::chrono::nanoseconds(4 * kFastTickPeriod).count());
+    displayWriter.join();
+
+    swappy.onPreSwap(handlers);
+    swappy.onPostSwap(handlers);
+}
+
+void verifyConcurrentSettingsUpdates(SwappyCommon& swappy, int rounds) {
+    const auto handlers = readySwapHandlers(200us);
+    for (int round = 0; round < rounds; ++round) {
+        SCOPED_TRACE(round);
+        runConcurrentSettingsUpdateRound(swappy, handlers);
+        ASSERT_EQ(swappy.getRefreshPeriod(), kFastTickPeriod);
+        ASSERT_EQ(swappy.getSwapDuration(), 4 * kFastTickPeriod);
+    }
 }
 
 class SwappyCommonHostTest : public ::testing::Test {
@@ -937,6 +1058,165 @@ TEST_F(SwappyCommonHostTest, ExtraVsyncDuringSingleFenceWaitDoesNotDoubleCountIn
 
     EXPECT_EQ(harness.swappy().getRefreshPeriod(), k60HzPeriod);
     EXPECT_EQ(harness.swappy().getSwapDuration(), k60HzPeriod);
+}
+
+TEST_F(SwappyCommonHostTest, ConcurrentReadersObserveConsistentPacingStateUnderTimingUpdates) {
+    auto state = std::make_shared<PlatformSharedState>();
+    state->initialSettings = makeSettings(kFastTickPeriod);
+    state->initialSettings.appVsyncOffset = 0ns;
+    state->initialSettings.sfVsyncOffset = 0ns;
+    Settings::getInstance()->setSwapDuration(kFastTickPeriod.count());
+
+    SwappyCommon swappy(std::make_unique<FakeSwappyPlatform>(state));
+    ASSERT_TRUE(swappy.isValid());
+    swappy.setMaxAutoSwapDuration(0ns);
+
+    EXPECT_TRUE(exerciseConcurrentPacingReaders(swappy, swappy, 64));
+}
+
+TEST_F(SwappyCommonHostTest, ConcurrentDisplayTimingAndSwapDurationUpdatesPreserveLatestState) {
+    auto state = std::make_shared<PlatformSharedState>();
+    state->initialSettings = makeSettings(kFastTickPeriod);
+    state->initialSettings.appVsyncOffset = 0ns;
+    state->initialSettings.sfVsyncOffset = 0ns;
+    Settings::getInstance()->setSwapDuration(std::chrono::nanoseconds(kFastTickPeriod).count());
+
+    SwappyCommon swappy(std::make_unique<FakeSwappyPlatform>(state));
+    ASSERT_TRUE(swappy.isValid());
+    swappy.setMaxAutoSwapDuration(0ns);
+
+    verifyConcurrentSettingsUpdates(swappy, 32);
+}
+
+TEST_F(SwappyCommonHostTest,
+       SupportedRefreshPeriodQueriesFromAppThreadDuringFramesReturnAllPeriods) {
+    auto state = std::make_shared<PlatformSharedState>();
+    state->initialSettings = makeSettings(kFastTickPeriod);
+    state->initialSettings.appVsyncOffset = 0ns;
+    state->initialSettings.sfVsyncOffset = 0ns;
+    state->supportedPeriods = std::make_shared<RefreshPeriodMap>();
+    insertRefreshPeriod(*state->supportedPeriods, k120HzPeriod, 1);
+    insertRefreshPeriod(*state->supportedPeriods, k60HzPeriod, 2);
+    Settings::getInstance()->setSwapDuration(kFastTickPeriod.count());
+
+    SwappyCommon swappy(std::make_unique<FakeSwappyPlatform>(state));
+    ASSERT_TRUE(swappy.isValid());
+    swappy.setMaxAutoSwapDuration(0ns);
+
+    // Each frame refreshes the supported periods on the render thread while an app thread
+    // queries them; both sides go through mMutex, which swappy_host_tsan_test checks.
+    EXPECT_TRUE(exerciseConcurrentSupportedRefreshPeriodQueries(swappy, 64,
+                                                                /*expectedPeriodCount=*/2));
+}
+
+struct ActiveSwapModeProbe {
+    SwappyCommon* swappy = nullptr;
+    int remainingIncompleteChecks = 1;
+    std::chrono::nanoseconds gpuTime = 4ms;
+    std::function<void()> onFirstIncompleteCheck;
+    int completeChecks = 0;
+    int gpuTimeReads = 0;
+    std::vector<PipelineMode> modesDuringCompleteChecks;
+    std::vector<PipelineMode> modesDuringGpuTimeReads;
+
+    [[nodiscard]] SwappyCommon::SwapHandlers handlers() {
+        return SwappyCommon::SwapHandlers{
+                .lastFrameIsComplete =
+                        [this] {
+                            ++completeChecks;
+                            modesDuringCompleteChecks.push_back(swappy->getCurrentPipelineMode());
+                            if (remainingIncompleteChecks > 0) {
+                                --remainingIncompleteChecks;
+                                if (completeChecks == 1 && onFirstIncompleteCheck) {
+                                    onFirstIncompleteCheck();
+                                }
+                                return false;
+                            }
+                            return true;
+                        },
+                .getPrevFrameGpuTime =
+                        [this] {
+                            ++gpuTimeReads;
+                            modesDuringGpuTimeReads.push_back(swappy->getCurrentPipelineMode());
+                            return gpuTime;
+                        },
+        };
+    }
+};
+
+TEST_F(SwappyCommonHostTest,
+       DisablingAutoPipelineModeBetweenPreAndPostSwapCompletesNonPipelinedWait) {
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    SimulatedSwappyHarness harness(makeSettings(k60HzPeriod), Clock::time_point{1s});
+    harness.runFrames(130, 2ms, 2ms);
+    ASSERT_EQ(harness.swappy().getCurrentPipelineMode(), PipelineMode::Off);
+
+    int postWaitCalls = 0;
+    int64_t postWaitGpuNs = -1;
+    SwappyTracer tracer{};
+    std::pair<int*, int64_t*> waitData{&postWaitCalls, &postWaitGpuNs};
+    tracer.userData = &waitData;
+    tracer.postWait = [](void* data, int64_t, int64_t gpuNs) {
+        auto* pair = static_cast<std::pair<int*, int64_t*>*>(data);
+        ++(*pair->first);
+        *pair->second = gpuNs;
+    };
+    harness.swappy().addTracerCallbacks(tracer);
+
+    ActiveSwapModeProbe probe{.swappy = &harness.swappy()};
+    const SwappyCommon::SwapHandlers handlers = probe.handlers();
+
+    harness.clock().advanceBy(2ms);
+    harness.swappy().onPreSwap(handlers);
+    EXPECT_EQ(probe.completeChecks, 0);
+    EXPECT_EQ(postWaitCalls, 0);
+
+    harness.swappy().setAutoPipelineMode(false);
+    EXPECT_EQ(harness.swappy().getCurrentPipelineMode(), PipelineMode::Off);
+
+    harness.clock().advanceBy(500us);
+    harness.swappy().onPostSwap(handlers);
+
+    EXPECT_EQ(postWaitCalls, 1);
+    EXPECT_EQ(postWaitGpuNs, std::chrono::nanoseconds(4ms).count());
+    EXPECT_EQ(probe.completeChecks, 3);
+    EXPECT_EQ(probe.gpuTimeReads, 1);
+    EXPECT_EQ(probe.modesDuringCompleteChecks,
+              (std::vector<PipelineMode>{PipelineMode::Off, PipelineMode::Off, PipelineMode::Off}));
+    EXPECT_EQ(probe.modesDuringGpuTimeReads, (std::vector<PipelineMode>{PipelineMode::Off}));
+    EXPECT_EQ(harness.swappy().getCurrentPipelineMode(), PipelineMode::On);
+}
+
+TEST_F(SwappyCommonHostTest, DisablingAutoSwapIntervalDuringPostSwapWaitKeepsNonPipelinedHandlers) {
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    SimulatedSwappyHarness harness(makeSettings(k60HzPeriod), Clock::time_point{1s});
+    harness.runFrames(130, 2ms, 2ms);
+    ASSERT_EQ(harness.swappy().getCurrentPipelineMode(), PipelineMode::Off);
+
+    int postWaitCalls = 0;
+    SwappyTracer tracer{};
+    tracer.userData = &postWaitCalls;
+    tracer.postWait = [](void* data, int64_t, int64_t) { ++(*static_cast<int*>(data)); };
+    harness.swappy().addTracerCallbacks(tracer);
+
+    ActiveSwapModeProbe probe{
+            .swappy = &harness.swappy(),
+            .onFirstIncompleteCheck = [&harness] { harness.swappy().setAutoSwapInterval(false); },
+    };
+    const SwappyCommon::SwapHandlers handlers = probe.handlers();
+
+    harness.clock().advanceBy(2ms);
+    harness.swappy().onPreSwap(handlers);
+    harness.clock().advanceBy(500us);
+    harness.swappy().onPostSwap(handlers);
+
+    EXPECT_EQ(postWaitCalls, 1);
+    EXPECT_EQ(probe.completeChecks, 3);
+    EXPECT_EQ(probe.gpuTimeReads, 1);
+    EXPECT_EQ(probe.modesDuringCompleteChecks,
+              (std::vector<PipelineMode>{PipelineMode::Off, PipelineMode::Off, PipelineMode::Off}));
+    EXPECT_EQ(probe.modesDuringGpuTimeReads, (std::vector<PipelineMode>{PipelineMode::Off}));
+    EXPECT_EQ(harness.swappy().getCurrentPipelineMode(), PipelineMode::On);
 }
 
 } // namespace
