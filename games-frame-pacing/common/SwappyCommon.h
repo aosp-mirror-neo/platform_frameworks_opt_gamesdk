@@ -134,7 +134,7 @@ private:
     using FrameDuration = ::swappy::FrameDuration;
     using FrameDurations = ::swappy::FrameDurations;
 
-    void addFrameDuration(FrameDuration duration);
+    void addFrameDuration(FrameDuration duration, bool previousFrameMissed);
     std::chrono::nanoseconds wakeClient(std::optional<std::chrono::nanoseconds> sfToVsyncDelay);
 
     // The swap interval ladder itself is in SwapIntervalLadder.h; this is the

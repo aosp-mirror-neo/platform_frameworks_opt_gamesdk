@@ -259,3 +259,27 @@ TEST(FrameDurationsTest, ClearDiscardsTheWindow) {
     EXPECT_EQ(durations.getMissedFramePercent(), 0)
             << "the missed-frame count outlived the window it was counted in";
 }
+
+// In pipelined mode the next frame's fence wait detects a GPU overrun, so
+// markLastFrameMissed() charges the newest sample after the fact.
+TEST(FrameDurationsTest, MarkLastFrameMissedChargesTheNewestSampleOnce) {
+    FrameDurations durations;
+    const TimePoint start{};
+
+    EXPECT_FALSE(durations.markLastFrameMissed()); // Empty window: nothing to charge.
+
+    durations.add(FrameDuration(10ms, 0ns, /*miss=*/false), start);
+    durations.add(FrameDuration(10ms, 0ns, /*miss=*/false), start + 1500ms);
+    durations.add(FrameDuration(10ms, 0ns, /*miss=*/false), start + 2001ms);
+    ASSERT_TRUE(durations.hasEnoughSamples());
+    EXPECT_EQ(durations.getMissedFramePercent(), 0);
+
+    EXPECT_TRUE(durations.markLastFrameMissed());
+    EXPECT_EQ(durations.getMissedFramePercent(), 33);
+    EXPECT_FALSE(durations.markLastFrameMissed()); // Already missed: counted once.
+    EXPECT_EQ(durations.getMissedFramePercent(), 33);
+
+    // The charge ages out with its sample.
+    feed(durations, start + 2001ms + kFrame60Hz, 200, kFrame60Hz, 10ms);
+    EXPECT_EQ(durations.getMissedFramePercent(), 0);
+}

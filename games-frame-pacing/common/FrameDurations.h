@@ -155,6 +155,19 @@ public:
         return std::round(mMissedFrameCount * 100.0f / mFrames.size());
     }
 
+    // Marks the newest sample as missed if it is on time. In pipelined mode,
+    // the next frame's fence wait detects a GPU overrun and charges this sample
+    // once. Does nothing when the window is empty after clear().
+    bool markLastFrameMissed() {
+        if (mFrames.empty() || mFrames.back().second.frameMiss()) {
+            return false;
+        }
+        FrameDuration& last = mFrames.back().second;
+        last = FrameDuration(last.getCpuTime(), last.getGpuTime(), true);
+        mMissedFrameCount++;
+        return true;
+    }
+
     void clear() {
         mFrames.clear();
         mFrameDurationsSum = {};

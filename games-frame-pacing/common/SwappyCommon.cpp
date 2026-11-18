@@ -143,6 +143,7 @@ bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
     // the flags.
     mMutex.lock();
     bool localAutoSwapIntervalEnabled = mAutoSwapIntervalEnabled;
+    PipelineMode localPipelineMode = mPipelineMode;
     bool localFramePacingEnabled = mFramePacingEnabled;
 
     // We do the blocking wait when pacing or request by the app when not
@@ -156,12 +157,17 @@ bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
 
     preWaitCallbacks();
 
+    bool cpuMissed = false;
     // if we are running slower than the threshold (if auto swap interval is
     // enabled) there is no point to sleep,
     // just let the app run as fast as it can
     if (mCommonSettings.refreshPeriod * mAutoSwapInterval <= mAutoSwapIntervalThreshold.load() ||
         !localAutoSwapIntervalEnabled) {
-        if (localFramePacingEnabled) waitUntilTargetFrame();
+        if (localFramePacingEnabled) {
+            waitUntilTargetFrame();
+            std::lock_guard<std::mutex> lock(mWaitingMutex);
+            cpuMissed = mCurrentFrame > mTargetFrame;
+        }
 
         if (localBlockingWaitEnabled) {
             // wait for the previous frame to be rendered
@@ -174,6 +180,10 @@ bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
         mPresentationTime += lateFrames * mCommonSettings.refreshPeriod;
         presentationTimeIsNeeded = localFramePacingEnabled;
     } else {
+        if (localFramePacingEnabled) {
+            std::lock_guard<std::mutex> lock(mWaitingMutex);
+            cpuMissed = mCurrentFrame > mTargetFrame;
+        }
         presentationTimeIsNeeded = false;
     }
 
@@ -182,12 +192,23 @@ bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
 
     // Keep track of durations only if frame pacing is enabled.
     if (localFramePacingEnabled) {
-        bool frameMissed = false;
-        {
-            std::lock_guard<std::mutex> lock(mWaitingMutex);
-            frameMissed = mCurrentFrame > mTargetFrame;
+        const bool fenceWaitMissed = lateFrames > 0;
+        // In pipelined mode, the fence wait blocks on the previous frame's GPU
+        // work. If the current frame missed on CPU, that fence may have retired
+        // during the CPU stall with lateFrames == 0, so also check gpuTime.
+        bool frameMissed = cpuMissed || fenceWaitMissed;
+        bool previousFrameMissed = false;
+        if (localPipelineMode == PipelineMode::On) {
+            frameMissed = cpuMissed;
+            if (fenceWaitMissed) {
+                previousFrameMissed = true;
+            } else if (cpuMissed && gpuTime > 0ns) {
+                const nanoseconds currentSwapDuration = getSwapDuration();
+                previousFrameMissed = currentSwapDuration > 0ns &&
+                        gpuTime > currentSwapDuration + DURATION_ROUNDING_MARGIN;
+            }
         }
-        addFrameDuration({cpuTime, gpuTime, frameMissed});
+        addFrameDuration({cpuTime, gpuTime, frameMissed}, previousFrameMissed);
     }
 
     postWaitCallbacks(cpuTime, gpuTime);
@@ -327,12 +348,15 @@ nanoseconds SwappyCommon::getSwapDuration() {
     return mAutoSwapInterval * mCommonSettings.refreshPeriod;
 };
 
-void SwappyCommon::addFrameDuration(FrameDuration duration) {
+void SwappyCommon::addFrameDuration(FrameDuration duration, bool previousFrameMissed) {
     SWAPPY_LOGV("cpuTime = %.2f", duration.getCpuTime().count() / 1e6f);
     SWAPPY_LOGV("gpuTime = %.2f", duration.getGpuTime().count() / 1e6f);
     SWAPPY_LOGV("frame %s", duration.frameMiss() ? "MISS" : "on time");
 
     std::lock_guard<std::mutex> lock(mMutex);
+    if (previousFrameMissed) {
+        mFrameDurations.markLastFrameMissed();
+    }
     mFrameDurations.add(duration, mClock.now());
 }
 

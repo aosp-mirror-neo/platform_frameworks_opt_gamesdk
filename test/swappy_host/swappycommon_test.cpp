@@ -433,6 +433,16 @@ public:
         }
     }
 
+    void runCombinedHitchCycles(int cycleCount, int lightFrames, std::chrono::nanoseconds lightCpu,
+                                std::chrono::nanoseconds lightGpu, int spikeFrames,
+                                std::chrono::nanoseconds spikeCpu,
+                                std::chrono::nanoseconds spikeGpu) {
+        for (int cycle = 0; cycle < cycleCount; ++cycle) {
+            runFrames(lightFrames, lightCpu, lightGpu);
+            runFrames(spikeFrames, spikeCpu, spikeGpu);
+        }
+    }
+
     [[nodiscard]] std::chrono::nanoseconds displayPeriod() const {
         return mTimeline.displayPeriod();
     }
@@ -840,6 +850,93 @@ TEST_F(SwappyCommonHostTest, DiscreteLegacyPanelSelects60HzModeIdFor30HzTarget) 
     EXPECT_EQ(harness.displayPeriod(), k60HzPeriod);
     EXPECT_EQ(harness.swappy().getRefreshPeriod(), k60HzPeriod);
     EXPECT_NEAR(harness.swappy().getSwapDuration().count(), (2 * k60HzPeriod).count(), 100);
+}
+
+TEST_F(SwappyCommonHostTest,
+       SingleFrameCpuAndGpuHitchAtFivePercentDoesNotDoubleCountIntoThirtyHzDownshift) {
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    SimulatedSwappyHarness harness(makeSettings(k60HzPeriod, 36), Clock::time_point{1s});
+
+    // 17 normal frames (6ms CPU, 6ms GPU) + 1 combined CPU+GPU hitch frame (35ms CPU, 28ms GPU)
+    // is a 5.6% hitch rate (<= 10% FRAME_DROP_THRESHOLD). Because the hitch is not double-counted
+    // against its successor during GPU fence wait, pacing remains at 60Hz instead of dropping to
+    // 30Hz.
+    harness.runCombinedHitchCycles(8, 17, 6ms, 6ms, 1, 35ms, 28ms);
+
+    EXPECT_EQ(harness.swappy().getRefreshPeriod(), k60HzPeriod);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), k60HzPeriod);
+}
+
+TEST_F(SwappyCommonHostTest, GpuOnlyHitchesAboveTenPercentStillStepDownTo30Hz) {
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    SimulatedSwappyHarness harness(makeSettings(k60HzPeriod, 36), Clock::time_point{1s});
+
+    // 7 normal frames (6ms CPU, 6ms GPU) + 1 GPU-only hitch frame (6ms CPU, 28ms GPU) is a
+    // 12.5% hitch rate (> 10% FRAME_DROP_THRESHOLD). 16 cycles (2.4s) crosses the 2s sample
+    // window and steps pacing down to 30Hz.
+    harness.runCombinedHitchCycles(16, 7, 6ms, 6ms, 1, 6ms, 28ms);
+
+    EXPECT_EQ(harness.swappy().getSwapDuration(), k30HzPeriod);
+}
+
+TEST_F(SwappyCommonHostTest, GpuHitchFollowedByLongerCpuHitchCountsBothMissesAndStepsDownTo30Hz) {
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    SimulatedSwappyHarness harness(makeSettings(k60HzPeriod, 36), Clock::time_point{1s});
+
+    // 15 healthy frames + 1 GPU hitch (6ms CPU, 28ms GPU) + 1 longer CPU hitch (35ms CPU, 6ms GPU)
+    // is 2 missed frames out of 17 (11.8% > 10% FRAME_DROP_THRESHOLD). Even though the 28ms GPU
+    // fence retires during the successor's 35ms CPU stall (lateFrames == 0), both overrunning
+    // frames must be counted so pacing steps down to 30Hz after the 2s sample window (~2.53s).
+    for (int cycle = 0; cycle < 8; ++cycle) {
+        harness.runFrames(15, 6ms, 6ms);
+        harness.runFrame(6ms, 28ms);
+        harness.runFrame(35ms, 6ms);
+    }
+
+    EXPECT_EQ(harness.swappy().getSwapDuration(), k30HzPeriod);
+}
+
+TEST_F(SwappyCommonHostTest, ExtraVsyncDuringSingleFenceWaitDoesNotDoubleCountIntoCurrentFrame) {
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    SimulatedSwappyHarness harness(makeSettings(k60HzPeriod, 36), Clock::time_point{1s});
+
+    // 17 healthy frames + 1 GPU-only hitch is a 5.6% hitch rate (<= 10% FRAME_DROP_THRESHOLD).
+    // Simulate OS scheduling delay where mCurrentFrame advances by two vsyncs during a single
+    // waitOneFrame() iteration (lateFrames == 1); the healthy successor whose CPU finished on time
+    // must not be charged a second miss.
+    for (int cycle = 0; cycle < 8; ++cycle) {
+        harness.runFrames(16, 6ms, 6ms);
+        harness.runFrame(6ms, 24ms);
+
+        harness.clock().advanceBy(6ms);
+        int checkCount = 0;
+        const SwappyCommon::SwapHandlers handlers{
+                .lastFrameIsComplete =
+                        [&] {
+                            ++checkCount;
+                            if (checkCount == 1) {
+                                return false;
+                            }
+                            if (checkCount == 2) {
+                                harness.clock().advanceBy(k60HzPeriod);
+                                EXPECT_TRUE(triggerChoreographer(*harness.platformState()));
+                                EXPECT_TRUE(harness.clock().waitForWorkersSettled());
+                                harness.clock().advanceBy(k60HzPeriod);
+                                EXPECT_TRUE(triggerChoreographer(*harness.platformState()));
+                                EXPECT_TRUE(harness.clock().waitForWorkersSettled());
+                            }
+                            return true;
+                        },
+                .getPrevFrameGpuTime = [] { return 24ms; },
+        };
+        harness.swappy().onPreSwap(handlers);
+        EXPECT_EQ(checkCount, 3);
+        harness.clock().advanceBy(500us);
+        harness.swappy().onPostSwap(handlers);
+    }
+
+    EXPECT_EQ(harness.swappy().getRefreshPeriod(), k60HzPeriod);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), k60HzPeriod);
 }
 
 } // namespace
