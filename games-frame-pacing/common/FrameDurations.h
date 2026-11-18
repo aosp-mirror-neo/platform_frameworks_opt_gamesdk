@@ -89,6 +89,10 @@ public:
         mFrameMissedDeadline = true;
     }
 
+    void clearMiss() {
+        mFrameMissedDeadline = false;
+    }
+
     std::chrono::nanoseconds getTime(PipelineMode pipeline) const {
         if (mCpuTime == std::chrono::nanoseconds(0) && mGpuTime == std::chrono::nanoseconds(0)) {
             return std::chrono::nanoseconds(0);
@@ -202,6 +206,17 @@ public:
         mFrames.back().second.markMiss();
         ++mMissedFrameCount;
         return true;
+    }
+
+    // Clears deadline-miss flags whose work duration fits `budget` under
+    // `pipeline`, while retaining sample timestamps and work durations.
+    void clearMissesFittingBudget(std::chrono::nanoseconds budget, PipelineMode pipeline) {
+        for (auto& entry : mFrames) {
+            if (entry.second.frameMiss() && entry.second.getTime(pipeline) <= budget) {
+                entry.second.clearMiss();
+                --mMissedFrameCount;
+            }
+        }
     }
 
     void clear() {

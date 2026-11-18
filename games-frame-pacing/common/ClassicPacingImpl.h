@@ -139,7 +139,7 @@ public:
     }
 
     PacingResult onDisplayTimingsChanged(
-            int32_t /*currentSwapInterval*/, PipelineMode /*currentPipelineMode*/,
+            int32_t currentSwapInterval, PipelineMode currentPipelineMode,
             FrameDurations& durations, const TimingChange& change,
             const VotableRefreshPeriods& votableRefreshPeriods = {}) override {
         using namespace std::chrono_literals;
@@ -156,6 +156,7 @@ public:
             };
         }
 
+        const auto oldPacedPeriod = change.oldRefreshPeriod * currentSwapInterval;
         const auto pipelineFrameTime = durations.getAverageFrameTime().getTime(PipelineMode::On);
         const auto targetDuration =
                 pipelineFrameTime != 0ns ? pipelineFrameTime : change.swapDuration;
@@ -174,7 +175,13 @@ public:
                                      votableRefreshPeriods);
         }
 
-        durations.clear();
+        const auto newPacedPeriod = change.newRefreshPeriod * autoSwapInterval;
+        const bool budgetLoosened = newPacedPeriod > oldPacedPeriod + DURATION_ROUNDING_MARGIN ||
+                currentPipelineMode == PipelineMode::Off;
+        if (budgetLoosened) {
+            durations.clearMissesFittingBudget(newPacedPeriod, PipelineMode::On);
+        }
+
         return PacingResult{
                 .autoSwapInterval = autoSwapInterval,
                 .pipelineMode = PipelineMode::On,

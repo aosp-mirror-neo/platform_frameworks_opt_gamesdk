@@ -301,7 +301,6 @@ TEST(FrameDurationsTest, CompleteLastPipelinedFrameComputesExactMeanWithoutTrail
     EXPECT_EQ(average.getGpuTime(), 29ms);
     EXPECT_EQ(average.getTime(PipelineMode::On), 30ms);
 }
-
 TEST(FrameDurationsTest, CompleteLastPipelinedFrameIgnoresCompletedUnpipelinedSample) {
     FrameDurations durations;
     const TimePoint start{};
@@ -312,5 +311,63 @@ TEST(FrameDurationsTest, CompleteLastPipelinedFrameIgnoresCompletedUnpipelinedSa
 
     EXPECT_FALSE(durations.completeLastPipelinedFrame(2ms, /*gpuMissedDeadline=*/true));
     EXPECT_EQ(durations.getAverageFrameTime().getGpuTime(), 14ms);
+    EXPECT_EQ(durations.getMissedFramePercent(), 0);
+}
+
+TEST(FrameDurationsTest, ClearMissesFittingBudgetDropsResolvedMissesAndRetainsSamples) {
+    FrameDurations durations;
+    const TimePoint start{};
+
+    durations.add(FrameDuration(19ms, 0ns, /*miss=*/true), start);
+    durations.add(FrameDuration(24ms, 0ns, /*miss=*/true), start + 700ms);
+    durations.add(FrameDuration(25ms, 0ns, /*miss=*/true), start + 1400ms);
+    durations.add(FrameDuration(29ms, 0ns, /*miss=*/true), start + 2001ms);
+    ASSERT_TRUE(durations.hasEnoughSamples());
+    ASSERT_EQ(durations.getMissedFramePercent(), 100);
+
+    // With 1ms FRAME_MARGIN: 19ms->20ms and 24ms->25ms fit <= 25ms; 25ms->26ms and 29ms->30ms stay.
+    durations.clearMissesFittingBudget(25ms, PipelineMode::On);
+
+    EXPECT_TRUE(durations.hasEnoughSamples());
+    EXPECT_EQ(durations.getMissedFramePercent(), 50);
+    EXPECT_EQ(durations.getAverageFrameTime().getCpuTime(), 24250us);
+}
+
+TEST(FrameDurationsTest, ClearMissesFittingBudgetRespectsPipelineModeOverlap) {
+    FrameDurations durations;
+    const TimePoint start{};
+
+    // 14ms CPU + 14ms GPU + 1ms margin = 29ms when PipelineMode::Off, 15ms when PipelineMode::On.
+    durations.add(FrameDuration(14ms, 14ms, /*miss=*/true), start);
+    durations.add(FrameDuration(14ms, 14ms, /*miss=*/true), start + 2001ms);
+    ASSERT_TRUE(durations.hasEnoughSamples());
+
+    durations.clearMissesFittingBudget(20ms, PipelineMode::Off);
+    EXPECT_EQ(durations.getMissedFramePercent(), 100);
+
+    durations.clearMissesFittingBudget(20ms, PipelineMode::On);
+    EXPECT_EQ(durations.getMissedFramePercent(), 0);
+}
+
+TEST(FrameDurationsTest, ClearMissesFittingBudgetUsesCompletedPipelinedGpuDuration) {
+    FrameDurations durations;
+    const TimePoint start{};
+
+    // Frame 0 starts with pending GPU, then Frame 1's fence wait completes Frame 0's own 30ms GPU
+    // overrun and marks Frame 0 missed via completeLastPipelinedFrame().
+    durations.add(FrameDuration::withPendingGpu(6ms, /*cpuMissedDeadline=*/false), start);
+    EXPECT_TRUE(durations.completeLastPipelinedFrame(30ms, /*gpuMissedDeadline=*/true));
+    durations.add(FrameDuration::withPendingGpu(6ms, /*cpuMissedDeadline=*/false), start + 1000ms);
+    EXPECT_FALSE(durations.completeLastPipelinedFrame(6ms, /*gpuMissedDeadline=*/false));
+    durations.add(FrameDuration::withPendingGpu(6ms, /*cpuMissedDeadline=*/false), start + 2001ms);
+    ASSERT_TRUE(durations.hasEnoughSamples());
+    ASSERT_EQ(durations.getMissedFramePercent(), 33);
+
+    // 30ms + 1ms margin = 31ms > 25ms, so loosening to 25ms (40Hz) retains the GPU miss.
+    durations.clearMissesFittingBudget(25ms, PipelineMode::On);
+    EXPECT_EQ(durations.getMissedFramePercent(), 33);
+
+    // Loosening to 31ms resolves the 30ms GPU overrun.
+    durations.clearMissesFittingBudget(31ms, PipelineMode::On);
     EXPECT_EQ(durations.getMissedFramePercent(), 0);
 }

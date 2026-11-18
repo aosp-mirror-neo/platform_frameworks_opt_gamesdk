@@ -62,6 +62,7 @@ using swappy::testing::VsyncPanelTimeline;
 
 constexpr auto k60HzPeriod = 16'666'667ns;
 constexpr auto k30HzPeriod = 33'333'334ns;
+constexpr auto k90HzPeriod = 11'111'111ns;
 constexpr auto k120HzPeriod = 8'333'333ns;
 constexpr auto kFastTickPeriod = 1ms;
 
@@ -618,6 +619,16 @@ public:
     void triggerPassiveDisplayRateChange(std::chrono::nanoseconds newRefreshPeriod) {
         mTimeline.triggerPassiveDisplayRateChange(newRefreshPeriod);
         EXPECT_TRUE(mClock.waitForWorkersSettled());
+    }
+
+    void runDisplayJitterBursts(int burstCount, int framesPerPhase,
+                                std::chrono::nanoseconds cpuWork,
+                                std::chrono::nanoseconds gpuWork) {
+        const std::chrono::nanoseconds kPhases[] = {k120HzPeriod, k90HzPeriod, k60HzPeriod};
+        for (int burst = 0; burst < burstCount; ++burst) {
+            triggerPassiveDisplayRateChange(kPhases[burst % 3]);
+            runFrames(framesPerPhase, cpuWork, gpuWork);
+        }
     }
 
 private:
@@ -1264,6 +1275,56 @@ TEST_F(SwappyCommonHostTest, DisablingAutoSwapIntervalDuringPostSwapWaitKeepsNon
               (std::vector<PipelineMode>{PipelineMode::Off, PipelineMode::Off, PipelineMode::Off}));
     EXPECT_EQ(probe.modesDuringGpuTimeReads, (std::vector<PipelineMode>{PipelineMode::Off}));
     EXPECT_EQ(harness.swappy().getCurrentPipelineMode(), PipelineMode::On);
+}
+
+TEST_F(SwappyCommonHostTest, SubTwoSecondDisplayRateJitterDoesNotStarveAutoPacingDownshift) {
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    SimulatedSwappyHarness harness(makeSettings(k120HzPeriod), Clock::time_point{1s});
+
+    // Each 35-frame phase at 25ms spans ~0.89s (< 2.0s). Across 3 phases (~2.7s ending on 60Hz),
+    // retained samples reach 2.0s and step auto-pacing down instead of starving forever.
+    harness.runDisplayJitterBursts(/*burstCount=*/3, /*framesPerPhase=*/35, 25ms, 4ms);
+
+    EXPECT_EQ(harness.swappy().getRefreshPeriod(), k60HzPeriod);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), 2 * k60HzPeriod);
+}
+
+TEST_F(SwappyCommonHostTest,
+       ExternalDisplayDropTo30HzClearsResolved60HzMissesWithoutDoubleDownshift) {
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    SimulatedSwappyHarness harness(makeSettings(k60HzPeriod), Clock::time_point{1s});
+
+    // 80 frames of 20ms (~1.64s < 2.0s) all miss the 60Hz budget before an external 30Hz switch.
+    harness.runFrames(80, 20ms, 4ms);
+    ASSERT_EQ(harness.swappy().getSwapDuration(), k60HzPeriod);
+
+    harness.triggerPassiveDisplayRateChange(k30HzPeriod);
+    harness.runFrames(25, 20ms, 4ms);
+
+    // Total span exceeds 2.0s; 20ms + 1ms margin fits 33.33ms, so pacing stays at 30Hz (interval=1)
+    // rather than falsely stepping to 15Hz (interval=2) from pre-switch 60Hz misses.
+    EXPECT_EQ(harness.swappy().getRefreshPeriod(), k30HzPeriod);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), k30HzPeriod);
+}
+
+TEST_F(SwappyCommonHostTest,
+       ExternalDisplayDropTo40HzRetainsUnresolvedPipelinedGpuMissesAndStepsDown) {
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    SimulatedSwappyHarness harness(makeSettings(k60HzPeriod), Clock::time_point{1s});
+
+    // 14 cycles of 4 healthy frames (6ms CPU, 6ms GPU) + 1 GPU hitch (6ms CPU, 38ms GPU) span
+    // ~1.4s (< 2.0s) with 14 pipelined GPU misses that still exceed a 40Hz (25ms) budget.
+    harness.runCombinedHitchCycles(14, 4, 6ms, 6ms, 1, 6ms, 38ms);
+    harness.runFrame(6ms, 6ms);
+    ASSERT_EQ(harness.swappy().getSwapDuration(), k60HzPeriod);
+
+    harness.triggerPassiveDisplayRateChange(25'000'000ns);
+    harness.runFrames(30, 6ms, 6ms);
+
+    // Total span exceeds 2.0s; 38ms GPU + 1ms margin > 25ms, so the 14 unresolved GPU misses
+    // (~14% > 10%) survive clearMissesFittingBudget and step swapInterval to 2 (50ms).
+    EXPECT_EQ(harness.swappy().getRefreshPeriod(), 25'000'000ns);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), 50'000'000ns);
 }
 
 } // namespace

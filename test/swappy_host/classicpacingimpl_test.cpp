@@ -31,6 +31,7 @@ namespace {
 
 constexpr nanoseconds k60Hz = 16666667ns;
 constexpr nanoseconds k40Hz = 25000000ns;
+constexpr nanoseconds k30Hz = 33333334ns;
 constexpr nanoseconds k120Hz = 8333333ns;
 constexpr VotableRefreshPeriods kSetFrameRateVotable{.usesSetFrameRate = true};
 
@@ -154,7 +155,7 @@ TEST(ClassicPacingImplTest, DisplayTimingChangeUsesMeasuredPipelineFrameTimeAndI
     EXPECT_EQ(result.pipelineMode, PipelineMode::On);
     ASSERT_TRUE(result.vote.frameRateHz.has_value());
     EXPECT_NEAR(*result.vote.frameRateHz, 120.0f, 0.05f);
-    EXPECT_FALSE(durations.hasEnoughSamples());
+    EXPECT_TRUE(durations.hasEnoughSamples());
 }
 
 TEST(ClassicPacingImplTest, DisplayTimingChangeFallsBackWhenNoSamples) {
@@ -268,4 +269,41 @@ TEST(ClassicPacingImplTest, DisplayTimingChangeTreatsSubMicrosecond120HzMultiple
     EXPECT_EQ(undercutResult.autoSwapInterval, 2);
     ASSERT_TRUE(undercutResult.vote.frameRateHz.has_value());
     EXPECT_NEAR(*undercutResult.vote.frameRateHz, 60.0f, 0.05f);
+}
+
+TEST(ClassicPacingImplTest, PassiveTimingChangeRetainsSamplesAndClearsMissesFittingLoosenedBudget) {
+    ClassicPacingImplementation pacing;
+    FrameDurations durations;
+    TimePoint now = feed(durations, TimePoint{}, kFramesToFillWindow - 20, k60Hz, 20ms);
+    feed(durations, now, 20, k60Hz, 20ms, 0ns, /*miss=*/true);
+    ASSERT_TRUE(durations.hasEnoughSamples());
+    ASSERT_GT(durations.getMissedFramePercent(), 10);
+
+    const TimingChange passiveChange{
+            .oldRefreshPeriod = k60Hz,
+            .newRefreshPeriod = k40Hz,
+            .swapDuration = k60Hz,
+    };
+    const PacingResult passiveResult =
+            pacing.onDisplayTimingsChanged(1, PipelineMode::On, durations, passiveChange);
+    EXPECT_EQ(passiveResult.autoSwapInterval, 1);
+    EXPECT_TRUE(durations.hasEnoughSamples());
+    EXPECT_EQ(durations.getMissedFramePercent(), 0);
+}
+
+TEST(ClassicPacingImplTest, ExplicitSwapDurationChangeClearsSamples) {
+    ClassicPacingImplementation pacing;
+    FrameDurations durations;
+    feed(durations, TimePoint{}, kFramesToFillWindow, k40Hz, 20ms);
+    ASSERT_TRUE(durations.hasEnoughSamples());
+
+    const TimingChange explicitSwapDurationChange{
+            .oldRefreshPeriod = k40Hz,
+            .newRefreshPeriod = k40Hz,
+            .swapDuration = k30Hz,
+            .swapDurationChanged = true,
+    };
+    (void)pacing.onDisplayTimingsChanged(2, PipelineMode::On, durations,
+                                         explicitSwapDurationChange);
+    EXPECT_FALSE(durations.hasEnoughSamples());
 }
