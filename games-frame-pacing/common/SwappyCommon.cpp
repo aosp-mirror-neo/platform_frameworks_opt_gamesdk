@@ -214,7 +214,7 @@ bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
                         gpuTime > currentSwapDuration + DURATION_ROUNDING_MARGIN;
             }
         }
-        addFrameDuration({cpuTime, gpuTime, frameMissed}, previousFrameMissed);
+        addFrameDuration({cpuTime, gpuTime, frameMissed}, localPipelineMode, previousFrameMissed);
     }
 
     postWaitCallbacks(cpuTime, gpuTime);
@@ -374,16 +374,23 @@ nanoseconds SwappyCommon::getRefreshPeriod() const {
     return mCommonSettings.refreshPeriod;
 }
 
-void SwappyCommon::addFrameDuration(FrameDuration duration, bool previousFrameMissed) {
+void SwappyCommon::addFrameDuration(FrameDuration duration, PipelineMode swapPipelineMode,
+                                    bool previousFrameMissed) {
     SWAPPY_LOGV("cpuTime = %.2f", duration.getCpuTime().count() / 1e6f);
     SWAPPY_LOGV("gpuTime = %.2f", duration.getGpuTime().count() / 1e6f);
     SWAPPY_LOGV("frame %s", duration.frameMiss() ? "MISS" : "on time");
 
     std::lock_guard<std::mutex> lock(mMutex);
-    if (previousFrameMissed) {
-        mFrameDurations.markLastFrameMissed();
+    if (swapPipelineMode == PipelineMode::On) {
+        const auto completedGpu =
+                duration.hasGpuTime() ? duration.getGpuTime() : std::chrono::nanoseconds(-1);
+        mFrameDurations.completeLastPipelinedFrame(completedGpu, previousFrameMissed);
+        mFrameDurations.add(FrameDuration::withPendingGpu(duration.getCpuTime(),
+                                                          duration.frameMiss()),
+                            mClock.now());
+    } else {
+        mFrameDurations.add(duration, mClock.now());
     }
-    mFrameDurations.add(duration, mClock.now());
 }
 
 bool SwappyCommon::updateSwapInterval() {

@@ -19,6 +19,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <utility>
 
@@ -48,9 +50,18 @@ public:
 
     FrameDuration(std::chrono::nanoseconds cpuTime, std::chrono::nanoseconds gpuTime,
                   bool frameMissedDeadline)
-          : mCpuTime(cpuTime), mGpuTime(gpuTime), mFrameMissedDeadline(frameMissedDeadline) {
-        mCpuTime = std::min(mCpuTime, MAX_DURATION);
-        mGpuTime = std::min(mGpuTime, MAX_DURATION);
+          : mCpuTime(std::min(cpuTime, MAX_DURATION)),
+            mGpuTime(gpuTime >= std::chrono::nanoseconds(0) ? std::min(gpuTime, MAX_DURATION)
+                                                            : std::chrono::nanoseconds(0)),
+            mHasGpuTime(gpuTime >= std::chrono::nanoseconds(0)),
+            mFrameMissedDeadline(frameMissedDeadline) {}
+
+    // Creates a pipelined sample whose CPU duration is known now and whose own
+    // GPU duration will be attached on the next frame's fence wait via
+    // FrameDurations::completeLastPipelinedFrame().
+    [[nodiscard]] static FrameDuration withPendingGpu(std::chrono::nanoseconds cpuTime,
+                                                      bool cpuMissedDeadline) {
+        return FrameDuration(cpuTime, std::chrono::nanoseconds(-1), cpuMissedDeadline);
     }
 
     std::chrono::nanoseconds getCpuTime() const {
@@ -59,9 +70,23 @@ public:
     std::chrono::nanoseconds getGpuTime() const {
         return mGpuTime;
     }
+    bool hasGpuTime() const {
+        return mHasGpuTime;
+    }
 
     bool frameMiss() const {
         return mFrameMissedDeadline;
+    }
+
+    void completeGpu(std::chrono::nanoseconds gpuTime) {
+        if (gpuTime >= std::chrono::nanoseconds(0)) {
+            mGpuTime = std::min(gpuTime, MAX_DURATION);
+            mHasGpuTime = true;
+        }
+    }
+
+    void markMiss() {
+        mFrameMissedDeadline = true;
     }
 
     std::chrono::nanoseconds getTime(PipelineMode pipeline) const {
@@ -76,27 +101,10 @@ public:
         return mCpuTime + mGpuTime + FRAME_MARGIN;
     }
 
-    FrameDuration& operator+=(const FrameDuration& other) {
-        mCpuTime += other.mCpuTime;
-        mGpuTime += other.mGpuTime;
-        return *this;
-    }
-
-    FrameDuration& operator-=(const FrameDuration& other) {
-        mCpuTime -= other.mCpuTime;
-        mGpuTime -= other.mGpuTime;
-        return *this;
-    }
-
-    friend FrameDuration operator/(FrameDuration lhs, int rhs) {
-        lhs.mCpuTime /= rhs;
-        lhs.mGpuTime /= rhs;
-        return lhs;
-    }
-
 private:
     std::chrono::nanoseconds mCpuTime = std::chrono::nanoseconds(0);
     std::chrono::nanoseconds mGpuTime = std::chrono::nanoseconds(0);
+    bool mHasGpuTime = false;
     bool mFrameMissedDeadline = false;
 
     static constexpr std::chrono::nanoseconds MAX_DURATION = std::chrono::milliseconds(100);
@@ -115,9 +123,13 @@ public:
     // this ordering for free on the production path.
     void add(FrameDuration frameDuration, TimePoint now) {
         mFrames.push_back({now, frameDuration});
-        mFrameDurationsSum += frameDuration;
+        mCpuTimeSum += frameDuration.getCpuTime();
+        if (frameDuration.hasGpuTime()) {
+            mGpuTimeSum += frameDuration.getGpuTime();
+            ++mGpuSampleCount;
+        }
         if (frameDuration.frameMiss()) {
-            mMissedFrameCount++;
+            ++mMissedFrameCount;
         }
 
         // Note the `begin() + 1` and the `size() >= 2` guard: one sample older
@@ -125,9 +137,14 @@ public:
         // can still measure a span of at least FRAME_DURATION_SAMPLE_SECONDS.
         while (mFrames.size() >= 2 &&
                now - (mFrames.begin() + 1)->first > FRAME_DURATION_SAMPLE_SECONDS) {
-            mFrameDurationsSum -= mFrames.front().second;
-            if (mFrames.front().second.frameMiss()) {
-                mMissedFrameCount--;
+            const FrameDuration& evicted = mFrames.front().second;
+            mCpuTimeSum -= evicted.getCpuTime();
+            if (evicted.hasGpuTime()) {
+                mGpuTimeSum -= evicted.getGpuTime();
+                --mGpuSampleCount;
+            }
+            if (evicted.frameMiss()) {
+                --mMissedFrameCount;
             }
             mFrames.pop_front();
         }
@@ -140,13 +157,18 @@ public:
 
     // Returns a zero-initialised duration when the window is too short. Callers
     // must test hasEnoughSamples() first, or they will read a frame time of
-    // zero as "everything fits" and upshift.
+    // zero as "everything fits" and upshift. Completed GPU samples are averaged
+    // over mGpuSampleCount so a trailing pending pipelined sample never biases
+    // the GPU mean downward.
     FrameDuration getAverageFrameTime() const {
-        if (hasEnoughSamples()) {
-            return mFrameDurationsSum / mFrames.size();
+        if (!hasEnoughSamples()) {
+            return {};
         }
-
-        return {};
+        const auto avgCpu = mCpuTimeSum / static_cast<int64_t>(mFrames.size());
+        const auto avgGpu = mGpuSampleCount > 0
+                ? (mGpuTimeSum / static_cast<int64_t>(mGpuSampleCount))
+                : std::chrono::nanoseconds(0);
+        return FrameDuration(avgCpu, avgGpu, false);
     }
 
     // Divides by the sample count without guarding against an empty window.
@@ -155,22 +177,38 @@ public:
         return std::round(mMissedFrameCount * 100.0f / mFrames.size());
     }
 
-    // Marks the newest sample as missed if it is on time. In pipelined mode,
-    // the next frame's fence wait detects a GPU overrun and charges this sample
-    // once. Does nothing when the window is empty after clear().
+    // Attach the newest pending pipelined sample's GPU duration (when
+    // non-negative) and charge any GPU deadline miss. Ignore empty windows and
+    // samples that already recorded GPU time in PipelineMode::Off.
+    bool completeLastPipelinedFrame(std::chrono::nanoseconds gpuTime, bool gpuMissedDeadline) {
+        if (mFrames.empty() || mFrames.back().second.hasGpuTime()) {
+            return false;
+        }
+        FrameDuration& last = mFrames.back().second;
+        if (gpuTime >= std::chrono::nanoseconds(0)) {
+            last.completeGpu(gpuTime);
+            mGpuTimeSum += last.getGpuTime();
+            ++mGpuSampleCount;
+        }
+        return gpuMissedDeadline && markLastFrameMissed();
+    }
+
+    // Marks the newest sample as missed if it is on time. Does nothing when the
+    // window is empty after clear().
     bool markLastFrameMissed() {
         if (mFrames.empty() || mFrames.back().second.frameMiss()) {
             return false;
         }
-        FrameDuration& last = mFrames.back().second;
-        last = FrameDuration(last.getCpuTime(), last.getGpuTime(), true);
-        mMissedFrameCount++;
+        mFrames.back().second.markMiss();
+        ++mMissedFrameCount;
         return true;
     }
 
     void clear() {
         mFrames.clear();
-        mFrameDurationsSum = {};
+        mCpuTimeSum = std::chrono::nanoseconds(0);
+        mGpuTimeSum = std::chrono::nanoseconds(0);
+        mGpuSampleCount = 0;
         mMissedFrameCount = 0;
     }
 
@@ -179,7 +217,9 @@ private:
             std::chrono::seconds(2);
 
     std::deque<std::pair<TimePoint, FrameDuration>> mFrames;
-    FrameDuration mFrameDurationsSum = {};
+    std::chrono::nanoseconds mCpuTimeSum = std::chrono::nanoseconds(0);
+    std::chrono::nanoseconds mGpuTimeSum = std::chrono::nanoseconds(0);
+    size_t mGpuSampleCount = 0;
     int mMissedFrameCount = 0;
 };
 

@@ -205,23 +205,40 @@ private:
 
     void waitForNextFrame() {
         const auto cpuTime = mStartFrameTime.has_value() ? (mNow - *mStartFrameTime) : 0ns;
+        int lateFrames = 0;
+        bool cpuMissed = false;
         if (mRefreshPeriod * mAutoSwapInterval <= kAutoSwapIntervalThreshold) {
             while (mCurrentVsync < mTargetVsync) {
                 advanceOneVsync();
             }
+            cpuMissed = mCurrentVsync > mTargetVsync;
             while (!mGpuQueue.lastFrameIsComplete(mNow, mPipelineMode)) {
+                ++lateFrames;
                 advanceOneVsync();
             }
+        } else {
+            cpuMissed = mCurrentVsync > mTargetVsync;
         }
 
         const auto gpuTime = mGpuQueue.lastFrameIsComplete(mNow, mPipelineMode)
                 ? mGpuQueue.lastFenceTime(mNow)
                 : -1ns;
-        const bool frameMissed = mCurrentVsync > mTargetVsync;
-        if (frameMissed) {
+        const bool fenceWaitMissed = lateFrames > 0;
+        if (cpuMissed || fenceWaitMissed) {
             ++mMissedFrames;
         }
-        mDurations.add(FrameDuration{cpuTime, gpuTime, frameMissed}, mNow);
+        if (mPipelineMode == PipelineMode::On) {
+            bool previousFrameMissed = fenceWaitMissed;
+            if (!previousFrameMissed && cpuMissed && gpuTime > 0ns) {
+                const auto currentSwapDuration = effectiveFramePeriod();
+                previousFrameMissed = currentSwapDuration > 0ns &&
+                        gpuTime > currentSwapDuration + swappy::DURATION_ROUNDING_MARGIN;
+            }
+            mDurations.completeLastPipelinedFrame(gpuTime, previousFrameMissed);
+            mDurations.add(FrameDuration::withPendingGpu(cpuTime, cpuMissed), mNow);
+        } else {
+            mDurations.add(FrameDuration{cpuTime, gpuTime, cpuMissed || fenceWaitMissed}, mNow);
+        }
     }
 
     [[nodiscard]] VotableRefreshPeriods votablePeriods() const noexcept {

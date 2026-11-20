@@ -283,3 +283,34 @@ TEST(FrameDurationsTest, MarkLastFrameMissedChargesTheNewestSampleOnce) {
     feed(durations, start + 2001ms + kFrame60Hz, 200, kFrame60Hz, 10ms);
     EXPECT_EQ(durations.getMissedFramePercent(), 0);
 }
+
+TEST(FrameDurationsTest, CompleteLastPipelinedFrameComputesExactMeanWithoutTrailingPendingBias) {
+    FrameDurations durations;
+    const TimePoint start{};
+
+    // Two completed 29ms GPU samples plus one trailing pending sample span more than 2s.
+    durations.add(FrameDuration::withPendingGpu(8ms, /*cpuMissedDeadline=*/false), start);
+    EXPECT_FALSE(durations.completeLastPipelinedFrame(29ms, /*gpuMissedDeadline=*/false));
+    durations.add(FrameDuration::withPendingGpu(8ms, /*cpuMissedDeadline=*/false), start + 1000ms);
+    EXPECT_FALSE(durations.completeLastPipelinedFrame(29ms, /*gpuMissedDeadline=*/false));
+    durations.add(FrameDuration::withPendingGpu(8ms, /*cpuMissedDeadline=*/false), start + 2001ms);
+
+    ASSERT_TRUE(durations.hasEnoughSamples());
+    const FrameDuration average = durations.getAverageFrameTime();
+    EXPECT_EQ(average.getCpuTime(), 8ms);
+    EXPECT_EQ(average.getGpuTime(), 29ms);
+    EXPECT_EQ(average.getTime(PipelineMode::On), 30ms);
+}
+
+TEST(FrameDurationsTest, CompleteLastPipelinedFrameIgnoresCompletedUnpipelinedSample) {
+    FrameDurations durations;
+    const TimePoint start{};
+
+    durations.add(FrameDuration(8ms, 14ms, /*frameMissedDeadline=*/false), start);
+    durations.add(FrameDuration(8ms, 14ms, /*frameMissedDeadline=*/false), start + 2001ms);
+    ASSERT_TRUE(durations.hasEnoughSamples());
+
+    EXPECT_FALSE(durations.completeLastPipelinedFrame(2ms, /*gpuMissedDeadline=*/true));
+    EXPECT_EQ(durations.getAverageFrameTime().getGpuTime(), 14ms);
+    EXPECT_EQ(durations.getMissedFramePercent(), 0);
+}
