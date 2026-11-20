@@ -28,7 +28,6 @@
 #endif
 
 #include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <optional>
 
@@ -48,7 +47,7 @@ public:
         if (votableRefreshPeriods.usesSetFrameRate) {
             const auto votedHz =
                     mDisplayRateController.voteFrameRateHz(targetPeriod, minSwapDuration);
-            const int64_t traceHz = std::lround(mDisplayRateController.lastVotedFrameRateHz());
+            const int64_t traceHz = (mDisplayRateController.lastVotedMillihertz() + 500) / 1000;
             return RefreshRateVote{
                     .frameRateHz = votedHz,
                     .traceValue = traceHz,

@@ -18,7 +18,8 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <utility>
 
@@ -28,13 +29,23 @@
 
 namespace swappy {
 
+// Converts a positive period to rounded integer millihertz, or returns 0 for
+// non-positive periods.
+[[nodiscard]] constexpr int64_t periodToMillihertz(std::chrono::nanoseconds period) {
+    if (period <= std::chrono::nanoseconds::zero()) {
+        return 0;
+    }
+    constexpr int64_t kMillihertzPerSecondNs = 1'000'000'000'000LL;
+    return (kMillihertzPerSecondNs + period.count() / 2) / period.count();
+}
+
 // Tracks platform display-rate votes across ANativeWindow_setFrameRate (API 30+)
 // and legacy WindowManager preferredDisplayModeId (API 28-29).
 class DisplayRateController {
 public:
     // 0.1 Hz absorbs 1 ns period rounding while still voting sub-20 Hz ARR
     // transitions (e.g. 16 vs 15 Hz and 11 vs 10 Hz).
-    static constexpr float kVoteMarginHz = 0.1f;
+    static constexpr int64_t kVoteMarginMillihertz = 100;
 
     struct ModeSelection {
         std::chrono::nanoseconds refreshPeriod{0};
@@ -43,11 +54,11 @@ public:
     };
 
     [[nodiscard]] bool hasVoted() const {
-        return mLastVotedFrameRateHz > 0.f || mLastModeId >= 0;
+        return mLastVotedMillihertz > 0 || mLastModeId >= 0;
     }
 
     void onWindowChanged() {
-        mLastVotedFrameRateHz = 0.f;
+        mLastVotedMillihertz = 0;
     }
 
     // Returns a new frameRate (in Hz) to pass to ANativeWindow_setFrameRate when
@@ -55,20 +66,20 @@ public:
     [[nodiscard]] std::optional<float> voteFrameRateHz(std::chrono::nanoseconds targetPeriod,
                                                        std::chrono::nanoseconds minSwapDuration) {
         const auto effectivePeriod = std::max(targetPeriod, minSwapDuration);
-        if (effectivePeriod <= std::chrono::nanoseconds::zero()) {
+        const int64_t millihertz = periodToMillihertz(effectivePeriod);
+        if (millihertz <= 0) {
             return std::nullopt;
         }
-        const float frameRate = 1e9f / static_cast<float>(effectivePeriod.count());
-        if (mLastVotedFrameRateHz > 0.f &&
-            std::abs(mLastVotedFrameRateHz - frameRate) <= kVoteMarginHz) {
+        if (mLastVotedMillihertz > 0 &&
+            std::abs(millihertz - mLastVotedMillihertz) <= kVoteMarginMillihertz) {
             return std::nullopt;
         }
-        mLastVotedFrameRateHz = frameRate;
-        return frameRate;
+        mLastVotedMillihertz = millihertz;
+        return static_cast<float>(millihertz) / 1000.0f;
     }
 
-    [[nodiscard]] float lastVotedFrameRateHz() const {
-        return mLastVotedFrameRateHz;
+    [[nodiscard]] int64_t lastVotedMillihertz() const {
+        return mLastVotedMillihertz;
     }
 
     // Selects the longest physical Display.Mode period whose integer multiple
@@ -109,7 +120,7 @@ public:
     }
 
 private:
-    float mLastVotedFrameRateHz = 0.f;
+    int64_t mLastVotedMillihertz = 0;
     int mLastModeId = -1;
 };
 
