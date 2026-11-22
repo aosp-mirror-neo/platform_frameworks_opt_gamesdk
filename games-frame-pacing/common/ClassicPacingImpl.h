@@ -212,7 +212,7 @@ public:
                                             votableRefreshPeriods);
         } else {
             if (change.swapDurationChanged || !swapIntervalValid ||
-                !mDisplayRateController.hasVoted()) {
+                autoSwapInterval > bounds.ceiling || !mDisplayRateController.hasVoted()) {
                 vote = voteClampedRefreshPeriod(autoSwapInterval, bounds, change.swapDuration,
                                                 change.swapDuration,
                                                 change.autoSwapIntervalThreshold,
@@ -243,8 +243,10 @@ private:
                                              const VotableRefreshPeriods& votableRefreshPeriods) {
         using namespace std::chrono_literals;
         if (swapInterval > bounds.ceiling) {
-            return minSwapDuration > 0ns
-                    ? voteRefreshPeriod(minSwapDuration, minSwapDuration, votableRefreshPeriods)
+            const auto recoveryPeriod =
+                    minSwapDuration > 0ns ? minSwapDuration : autoSwapIntervalThreshold;
+            return recoveryPeriod > 0ns
+                    ? voteRefreshPeriod(recoveryPeriod, minSwapDuration, votableRefreshPeriods)
                     : RefreshRateVote{};
         }
         if (targetPeriod <= 0ns) {

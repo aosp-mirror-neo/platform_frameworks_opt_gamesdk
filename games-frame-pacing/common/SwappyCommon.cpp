@@ -172,9 +172,8 @@ bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
     preWaitCallbacks();
 
     bool cpuMissed = false;
-    // if we are running slower than the threshold (if auto swap interval is
-    // enabled) there is no point to sleep,
-    // just let the app run as fast as it can
+    // Skip sleeping and present as soon as possible when auto-pacing is
+    // disabled (threshold == 0) or the swap period exceeds the threshold.
     if (shouldPaceFrame) {
         if (localFramePacingEnabled) {
             TRACE_SCOPE("Swappy::WaitPhase");

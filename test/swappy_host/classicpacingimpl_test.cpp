@@ -263,6 +263,85 @@ TEST(ClassicPacingImplTest, UnpacedAutoSwapThresholdVotesRequestedFloorInsteadOf
     EXPECT_NEAR(*unpacedResult.vote.frameRateHz, 60.0f, 0.05f);
 }
 
+TEST(ClassicPacingImplTest, SlowRefreshPeriodWithoutAppFloorVotesUpToAutoSwapThreshold) {
+    ClassicPacingImplementation pacing;
+    FrameDurations durations;
+    feed(durations, TimePoint{}, kFramesToFillWindow, 50ms, 45ms, 0ns, /*miss=*/true);
+    ASSERT_TRUE(durations.hasEnoughSamples());
+
+    const PacingResult recoveryResult =
+            pacing.updateSwapInterval(1, PipelineMode::On, durations, 50ms, 0ns, 33'333'333ns, true,
+                                      kSetFrameRateVotable);
+
+    EXPECT_FALSE(recoveryResult.configChanged);
+    EXPECT_EQ(recoveryResult.autoSwapInterval, 1);
+    ASSERT_TRUE(recoveryResult.vote.frameRateHz.has_value());
+    EXPECT_NEAR(*recoveryResult.vote.frameRateHz, 30.0f, 0.05f);
+}
+
+TEST(ClassicPacingImplTest, UnpacedAutoSwapThresholdWithoutAppFloorEmitsNoVote) {
+    ClassicPacingImplementation pacing;
+    FrameDurations durations;
+    feed(durations, TimePoint{}, kFramesToFillWindow, 40ms, 40ms, 0ns, /*miss=*/true);
+    ASSERT_TRUE(durations.hasEnoughSamples());
+
+    const PacingResult unpacedResult =
+            pacing.updateSwapInterval(1, PipelineMode::On, durations, k120Hz, 0ns, 0ns, true,
+                                      kSetFrameRateVotable);
+
+    EXPECT_FALSE(unpacedResult.configChanged);
+    EXPECT_EQ(unpacedResult.autoSwapInterval, 1);
+    EXPECT_FALSE(unpacedResult.vote.emitted());
+}
+
+TEST(ClassicPacingImplTest, DisplayTimingChangeWithoutAppFloorVotesUpToAutoSwapThreshold) {
+    ClassicPacingImplementation pacing;
+    FrameDurations emptyDurations;
+    const TimingChange slowStartupChange{
+            .oldRefreshPeriod = 50ms,
+            .newRefreshPeriod = 50ms,
+            .swapDuration = 0ns,
+            .autoSwapIntervalThreshold = 33'333'333ns,
+    };
+
+    // Initial timing setup (!hasVoted()): votes immediately to 30 Hz limit.
+    const PacingResult startupResult =
+            pacing.onDisplayTimingsChanged(1, PipelineMode::On, emptyDurations, slowStartupChange,
+                                           kSetFrameRateVotable);
+    EXPECT_EQ(startupResult.autoSwapInterval, 1);
+    ASSERT_TRUE(startupResult.vote.frameRateHz.has_value());
+    EXPECT_NEAR(*startupResult.vote.frameRateHz, 30.0f, 0.05f);
+
+    // Seed a 60 Hz vote so hasVoted() is true, then drop passively to 20 Hz
+    // (50 ms): autoSwapInterval (1) > ceiling (0) triggers immediate 30 Hz
+    // recovery without waiting for a full sample window.
+    ASSERT_TRUE(pacing.voteRefreshPeriod(k60Hz, 0ns, kSetFrameRateVotable).emitted());
+    const TimingChange passiveDropChange{
+            .oldRefreshPeriod = k60Hz,
+            .newRefreshPeriod = 50ms,
+            .swapDuration = 0ns,
+            .autoSwapIntervalThreshold = 33'333'333ns,
+    };
+    const PacingResult passiveDropResult =
+            pacing.onDisplayTimingsChanged(1, PipelineMode::On, emptyDurations, passiveDropChange,
+                                           kSetFrameRateVotable);
+    EXPECT_EQ(passiveDropResult.autoSwapInterval, 1);
+    ASSERT_TRUE(passiveDropResult.vote.frameRateHz.has_value());
+    EXPECT_NEAR(*passiveDropResult.vote.frameRateHz, 30.0f, 0.05f);
+
+    // Explicit unpaced opt-out (threshold == 0ns) with unset floor emits no vote.
+    const TimingChange unpacedDropChange{
+            .oldRefreshPeriod = k60Hz,
+            .newRefreshPeriod = 50ms,
+            .swapDuration = 0ns,
+            .autoSwapIntervalThreshold = 0ns,
+    };
+    const PacingResult unpacedDropResult =
+            pacing.onDisplayTimingsChanged(1, PipelineMode::On, emptyDurations, unpacedDropChange,
+                                           kSetFrameRateVotable);
+    EXPECT_FALSE(unpacedDropResult.vote.emitted());
+}
+
 TEST(ClassicPacingImplTest, DisplayTimingChangeSelectsLegacyDisplayModeAndWindowChangeRearmsVote) {
     ClassicPacingImplementation pacing;
     const RefreshPeriodMap periods = makePhysical60And120HzPeriods();
