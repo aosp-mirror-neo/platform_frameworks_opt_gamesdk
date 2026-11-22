@@ -73,11 +73,12 @@ void SwappyGL_injectTracer(const SwappyTracer* t);
 void SwappyGL_setAutoSwapInterval(bool enabled);
 
 /**
- * @brief Sets the maximal duration for auto-swap interval in milliseconds.
+ * @brief Sets the maximal duration for auto-swap interval in nanoseconds.
  *
- * If Swappy is operating in auto-swap interval and the frame duration is longer
- * than `max_swap_ns`, Swappy will not do any pacing and just submit the frame
- * as soon as possible.
+ * When auto-swap interval is enabled, Swappy clamps automatic downshifts to
+ * `max_swap_ns`. Swappy does not pace in auto mode, and submits frames as soon
+ * as possible, when `max_swap_ns` is `0` or more than 1 ms shorter than the
+ * swap interval set with `SwappyGL_setSwapIntervalNS`.
  */
 void SwappyGL_setMaxAutoSwapIntervalNS(uint64_t max_swap_ns);
 

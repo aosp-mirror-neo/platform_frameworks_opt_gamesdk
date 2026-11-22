@@ -178,6 +178,91 @@ TEST(ClassicPacingImplTest, DisplayTimingChangeFallsBackWhenNoSamples) {
     EXPECT_FALSE(result.vote.emitted());
 }
 
+TEST(ClassicPacingImplTest, DisplayTimingChangeClampsLongStallToAutoSwapThreshold) {
+    ClassicPacingImplementation pacing;
+    FrameDurations durations;
+    feed(durations, TimePoint{}, kFramesToFillWindow, 75ms, 75ms, 0ns, /*miss=*/true);
+    ASSERT_TRUE(durations.hasEnoughSamples());
+
+    TimingChange change;
+    change.newRefreshPeriod = k60Hz;
+    change.swapDuration = k120Hz;
+    change.autoSwapIntervalThreshold = 50ms;
+
+    const PacingResult timingResult =
+            pacing.onDisplayTimingsChanged(6, PipelineMode::On, durations, change);
+
+    // 76ms pipelined implies interval 5 on 60Hz (83.3ms), clamped to 3 (50.0ms).
+    EXPECT_EQ(timingResult.autoSwapInterval, 3);
+    EXPECT_EQ(timingResult.pipelineMode, PipelineMode::On);
+    EXPECT_TRUE(durations.hasEnoughSamples());
+}
+
+TEST(ClassicPacingImplTest, ThresholdOnlyChangeReportsReclampAsConfigChange) {
+    ClassicPacingImplementation pacing;
+    FrameDurations durations;
+    feed(durations, TimePoint{}, kFramesToFillWindow, 75ms, 75ms, 0ns, /*miss=*/true);
+    ASSERT_TRUE(durations.hasEnoughSamples());
+
+    // Tightening the ceiling to 60fps re-clamps interval 4 to 2 on 120Hz.
+    TimingChange tightened;
+    tightened.oldRefreshPeriod = k120Hz;
+    tightened.newRefreshPeriod = k120Hz;
+    tightened.swapDuration = k60Hz;
+    tightened.autoSwapIntervalThreshold = k60Hz;
+    tightened.autoSwapIntervalThresholdChanged = true;
+    const PacingResult reclamped =
+            pacing.onDisplayTimingsChanged(4, PipelineMode::On, durations, tightened);
+    EXPECT_EQ(reclamped.autoSwapInterval, 2);
+    EXPECT_TRUE(reclamped.configChanged);
+
+    // Already within the new ceiling: nothing to report.
+    const PacingResult unchanged =
+            pacing.onDisplayTimingsChanged(2, PipelineMode::On, durations, tightened);
+    EXPECT_EQ(unchanged.autoSwapInterval, 2);
+    EXPECT_FALSE(unchanged.configChanged);
+
+    // A same-frame app floor change owns the update, so it is not reported.
+    TimingChange withFloorChange = tightened;
+    withFloorChange.swapDurationChanged = true;
+    const PacingResult floorChanged =
+            pacing.onDisplayTimingsChanged(4, PipelineMode::On, durations, withFloorChange);
+    EXPECT_EQ(floorChanged.autoSwapInterval, 2);
+    EXPECT_FALSE(floorChanged.configChanged);
+}
+
+TEST(ClassicPacingImplTest, UpdateSwapIntervalClampsRefreshRateVoteToAutoSwapThreshold) {
+    ClassicPacingImplementation pacing;
+    FrameDurations durations;
+    feed(durations, TimePoint{}, kFramesToFillWindow, 75ms, 75ms, 0ns, /*miss=*/true);
+    ASSERT_TRUE(durations.hasEnoughSamples());
+
+    const PacingResult downshiftResult =
+            pacing.updateSwapInterval(1, PipelineMode::On, durations, k120Hz, k120Hz, 50ms, true,
+                                      kSetFrameRateVotable);
+
+    EXPECT_TRUE(downshiftResult.configChanged);
+    EXPECT_EQ(downshiftResult.autoSwapInterval, 6);
+    ASSERT_TRUE(downshiftResult.vote.frameRateHz.has_value());
+    EXPECT_NEAR(*downshiftResult.vote.frameRateHz, 20.0f, 0.05f);
+}
+
+TEST(ClassicPacingImplTest, UnpacedAutoSwapThresholdVotesRequestedFloorInsteadOfStallDuration) {
+    ClassicPacingImplementation pacing;
+    FrameDurations durations;
+    feed(durations, TimePoint{}, kFramesToFillWindow, 40ms, 40ms, 0ns, /*miss=*/true);
+    ASSERT_TRUE(durations.hasEnoughSamples());
+
+    const PacingResult unpacedResult =
+            pacing.updateSwapInterval(2, PipelineMode::On, durations, k120Hz, k60Hz, 0ns, true,
+                                      kSetFrameRateVotable);
+
+    EXPECT_FALSE(unpacedResult.configChanged);
+    EXPECT_EQ(unpacedResult.autoSwapInterval, 2);
+    ASSERT_TRUE(unpacedResult.vote.frameRateHz.has_value());
+    EXPECT_NEAR(*unpacedResult.vote.frameRateHz, 60.0f, 0.05f);
+}
+
 TEST(ClassicPacingImplTest, DisplayTimingChangeSelectsLegacyDisplayModeAndWindowChangeRearmsVote) {
     ClassicPacingImplementation pacing;
     const RefreshPeriodMap periods = makePhysical60And120HzPeriods();

@@ -1534,4 +1534,177 @@ TEST_F(SwappyCommonHostTest, FramePacingResetVotesPanelBackToAppFloorAfterArrDow
     EXPECT_EQ(harness.swappy().getRefreshPeriod(), k60HzPeriod);
     EXPECT_EQ(harness.swappy().getSwapDuration(), k60HzPeriod);
 }
+
+TEST_F(SwappyCommonHostTest, MaxAutoSwapThresholdKeepsPacingAcrossSubHzJitterAndNonDivisorPanels) {
+    // 119.88Hz panel (8,341,675ns): 2 * period = 16,683,350ns, 16.7us above
+    // SWAPPY_SWAP_60FPS, stays paced within FRAME_MARGIN.
+    {
+        Settings::reset();
+        auto state = std::make_shared<PlatformSharedState>();
+        constexpr auto k119_88HzPeriod = 8'341'675ns;
+        state->initialSettings = makeSettings(k119_88HzPeriod);
+        Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+
+        SwappyCommon swappy(std::make_unique<FakeSwappyPlatform>(state));
+        ASSERT_TRUE(swappy.isValid());
+        swappy.setMaxAutoSwapDuration(std::chrono::nanoseconds(SWAPPY_SWAP_60FPS));
+
+        const auto handlers = readySwapHandlers();
+        swappy.onPreSwap(handlers);
+        swappy.onPostSwap(handlers);
+        ASSERT_TRUE(triggerChoreographer(*state));
+        ASSERT_TRUE(triggerChoreographer(*state));
+
+        swappy.onPreSwap(handlers);
+        EXPECT_TRUE(swappy.needToSetPresentationTime());
+        swappy.onPostSwap(handlers);
+    }
+
+    // 90Hz panel (11,111,111ns) with 60fps floor and 60fps max auto threshold:
+    // rounding the 60fps floor up to 2 refresh periods (22.2ms) keeps pacing active,
+    // whereas an explicit 0ns max auto threshold switches pacing off.
+    {
+        Settings::reset();
+        auto state = std::make_shared<PlatformSharedState>();
+        constexpr auto k90HzPeriod = 11'111'111ns;
+        state->initialSettings = makeSettings(k90HzPeriod);
+        Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+
+        SwappyCommon swappy(std::make_unique<FakeSwappyPlatform>(state));
+        ASSERT_TRUE(swappy.isValid());
+        swappy.setMaxAutoSwapDuration(std::chrono::nanoseconds(SWAPPY_SWAP_60FPS));
+
+        const auto handlers = readySwapHandlers();
+        swappy.onPreSwap(handlers);
+        swappy.onPostSwap(handlers);
+        ASSERT_TRUE(triggerChoreographer(*state));
+        ASSERT_TRUE(triggerChoreographer(*state));
+
+        swappy.onPreSwap(handlers);
+        EXPECT_TRUE(swappy.needToSetPresentationTime());
+        swappy.onPostSwap(handlers);
+
+        swappy.setMaxAutoSwapDuration(0ns);
+        swappy.onPreSwap(handlers);
+        EXPECT_FALSE(swappy.needToSetPresentationTime());
+        swappy.onPostSwap(handlers);
+    }
+
+    // 120Hz panel (8,333,333ns) with 60fps floor and 60fps max auto threshold:
+    // sustained stalls clamp at interval 2 instead of stepping past the ceiling
+    // and leaving fast frames unpaced at 120+ FPS.
+    {
+        Settings::reset();
+        SimulatedSwappyHarness harness(makeSettings(k120HzPeriod), Clock::time_point{1s});
+        Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+        harness.swappy().setMaxAutoSwapDuration(std::chrono::nanoseconds(SWAPPY_SWAP_60FPS));
+
+        harness.runFrames(4, 2ms, 2ms);
+        ASSERT_EQ(harness.swappy().getSwapDuration(), 2 * k120HzPeriod);
+
+        harness.runFrames(120, 25ms, 25ms);
+        EXPECT_EQ(harness.swappy().getSwapDuration(), 2 * k120HzPeriod);
+
+        harness.runFrame(2ms, 2ms);
+        EXPECT_TRUE(harness.swappy().needToSetPresentationTime());
+        const Clock::time_point firstPresent = harness.swappy().getPresentationTime();
+        harness.runFrame(2ms, 2ms);
+        EXPECT_TRUE(harness.swappy().needToSetPresentationTime());
+        const Clock::time_point secondPresent = harness.swappy().getPresentationTime();
+        EXPECT_NEAR((secondPresent - firstPresent).count(), (2 * k120HzPeriod).count(), 1'000'000);
+    }
+}
+
+TEST_F(SwappyCommonHostTest, ArrPanelClampsDisplayVoteAtMaxAutoSwapThresholdDuringStall) {
+    SimulatedSwappyHarness harness(makeSettings(k120HzPeriod, 36), Clock::time_point{1s},
+                                   DisplayPanelModel::continuousArr(24, 120, 2));
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    harness.swappy().setMaxAutoSwapDuration(std::chrono::nanoseconds(SWAPPY_SWAP_60FPS));
+    ANativeWindow window{203};
+    harness.swappy().setANativeWindow(&window);
+
+    harness.runFrames(150, 4ms, 35ms);
+
+    EXPECT_EQ(harness.displayPeriod(), k60HzPeriod);
+    EXPECT_EQ(harness.swappy().getRefreshPeriod(), k60HzPeriod);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), k60HzPeriod);
+}
+
+TEST_F(SwappyCommonHostTest, TighteningMaxAutoSwapDurationMidRunReclampsIntervalAndPanelVote) {
+    SimulatedSwappyHarness harness(makeSettings(k120HzPeriod, 36), Clock::time_point{1s},
+                                   DisplayPanelModel::continuousArr(24, 120, 2));
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    ANativeWindow window{204};
+    harness.swappy().setANativeWindow(&window);
+
+    harness.runFrames(200, 4ms, 39ms);
+    ASSERT_EQ(harness.displayPeriod(), 40'000'000ns);
+
+    harness.swappy().setMaxAutoSwapDuration(std::chrono::nanoseconds(SWAPPY_SWAP_60FPS));
+    harness.runFrame(2ms, 2ms);
+    EXPECT_TRUE(harness.swappy().needToSetPresentationTime());
+    harness.runFrames(3, 2ms, 2ms);
+
+    EXPECT_EQ(harness.displayPeriod(), k60HzPeriod);
+    EXPECT_EQ(harness.swappy().getRefreshPeriod(), k60HzPeriod);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), k60HzPeriod);
+}
+
+TEST_F(SwappyCommonHostTest, SameFrameSwapDurationAndMaxAutoThresholdTransitionStaysPaced) {
+    SimulatedSwappyHarness harness(makeSettings(k120HzPeriod), Clock::time_point{1s});
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_30FPS);
+    harness.swappy().setMaxAutoSwapDuration(std::chrono::nanoseconds(SWAPPY_SWAP_30FPS));
+
+    harness.runFrames(4, 2ms, 2ms);
+    ASSERT_EQ(harness.swappy().getSwapDuration(), 4 * k120HzPeriod);
+    ASSERT_TRUE(harness.swappy().needToSetPresentationTime());
+
+    // Switch both floor and max auto-swap ceiling from 30 FPS to 60 FPS on the
+    // same frame; pacing must stay active across the transition frame without
+    // comparing the old interval 4 against the new 60 FPS ceiling prematurely.
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    harness.swappy().setMaxAutoSwapDuration(std::chrono::nanoseconds(SWAPPY_SWAP_60FPS));
+
+    harness.runFrame(2ms, 2ms);
+    EXPECT_TRUE(harness.swappy().needToSetPresentationTime());
+    EXPECT_EQ(harness.swappy().getSwapDuration(), 2 * k120HzPeriod);
+
+    harness.runFrame(2ms, 2ms);
+    EXPECT_TRUE(harness.swappy().needToSetPresentationTime());
+    EXPECT_EQ(harness.swappy().getSwapDuration(), 2 * k120HzPeriod);
+}
+
+TEST_F(SwappyCommonHostTest, TighteningMaxAutoSwapDurationReclampsIntervalAndNotifiesCallback) {
+    SimulatedSwappyHarness harness(makeSettings(k120HzPeriod), Clock::time_point{1s});
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+
+    harness.runFrames(4, 2ms, 2ms);
+    ASSERT_EQ(harness.swappy().getSwapDuration(), 2 * k120HzPeriod);
+
+    harness.runFrames(150, 4ms, 28ms);
+    ASSERT_EQ(harness.swappy().getSwapDuration(), 4 * k120HzPeriod);
+
+    struct ReclampedCallbackState {
+        SwappyCommon* swappy = nullptr;
+        int callCount = 0;
+        std::chrono::nanoseconds observedSwapDuration{0};
+    } callbackState{.swappy = &harness.swappy()};
+
+    SwappyTracer tracer{};
+    tracer.userData = &callbackState;
+    tracer.swapIntervalChanged = [](void* data) {
+        auto* state = static_cast<ReclampedCallbackState*>(data);
+        ++state->callCount;
+        state->observedSwapDuration = state->swappy->getSwapDuration();
+    };
+    harness.swappy().addTracerCallbacks(tracer);
+
+    harness.swappy().setMaxAutoSwapDuration(std::chrono::nanoseconds(SWAPPY_SWAP_60FPS));
+    harness.runFrame(2ms, 2ms);
+
+    EXPECT_EQ(callbackState.callCount, 1);
+    EXPECT_EQ(callbackState.observedSwapDuration, 2 * k120HzPeriod);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), 2 * k120HzPeriod);
+}
+
 } // namespace

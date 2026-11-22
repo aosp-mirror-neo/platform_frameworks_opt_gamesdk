@@ -139,26 +139,30 @@ void SwappyCommon::onChoreographer(int64_t /*frameTimeNanos*/) {
     mPlatform->postFrameCallbacks();
 }
 
+bool SwappyCommon::isAutoSwapWithinThresholdLocked() const {
+    const AutoSwapBounds bounds = autoSwapBounds(mCommonSettings.refreshPeriod, mSwapDuration,
+                                                 mAutoSwapIntervalThreshold);
+    return mNextAutoSwapIntervalThreshold > 0ns && mAutoSwapInterval <= bounds.ceiling;
+}
+
 bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
     int lateFrames = 0;
     bool presentationTimeIsNeeded;
 
     // We do not want to hold the mutex while waiting, so make a local copy of
     // the flags and current pacing configuration.
-    nanoseconds pacedPeriod;
     PipelineMode localPipelineMode;
-    bool localAutoSwapIntervalEnabled;
+    bool shouldPaceFrame;
     bool localFramePacingEnabled;
     bool localBlockingWaitEnabled;
     {
         std::lock_guard<std::mutex> lock(mMutex);
-        pacedPeriod = mCommonSettings.refreshPeriod * mAutoSwapInterval;
         localPipelineMode = mActiveSwapPipelineMode.value_or(mPipelineMode);
-        localAutoSwapIntervalEnabled = mAutoSwapIntervalEnabled;
         localFramePacingEnabled = mFramePacingEnabled;
         // We do the blocking wait when pacing or request by the app when not
         // pacing.
         localBlockingWaitEnabled = mBlockingWaitEnabled || mFramePacingEnabled;
+        shouldPaceFrame = !mAutoSwapIntervalEnabled || isAutoSwapWithinThresholdLocked();
     }
 
     const nanoseconds cpuTime =
@@ -171,7 +175,7 @@ bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
     // if we are running slower than the threshold (if auto swap interval is
     // enabled) there is no point to sleep,
     // just let the app run as fast as it can
-    if (pacedPeriod <= mAutoSwapIntervalThreshold.load() || !localAutoSwapIntervalEnabled) {
+    if (shouldPaceFrame) {
         if (localFramePacingEnabled) {
             TRACE_SCOPE("Swappy::WaitPhase");
             waitUntilTargetFrame();
@@ -230,7 +234,7 @@ bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
     return presentationTimeIsNeeded;
 }
 
-void SwappyCommon::updateDisplayTimings() {
+bool SwappyCommon::updateDisplayTimings() {
     std::lock_guard<std::mutex> lock(mMutex);
     SWAPPY_LOGW_ONCE_IF(!mWindow,
                         "ANativeWindow not configured, frame rate will not be "
@@ -243,22 +247,25 @@ void SwappyCommon::updateDisplayTimings() {
     }
 
     if (!mFramePacingEnabled) {
-        return;
+        return false;
     }
 
     if (!mTimingSettingsNeedUpdate && !mWindowChanged) {
-        return;
+        return false;
     }
 
-    applyNextTimingSettings();
+    return applyNextTimingSettings();
 }
 
-void SwappyCommon::applyNextTimingSettings() {
+bool SwappyCommon::applyNextTimingSettings() {
     mTimingSettingsNeedUpdate = false;
+    const bool autoSwapThresholdChanged =
+            mAutoSwapIntervalThreshold != mNextAutoSwapIntervalThreshold;
 
-    if (!mWindowChanged && mCommonSettings.refreshPeriod == mNextTimingSettings.refreshPeriod &&
+    if (!mWindowChanged && !autoSwapThresholdChanged &&
+        mCommonSettings.refreshPeriod == mNextTimingSettings.refreshPeriod &&
         mSwapDuration == mNextTimingSettings.swapDuration) {
-        return;
+        return false;
     }
 
     const bool swapDurationChanged = mSwapDuration != mNextTimingSettings.swapDuration;
@@ -266,12 +273,15 @@ void SwappyCommon::applyNextTimingSettings() {
             .oldRefreshPeriod = mCommonSettings.refreshPeriod,
             .newRefreshPeriod = mNextTimingSettings.refreshPeriod,
             .swapDuration = mNextTimingSettings.swapDuration,
+            .autoSwapIntervalThreshold = mNextAutoSwapIntervalThreshold,
             .swapDurationChanged = swapDurationChanged,
+            .autoSwapIntervalThresholdChanged = autoSwapThresholdChanged,
             .autoSwapIntervalEnabled = mAutoSwapIntervalEnabled,
     };
     mWindowChanged = false;
     mCommonSettings.refreshPeriod = mNextTimingSettings.refreshPeriod;
     mSwapDuration = mNextTimingSettings.swapDuration;
+    mAutoSwapIntervalThreshold = mNextAutoSwapIntervalThreshold;
 
     const PacingResult timingResult =
             mPacingImpl->onDisplayTimingsChanged(mAutoSwapInterval, mPipelineMode, mFrameDurations,
@@ -285,6 +295,8 @@ void SwappyCommon::applyNextTimingSettings() {
     TRACE_INT("mCommonSettings.refreshPeriod", mCommonSettings.refreshPeriod.count());
     TRACE_INT("mPipelineMode", static_cast<int>(mPipelineMode));
     TRACE_INT("Swappy.TargetPeriodNs", (mAutoSwapInterval * mCommonSettings.refreshPeriod).count());
+
+    return timingResult.configChanged;
 }
 
 void SwappyCommon::onPreSwap(const SwapHandlers& h) {
@@ -293,12 +305,13 @@ void SwappyCommon::onPreSwap(const SwapHandlers& h) {
     }
 
     PipelineMode pipelineMode;
-    nanoseconds pacedPeriod;
+    bool nonPipelinePresentationTimeNeeded;
     {
         std::lock_guard<std::mutex> lock(mMutex);
         mActiveSwapPipelineMode = mPipelineMode;
         pipelineMode = mPipelineMode;
-        pacedPeriod = mCommonSettings.refreshPeriod * mAutoSwapInterval;
+        nonPipelinePresentationTimeNeeded = mFramePacingEnabled &&
+                (!mAutoSwapIntervalEnabled || isAutoSwapWithinThresholdLocked());
     }
 
     // for non pipeline mode where both cpu and gpu work is done at the same
@@ -306,7 +319,7 @@ void SwappyCommon::onPreSwap(const SwapHandlers& h) {
     if (pipelineMode == PipelineMode::On) {
         mPresentationTimeNeeded = waitForNextFrame(h);
     } else {
-        mPresentationTimeNeeded = (pacedPeriod <= mAutoSwapIntervalThreshold.load());
+        mPresentationTimeNeeded = nonPipelinePresentationTimeNeeded;
     }
 
     mSwapTime = mClock.now();
@@ -340,7 +353,9 @@ void SwappyCommon::onPostSwap(const SwapHandlers& h) {
         TRACE_INT("mAutoSwapInterval", mAutoSwapInterval);
     }
 
-    updateDisplayTimings();
+    if (updateDisplayTimings()) {
+        swapIntervalChangedCallbacks();
+    }
     SWAPPY_TRACE_SETTINGS(mTraceSession, buildTraceSettingsSnapshot());
 
     startFrame();
@@ -360,9 +375,8 @@ TraceSettingsSnapshot SwappyCommon::buildTraceSettingsSnapshot() {
         snap.pipelineMode = mPipelineMode;
         snap.framePacingEnabled = mFramePacingEnabled;
         snap.blockingWaitEnabled = mBlockingWaitEnabled;
+        snap.autoSwapIntervalThresholdNs = mAutoSwapIntervalThreshold.count();
     }
-    snap.autoSwapIntervalThresholdNs =
-            mAutoSwapIntervalThreshold.load(std::memory_order_relaxed).count();
     snap.fenceTimeoutNs = mFenceTimeout.load(std::memory_order_relaxed).count();
     snap.bufferStuffingFixWait = mBufferStuffingFixWait.load(std::memory_order_relaxed);
     snap.useAffinity = Settings::getInstance()->getUseAffinity();
@@ -434,6 +448,7 @@ bool SwappyCommon::updateSwapInterval() {
         if (mTimingSettingsNeedUpdate) {
             mCommonSettings.refreshPeriod = mNextTimingSettings.refreshPeriod;
             mSwapDuration = mNextTimingSettings.swapDuration;
+            mAutoSwapIntervalThreshold = mNextAutoSwapIntervalThreshold;
             mTimingSettingsNeedUpdate = false;
             TRACE_INT("mSwapDuration", mSwapDuration.count());
             TRACE_INT("mCommonSettings.refreshPeriod", mCommonSettings.refreshPeriod.count());
@@ -453,13 +468,18 @@ bool SwappyCommon::updateSwapInterval() {
         mFramePacingResetRequested = false;
         return resetResult.configChanged;
     }
-    if (!mAutoSwapIntervalEnabled) return false;
+    if (!mAutoSwapIntervalEnabled ||
+        (mTimingSettingsNeedUpdate &&
+         (mSwapDuration != mNextTimingSettings.swapDuration ||
+          mAutoSwapIntervalThreshold != mNextAutoSwapIntervalThreshold))) {
+        return false;
+    }
 
     const auto result =
             mPacingImpl->updateSwapInterval(mAutoSwapInterval, mPipelineMode, mFrameDurations,
                                             mCommonSettings.refreshPeriod, mSwapDuration,
-                                            mAutoSwapIntervalThreshold.load(),
-                                            mPipelineModeAutoMode, votableRefreshPeriods());
+                                            mAutoSwapIntervalThreshold, mPipelineModeAutoMode,
+                                            votableRefreshPeriods());
 
     if (result.autoSwapInterval != mAutoSwapInterval) {
         TRACE_INT("Swappy.TargetPeriodNs",
@@ -568,6 +588,16 @@ void SwappyCommon::setAutoPipelineMode(bool enabled) {
         mPipelineMode = PipelineMode::On;
         TRACE_INT("mPipelineMode", static_cast<int>(mPipelineMode));
     }
+}
+
+void SwappyCommon::setMaxAutoSwapDuration(std::chrono::nanoseconds swapDuration) {
+    std::lock_guard<std::mutex> lock(mMutex);
+    if (mNextAutoSwapIntervalThreshold == swapDuration &&
+        mAutoSwapIntervalThreshold == swapDuration) {
+        return;
+    }
+    mNextAutoSwapIntervalThreshold = swapDuration;
+    mTimingSettingsNeedUpdate = true;
 }
 
 void SwappyCommon::setPreferredDisplayModeId(int modeId) {

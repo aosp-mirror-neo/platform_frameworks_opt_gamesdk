@@ -733,11 +733,23 @@ TEST_F(SwappyVkHostTest, GoogleDisplayTimingSetsDesiredPresentTimeAndSwappySemap
 TEST_F(SwappyVkHostTest, GoogleDisplayTimingDropsDesiredPresentTimeToZeroAboveMaxThreshold) {
     SimulatedSwappyVkHarness harness(/*advertiseGoogleDisplayTiming=*/true);
 
-    // Cap max auto-swap duration at 30ms so stepping down to 30Hz (33.33ms) exceeds the
-    // threshold and presents unpaced with desiredPresentTime == 0.
+    // With a 60Hz floor and a 30ms max auto-swap ceiling, automatic downshifts clamp at
+    // 60Hz (16.67ms) rather than stepping to 30Hz (33.33ms) and dropping pacing.
     SwappyVk_setMaxAutoSwapIntervalNS(30'000'000);
     SwappyVk_setFenceTimeoutNS(200'000'000);
     harness.presentFrames(150, 4ms, 22ms);
+
+    EXPECT_NEAR(SwappyVk_getSwapIntervalNS(harness.swapchain()),
+                static_cast<uint64_t>(k60HzPeriod.count()), 100);
+    const auto clampedPresents = harness.driver().recordedPresents();
+    ASSERT_FALSE(clampedPresents.empty());
+    EXPECT_TRUE(clampedPresents.back().hasDisplayTiming);
+    EXPECT_GT(clampedPresents.back().desiredPresentTimeNs, 0u);
+
+    // Setting an explicit 30Hz swap floor (33.33ms) above the 30ms auto-swap threshold
+    // presents unpaced with desiredPresentTime == 0.
+    SwappyVk_setSwapIntervalNS(harness.device(), harness.swapchain(), SWAPPY_SWAP_30FPS);
+    harness.presentFrames(3, 4ms, 4ms);
 
     EXPECT_NEAR(SwappyVk_getSwapIntervalNS(harness.swapchain()),
                 static_cast<uint64_t>(k30HzPeriod.count()), 100);

@@ -45,7 +45,9 @@ struct TimingChange {
     std::chrono::nanoseconds oldRefreshPeriod{0};
     std::chrono::nanoseconds newRefreshPeriod{0};
     std::chrono::nanoseconds swapDuration{0};
+    std::chrono::nanoseconds autoSwapIntervalThreshold{DEFAULT_AUTO_SWAP_INTERVAL_THRESHOLD};
     bool swapDurationChanged = false;
+    bool autoSwapIntervalThresholdChanged = false;
     bool autoSwapIntervalEnabled = true;
 };
 
@@ -82,6 +84,8 @@ public:
             std::chrono::nanoseconds fallbackRefreshPeriod,
             const VotableRefreshPeriods& votableRefreshPeriods = {}) = 0;
 
+    // Sets configChanged when an auto-swap threshold change re-clamps the swap
+    // interval, so the caller notifies swapIntervalChanged listeners.
     // votableRefreshPeriods.periods must stay valid for the duration of the call.
     virtual PacingResult onDisplayTimingsChanged(
             int32_t currentSwapInterval, PipelineMode currentPipelineMode,

@@ -93,10 +93,7 @@ public:
 
     void setAutoSwapInterval(bool enabled);
     void setAutoPipelineMode(bool enabled);
-
-    void setMaxAutoSwapDuration(std::chrono::nanoseconds swapDuration) {
-        mAutoSwapIntervalThreshold = swapDuration;
-    }
+    void setMaxAutoSwapDuration(std::chrono::nanoseconds swapDuration);
 
     Clock::time_point getPresentationTime() {
         return mPresentationTime;
@@ -165,9 +162,10 @@ private:
     // The returned periods pointer stays valid while mMutex is held.
     [[nodiscard]] VotableRefreshPeriods votableRefreshPeriods() const REQUIRES(mMutex);
     void applyRefreshRateVote(const RefreshRateVote& vote) REQUIRES(mMutex);
+    [[nodiscard]] bool isAutoSwapWithinThresholdLocked() const REQUIRES(mMutex);
     void refreshSupportedRefreshPeriods() EXCLUDES(mMutex);
-    void updateDisplayTimings();
-    void applyNextTimingSettings() REQUIRES(mMutex);
+    bool updateDisplayTimings();
+    bool applyNextTimingSettings() REQUIRES(mMutex);
 
     // Waits for the next frame, considering both Choreographer and the prior
     // frame's completion
@@ -201,7 +199,8 @@ private:
 
     std::chrono::nanoseconds mSwapDuration GUARDED_BY(mMutex) = 0ns;
     int32_t mAutoSwapInterval GUARDED_BY(mMutex);
-    std::atomic<std::chrono::nanoseconds> mAutoSwapIntervalThreshold = {50ms}; // 20FPS
+    std::chrono::nanoseconds mAutoSwapIntervalThreshold GUARDED_BY(mMutex) =
+            DEFAULT_AUTO_SWAP_INTERVAL_THRESHOLD;
 
     std::optional<Clock::time_point> mStartFrameTime;
 
@@ -250,6 +249,8 @@ private:
     };
     TimingSettings mNextTimingSettings GUARDED_BY(mMutex) = {};
     bool mTimingSettingsNeedUpdate GUARDED_BY(mMutex) = false;
+    std::chrono::nanoseconds mNextAutoSwapIntervalThreshold GUARDED_BY(mMutex) =
+            DEFAULT_AUTO_SWAP_INTERVAL_THRESHOLD;
 
     CPUTracer mCPUTracer;
 

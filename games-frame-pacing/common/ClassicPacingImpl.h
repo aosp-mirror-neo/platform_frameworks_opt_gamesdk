@@ -146,11 +146,12 @@ public:
                         decision.next.pipelineMode == PipelineMode::On ? "on" : "off");
         }
 
-        RefreshRateVote vote;
-        if (decision.preferredRefreshPeriodHint > 0ns) {
-            vote = voteRefreshPeriod(decision.preferredRefreshPeriodHint, swapDuration,
-                                     votableRefreshPeriods);
-        }
+        const AutoSwapBounds bounds =
+                autoSwapBounds(refreshPeriod, swapDuration, autoSwapIntervalThreshold);
+        const RefreshRateVote vote =
+                voteClampedRefreshPeriod(decision.next.autoSwapInterval, bounds,
+                                         decision.preferredRefreshPeriodHint, swapDuration,
+                                         autoSwapIntervalThreshold, votableRefreshPeriods);
 
         if (decision.configChanged) {
             durations.clear();
@@ -169,7 +170,7 @@ public:
             FrameDurations& durations, const TimingChange& change,
             const VotableRefreshPeriods& votableRefreshPeriods = {}) override {
         using namespace std::chrono_literals;
-        if (!change.autoSwapIntervalEnabled || change.swapDurationChanged) {
+        if (!change.autoSwapIntervalEnabled) {
             durations.clear();
             const int32_t autoSwapInterval =
                     calculateSwapInterval(change.swapDuration, change.newRefreshPeriod);
@@ -182,6 +183,10 @@ public:
             };
         }
 
+        if (change.swapDurationChanged) {
+            durations.clear();
+        }
+
         const auto oldPacedPeriod = change.oldRefreshPeriod * currentSwapInterval;
         const auto pipelineFrameTime = durations.getAverageFrameTime().getTime(PipelineMode::On);
         const auto targetDuration =
@@ -191,32 +196,67 @@ public:
         const bool swapIntervalValid =
                 change.newRefreshPeriod * autoSwapInterval + DURATION_ROUNDING_MARGIN >=
                 change.swapDuration;
-        if (!swapIntervalValid) {
-            autoSwapInterval = calculateSwapInterval(change.swapDuration, change.newRefreshPeriod);
-        }
+        const AutoSwapBounds bounds = autoSwapBounds(change.newRefreshPeriod, change.swapDuration,
+                                                     change.autoSwapIntervalThreshold);
+        autoSwapInterval = bounds.clamp(swapIntervalValid ? autoSwapInterval : bounds.floor);
 
         RefreshRateVote vote;
-        if (!swapIntervalValid || !mDisplayRateController.hasVoted()) {
-            vote = voteRefreshPeriod(change.swapDuration, change.swapDuration,
-                                     votableRefreshPeriods);
-        }
-
-        const auto newPacedPeriod = change.newRefreshPeriod * autoSwapInterval;
-        const bool budgetLoosened = newPacedPeriod > oldPacedPeriod + DURATION_ROUNDING_MARGIN ||
-                currentPipelineMode == PipelineMode::Off;
-        if (budgetLoosened) {
-            durations.clearMissesFittingBudget(newPacedPeriod, PipelineMode::On);
+        bool configChanged = false;
+        if (change.autoSwapIntervalThresholdChanged && !change.swapDurationChanged) {
+            durations.clear();
+            // Report the re-clamp so the caller notifies swapIntervalChanged
+            // listeners; app floor and refresh-period changes do not.
+            configChanged = autoSwapInterval != currentSwapInterval;
+            vote = voteClampedRefreshPeriod(autoSwapInterval, bounds, targetDuration,
+                                            change.swapDuration, change.autoSwapIntervalThreshold,
+                                            votableRefreshPeriods);
+        } else {
+            if (change.swapDurationChanged || !swapIntervalValid ||
+                !mDisplayRateController.hasVoted()) {
+                vote = voteClampedRefreshPeriod(autoSwapInterval, bounds, change.swapDuration,
+                                                change.swapDuration,
+                                                change.autoSwapIntervalThreshold,
+                                                votableRefreshPeriods);
+            }
+            const auto newPacedPeriod = change.newRefreshPeriod * autoSwapInterval;
+            const bool budgetLoosened =
+                    newPacedPeriod > oldPacedPeriod + DURATION_ROUNDING_MARGIN ||
+                    currentPipelineMode == PipelineMode::Off;
+            if (budgetLoosened) {
+                durations.clearMissesFittingBudget(newPacedPeriod, PipelineMode::On);
+            }
         }
 
         return PacingResult{
                 .autoSwapInterval = autoSwapInterval,
                 .pipelineMode = PipelineMode::On,
-                .configChanged = false,
+                .configChanged = configChanged,
                 .vote = vote,
         };
     }
 
 private:
+    RefreshRateVote voteClampedRefreshPeriod(int32_t swapInterval, const AutoSwapBounds& bounds,
+                                             std::chrono::nanoseconds targetPeriod,
+                                             std::chrono::nanoseconds minSwapDuration,
+                                             std::chrono::nanoseconds autoSwapIntervalThreshold,
+                                             const VotableRefreshPeriods& votableRefreshPeriods) {
+        using namespace std::chrono_literals;
+        if (swapInterval > bounds.ceiling) {
+            return minSwapDuration > 0ns
+                    ? voteRefreshPeriod(minSwapDuration, minSwapDuration, votableRefreshPeriods)
+                    : RefreshRateVote{};
+        }
+        if (targetPeriod <= 0ns) {
+            return votableRefreshPeriods.usesSetFrameRate
+                    ? RefreshRateVote{}
+                    : voteRefreshPeriod(0ns, minSwapDuration, votableRefreshPeriods);
+        }
+        const auto maxPreferredPeriod = std::max(minSwapDuration, autoSwapIntervalThreshold);
+        return voteRefreshPeriod(std::min(targetPeriod, maxPreferredPeriod), minSwapDuration,
+                                 votableRefreshPeriods);
+    }
+
     DisplayRateController mDisplayRateController;
 };
 

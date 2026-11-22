@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -60,6 +61,11 @@ inline constexpr int FRAME_DROP_THRESHOLD = 10; // 10%
 // refresh period.
 inline constexpr std::chrono::nanoseconds REFRESH_RATE_MARGIN = std::chrono::nanoseconds(500);
 
+// Default auto-swap ceiling (20 fps), used until the app sets a max auto swap
+// interval.
+inline constexpr std::chrono::nanoseconds DEFAULT_AUTO_SWAP_INTERVAL_THRESHOLD =
+        std::chrono::milliseconds(50);
+
 // The part of Swappy's state that the ladder owns.
 struct LadderState {
     int32_t autoSwapInterval = 1;
@@ -83,7 +89,7 @@ struct LadderInput {
     // not swap faster than this.
     std::chrono::nanoseconds swapDuration = std::chrono::nanoseconds(0);
     // The ceiling, i.e. the slowest swap the ladder may descend to.
-    std::chrono::nanoseconds autoSwapIntervalThreshold = std::chrono::milliseconds(50);
+    std::chrono::nanoseconds autoSwapIntervalThreshold = DEFAULT_AUTO_SWAP_INTERVAL_THRESHOLD;
     bool pipelineModeAutoMode = true;
 };
 
@@ -136,6 +142,55 @@ inline int calculateSwapInterval(std::chrono::nanoseconds frameTime,
     return (framesPerRefresh + (framesPerRefreshRemainder > REFRESH_RATE_MARGIN.count() ? 1 : 0));
 }
 
+// The auto-swap interval range on a panel. `floor` is the interval the app's
+// swap-duration floor needs, and `ceiling` is the longest interval within
+// `threshold + FRAME_MARGIN`, or `0` when auto pacing is disabled
+// (`threshold <= 0`). Owns the floor-versus-ceiling rule, so callers clamp
+// through it instead of comparing the two themselves.
+struct AutoSwapBounds {
+    int32_t floor = 1;
+    int32_t ceiling = 0;
+
+    // False when auto pacing is disabled or the app floor exceeds the ceiling;
+    // auto mode then holds the floor unpaced.
+    [[nodiscard]] bool paced() const {
+        return ceiling >= floor;
+    }
+
+    // Caps `interval` at the ceiling while paced; otherwise returns it as is.
+    [[nodiscard]] int32_t clamp(int32_t interval) const {
+        return paced() ? std::min(interval, ceiling) : interval;
+    }
+};
+
+// When `swapDuration` is within `threshold + FRAME_MARGIN`, rounding that floor
+// up to whole refresh periods (for example, 60fps -> 2 * 11.1ms on 90Hz) lifts
+// the ceiling to the floor, which keeps pacing active instead of crossing the
+// ceiling.
+[[nodiscard]] inline AutoSwapBounds autoSwapBounds(std::chrono::nanoseconds refreshPeriod,
+                                                   std::chrono::nanoseconds swapDuration,
+                                                   std::chrono::nanoseconds threshold) {
+    AutoSwapBounds bounds;
+    if (refreshPeriod <= std::chrono::nanoseconds(0)) {
+        return bounds;
+    }
+    if (swapDuration > std::chrono::nanoseconds(0)) {
+        bounds.floor = calculateSwapInterval(swapDuration, refreshPeriod);
+    }
+    if (threshold <= std::chrono::nanoseconds(0)) {
+        return bounds;
+    }
+    const auto maxBudget = (threshold > std::chrono::nanoseconds::max() - FRAME_MARGIN)
+            ? std::chrono::nanoseconds::max()
+            : threshold + FRAME_MARGIN;
+    const int64_t rawIntervals = maxBudget / refreshPeriod;
+    bounds.ceiling = (rawIntervals > INT32_MAX) ? INT32_MAX : static_cast<int32_t>(rawIntervals);
+    if (swapDuration > std::chrono::nanoseconds(0) && swapDuration <= maxBudget) {
+        bounds.ceiling = std::max(bounds.ceiling, bounds.floor);
+    }
+    return bounds;
+}
+
 namespace ladder_internal {
 
 // Is there room to move one step up the ladder without undercutting the swap
@@ -151,21 +206,16 @@ inline bool swapSlower(LadderState& state, const LadderInput& in, int newSwapInt
 
     const auto upperBound = in.refreshPeriod * state.autoSwapInterval;
     const auto frameFitsUpperBound = in.averageFrameTime.getTime(PipelineMode::On) <= upperBound;
-    const auto swapDurationWithinThreshold = in.refreshPeriod * state.autoSwapInterval <=
-            in.autoSwapIntervalThreshold + FRAME_MARGIN;
+    const AutoSwapBounds bounds =
+            autoSwapBounds(in.refreshPeriod, in.swapDuration, in.autoSwapIntervalThreshold);
 
-    // Check if turning on pipeline is not enough
-    if ((state.pipelineMode == PipelineMode::On || !frameFitsUpperBound) &&
-        swapDurationWithinThreshold) {
-        int32_t originalAutoSwapInterval = state.autoSwapInterval;
-        if (newSwapInterval > state.autoSwapInterval) {
-            state.autoSwapInterval = newSwapInterval;
-        } else {
-            state.autoSwapInterval++;
-        }
-        if (state.autoSwapInterval != originalAutoSwapInterval) {
-            swappedSlower = true;
-        }
+    // Check if turning on pipeline is not enough. Downshifts clamp at the
+    // ceiling (re-clamping an interval above it) and hold while unpaced.
+    if ((state.pipelineMode == PipelineMode::On || !frameFitsUpperBound) && bounds.paced()) {
+        const int32_t targetInterval =
+                bounds.clamp(std::max<int32_t>(newSwapInterval, state.autoSwapInterval + 1));
+        swappedSlower = targetInterval != state.autoSwapInterval;
+        state.autoSwapInterval = targetInterval;
     }
 
     // Deliberately outside the branch above, and deliberately not reported as a

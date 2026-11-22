@@ -237,12 +237,13 @@ void SwappyVk_setAutoPipelineMode(bool enabled);
 /**
  * @brief Sets the maximal swap duration for all instances.
  *
- * Sets the maximal duration for Auto-Swap-Interval in milliseconds.
- * If SwappyVk is operating in Auto-Swap-Interval and the frame duration is
- * longer than the provided duration, SwappyVk will not do any pacing and just
- * submit the frame as soon as possible.
+ * Sets the maximal duration for Auto-Swap-Interval in nanoseconds.
+ * When Auto-Swap-Interval is enabled, SwappyVk clamps automatic downshifts to
+ * `max_swap_ns`. SwappyVk does not pace in auto mode, and submits frames as
+ * soon as possible, when `max_swap_ns` is `0` or more than 1 ms shorter than
+ * the swap interval set with `SwappyVk_setSwapIntervalNS`.
  *
- * @param[in]  max_swap_ns - maximal swap duration in milliseconds.
+ * @param[in]  max_swap_ns - maximal swap duration in nanoseconds.
  */
 void SwappyVk_setMaxAutoSwapIntervalNS(uint64_t max_swap_ns);
 

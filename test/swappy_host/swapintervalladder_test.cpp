@@ -49,6 +49,7 @@ TEST(SwapIntervalLadderTest, TuningConstantsAreTheShippingValues) {
     EXPECT_EQ(NON_PIPELINE_PERCENT, 50);
     EXPECT_EQ(REFRESH_RATE_MARGIN, 500ns);
     EXPECT_EQ(DURATION_ROUNDING_MARGIN, 1us);
+    EXPECT_EQ(DEFAULT_AUTO_SWAP_INTERVAL_THRESHOLD, 50ms);
 }
 
 // Defaults chosen to be out of the way: no requested swap duration floor, a
@@ -137,13 +138,109 @@ TEST(SwapIntervalLadderTest, MissingFramesLengthensTheSwapInterval) {
 }
 
 // One step at a time is only the fallback. If the measured frame time already
-// implies a longer interval, the ladder jumps straight there: a 51ms frame on a
-// 60Hz panel needs four refresh periods, not two.
+// implies a longer interval within the ceiling, the ladder jumps straight
+// there: a 51ms frame on a 60Hz panel needs four refresh periods, not two.
 TEST(SwapIntervalLadderTest, SwapSlowerJumpsStraightToTheImpliedInterval) {
-    const LadderDecision d = decideSwapInterval(state(1, PipelineMode::On), input(50ms, 0ms, 100));
+    LadderInput in = input(50ms, 0ms, 100);
+    in.autoSwapIntervalThreshold = 70ms;
+
+    const LadderDecision d = decideSwapInterval(state(1, PipelineMode::On), in);
 
     EXPECT_EQ(d.next.autoSwapInterval, 4);
     EXPECT_TRUE(d.configChanged);
+}
+
+// Downshifts clamp at the auto-swap ceiling rather than stepping one rung past
+// it: on 60Hz, 120Hz, and 30Hz panels with the default 50ms ceiling, slow
+// windows do not cross into 66.7ms (15fps) or 58.3ms (17.1fps).
+TEST(SwapIntervalLadderTest, SwapSlowerClampsJumpAndStepAtThreshold) {
+    // 60Hz: 51ms pipelined implies interval 4 (66.7ms), clamped to 3 (50.0ms).
+    const LadderDecision jumped60 =
+            decideSwapInterval(state(1, PipelineMode::On), input(50ms, 0ms, 100));
+    EXPECT_EQ(jumped60.action, LadderAction::SwapSlower);
+    EXPECT_EQ(jumped60.next.autoSwapInterval, 3);
+    EXPECT_TRUE(jumped60.configChanged);
+
+    const LadderDecision held60 =
+            decideSwapInterval(state(3, PipelineMode::On), input(50ms, 0ms, 100));
+    EXPECT_EQ(held60.action, LadderAction::SwapSlower);
+    EXPECT_EQ(held60.next.autoSwapInterval, 3);
+    EXPECT_FALSE(held60.configChanged);
+
+    // 120Hz: interval 6 is 50.0ms; interval 7 (58.3ms) exceeds the 50ms ceiling.
+    LadderInput in120 = input(55ms, 0ms, 100);
+    in120.refreshPeriod = 8333333ns;
+    EXPECT_EQ(decideSwapInterval(state(1, PipelineMode::On), in120).next.autoSwapInterval, 6);
+    const LadderDecision held120 = decideSwapInterval(state(6, PipelineMode::On), in120);
+    EXPECT_EQ(held120.next.autoSwapInterval, 6);
+    EXPECT_FALSE(held120.configChanged);
+
+    // 30Hz: interval 1 is 33.3ms; interval 2 (66.7ms) exceeds the 50ms ceiling.
+    LadderInput in30 = input(55ms, 0ms, 100);
+    in30.refreshPeriod = 33333334ns;
+    const LadderDecision held30 = decideSwapInterval(state(1, PipelineMode::On), in30);
+    EXPECT_EQ(held30.next.autoSwapInterval, 1);
+    EXPECT_FALSE(held30.configChanged);
+
+    // 90Hz with a 60fps floor and a 60fps max threshold: rounded floor is
+    // interval 2 (22.2ms), and a 30ms hitch stays clamped at interval 2.
+    LadderInput in90 = input(30ms, 0ms, 100);
+    in90.refreshPeriod = 11111111ns;
+    in90.swapDuration = k60Hz;
+    in90.autoSwapIntervalThreshold = k60Hz;
+    const LadderDecision held90 = decideSwapInterval(state(2, PipelineMode::On), in90);
+    EXPECT_EQ(held90.next.autoSwapInterval, 2);
+    EXPECT_FALSE(held90.configChanged);
+}
+
+TEST(SwapIntervalLadderTest, SwapSlowerClampsCurrentIntervalDownWhenThresholdTightens) {
+    LadderInput tightened = input(45ms, 0ms, 50);
+    tightened.swapDuration = k60Hz;
+    tightened.autoSwapIntervalThreshold = k60Hz * 2;
+    const LadderDecision reclamped = decideSwapInterval(state(3, PipelineMode::On), tightened);
+    EXPECT_EQ(reclamped.action, LadderAction::SwapSlower);
+    EXPECT_EQ(reclamped.next.autoSwapInterval, 2);
+    EXPECT_TRUE(reclamped.configChanged);
+
+    // An explicit swapDuration floor above the threshold stays at the floor.
+    LadderInput floorAboveThreshold = input(45ms, 0ms, 50);
+    floorAboveThreshold.swapDuration = k60Hz * 2;
+    floorAboveThreshold.autoSwapIntervalThreshold = 30ms;
+    const LadderDecision preservedFloor =
+            decideSwapInterval(state(2, PipelineMode::On), floorAboveThreshold);
+    EXPECT_EQ(preservedFloor.next.autoSwapInterval, 2);
+    EXPECT_FALSE(preservedFloor.configChanged);
+}
+
+// autoSwapBounds() owns the floor-versus-ceiling rule that the ladder and the
+// pacing implementation clamp through.
+TEST(SwapIntervalLadderTest, AutoSwapBoundsLiftCeilingToRoundedFloorAndHoldFloorAboveIt) {
+    // Default 50ms ceiling on 120Hz: interval 6 (50.0ms) fits, 7 (58.3ms) does not.
+    const AutoSwapBounds at120 = autoSwapBounds(8333333ns, 0ns, 50ms);
+    EXPECT_EQ(at120.floor, 1);
+    EXPECT_EQ(at120.ceiling, 6);
+    EXPECT_TRUE(at120.paced());
+    EXPECT_EQ(at120.clamp(7), 6);
+    EXPECT_EQ(at120.clamp(4), 4);
+
+    // 60fps floor and ceiling on 90Hz: the floor rounds up to interval 2
+    // (22.2ms) and lifts the ceiling with it, so pacing stays active.
+    const AutoSwapBounds at90 = autoSwapBounds(11111111ns, k60Hz, k60Hz);
+    EXPECT_EQ(at90.floor, 2);
+    EXPECT_EQ(at90.ceiling, 2);
+    EXPECT_TRUE(at90.paced());
+
+    // A floor above the ceiling holds the floor unpaced; clamp() leaves it.
+    const AutoSwapBounds floorAbove = autoSwapBounds(k60Hz, k60Hz * 2, 30ms);
+    EXPECT_EQ(floorAbove.floor, 2);
+    EXPECT_EQ(floorAbove.ceiling, 1);
+    EXPECT_FALSE(floorAbove.paced());
+    EXPECT_EQ(floorAbove.clamp(2), 2);
+
+    // A zero threshold disables auto pacing.
+    const AutoSwapBounds disabled = autoSwapBounds(k60Hz, k60Hz, 0ns);
+    EXPECT_EQ(disabled.ceiling, 0);
+    EXPECT_FALSE(disabled.paced());
 }
 
 // FRAME_DROP_THRESHOLD is exclusive: exactly 10% missed is tolerated.
@@ -163,22 +260,20 @@ TEST(SwapIntervalLadderTest, ExactlyAtTheDropThresholdIsTolerated) {
     EXPECT_EQ(decideSwapInterval(state(1, PipelineMode::On), in).next.autoSwapInterval, 2);
 }
 
-// The ceiling is `refreshPeriod * interval <= threshold + FRAME_MARGIN`, so a
-// threshold one FRAME_MARGIN short of the resulting swap duration still permits
-// the step. Tested on the exact boundary because the margin is easy to drop.
+// The ceiling is `refreshPeriod * targetInterval <= threshold + FRAME_MARGIN`,
+// so a threshold one FRAME_MARGIN short of the resulting swap duration still
+// permits the step. Tested on the exact boundary because the margin is easy to
+// drop.
 TEST(SwapIntervalLadderTest, SwapSlowerCeilingIncludesOneFrameMargin) {
-    // Stepping from interval 2 to 3 produces a swap duration of 2 * k60Hz at
-    // the time the ceiling is checked -- the check uses the interval it is
-    // leaving, not the one it is moving to.
-    const nanoseconds swapDurationBeforeStep = k60Hz * 2;
+    const nanoseconds swapDurationAfterStep = k60Hz * 3;
 
     LadderInput justAllowed = input(40ms, 0ms, 50);
-    justAllowed.autoSwapIntervalThreshold = swapDurationBeforeStep - FRAME_MARGIN;
+    justAllowed.autoSwapIntervalThreshold = swapDurationAfterStep - FRAME_MARGIN;
     // 41ms pipelined over a 16.6ms period implies interval 3.
     EXPECT_EQ(decideSwapInterval(state(2, PipelineMode::On), justAllowed).next.autoSwapInterval, 3);
 
     LadderInput justBlocked = input(40ms, 0ms, 50);
-    justBlocked.autoSwapIntervalThreshold = swapDurationBeforeStep - FRAME_MARGIN - 1ns;
+    justBlocked.autoSwapIntervalThreshold = swapDurationAfterStep - FRAME_MARGIN - 1ns;
     const LadderDecision d = decideSwapInterval(state(2, PipelineMode::On), justBlocked);
     EXPECT_EQ(d.next.autoSwapInterval, 2);
     EXPECT_FALSE(d.configChanged);
