@@ -301,6 +301,53 @@ TEST_F(SwappyCommonHostTest, WindowLifecycleAcquiresReleasesAndDeduplicatesSameW
     EXPECT_EQ(snapshot.releasedWindows[1], &windowB);
 }
 
+TEST_F(SwappyCommonHostTest, DestructorReleasesRetainedWindowBeforePlatformTeardown) {
+    auto state = std::make_shared<PlatformSharedState>();
+    ANativeWindow window{11};
+
+    {
+        SwappyCommon swappy(std::make_unique<FakeSwappyPlatform>(state));
+        ASSERT_TRUE(swappy.isValid());
+        swappy.setANativeWindow(&window);
+    }
+
+    const PlatformSnapshot snapshot = snapshotPlatformState(*state);
+    ASSERT_EQ(snapshot.acquiredWindows.size(), 1u);
+    EXPECT_EQ(snapshot.acquiredWindows[0], &window);
+    ASSERT_EQ(snapshot.releasedWindows.size(), 1u);
+    EXPECT_EQ(snapshot.releasedWindows[0], &window);
+}
+
+TEST_F(SwappyCommonHostTest, DestructorDoesNotDoubleReleaseClearedWindow) {
+    auto state = std::make_shared<PlatformSharedState>();
+    ANativeWindow window{12};
+
+    {
+        SwappyCommon swappy(std::make_unique<FakeSwappyPlatform>(state));
+        ASSERT_TRUE(swappy.isValid());
+        swappy.setANativeWindow(&window);
+        swappy.setANativeWindow(nullptr);
+    }
+
+    const PlatformSnapshot snapshot = snapshotPlatformState(*state);
+    ASSERT_EQ(snapshot.acquiredWindows.size(), 1u);
+    ASSERT_EQ(snapshot.releasedWindows.size(), 1u);
+    EXPECT_EQ(snapshot.releasedWindows[0], &window);
+}
+
+TEST_F(SwappyCommonHostTest, DestructorDoesNotReleaseWhenWindowWasNeverSet) {
+    auto state = std::make_shared<PlatformSharedState>();
+
+    {
+        SwappyCommon swappy(std::make_unique<FakeSwappyPlatform>(state));
+        ASSERT_TRUE(swappy.isValid());
+    }
+
+    const PlatformSnapshot snapshot = snapshotPlatformState(*state);
+    EXPECT_TRUE(snapshot.acquiredWindows.empty());
+    EXPECT_TRUE(snapshot.releasedWindows.empty());
+}
+
 TEST_F(SwappyCommonHostTest, GetSupportedRefreshPeriodsCopiesSortedPeriodsFromPlatform) {
     auto state = std::make_shared<PlatformSharedState>();
     state->supportedPeriods = std::make_shared<RefreshPeriodMap>();

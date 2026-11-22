@@ -74,7 +74,9 @@ using swappy::SwappyVkTestPeer;
 using swappy::testing::FakeSwappyPlatform;
 using swappy::testing::makeTestSwappySettings;
 using swappy::testing::PlatformSharedState;
+using swappy::testing::PlatformSnapshot;
 using swappy::testing::SimulatedClock;
+using swappy::testing::snapshotPlatformState;
 using swappy::testing::VsyncPanelTimeline;
 
 constexpr auto k60HzPeriod = 16'666'667ns;
@@ -919,6 +921,52 @@ TEST_F(SwappyVkHostTest, NestedSimulatedClockPreservesOuterThreadHooksAndWorkerA
 
     harness.presentFrames(3, 3ms, 3ms);
     EXPECT_EQ(harness.driver().recordedPresents().size(), 5u);
+}
+
+TEST_F(SwappyVkHostTest, DestroySwapchainReleasesWindowAcrossSwapchainRecreations) {
+    auto state = std::make_shared<PlatformSharedState>();
+    SimulatedClock clock(Clock::time_point{1s});
+    FakeVulkanDriver driver(clock);
+    SwappyVkTestPeer::ScopedHooks hooks(
+            [state](JNIEnv* /*env*/, jobject /*activity*/) {
+                return std::make_unique<FakeSwappyPlatform>(state);
+            },
+            clock, driver.provider());
+
+    const VkPhysicalDevice physicalDevice = makeVkHandle<VkPhysicalDevice>(31);
+    const VkDevice device = makeVkHandle<VkDevice>(32);
+    const VkQueue queue = makeVkHandle<VkQueue>(33);
+    const VkSwapchainKHR swapchainA = makeVkHandle<VkSwapchainKHR>(34);
+    const VkSwapchainKHR swapchainB = makeVkHandle<VkSwapchainKHR>(35);
+    ANativeWindow windowA{101};
+    ANativeWindow windowB{102};
+
+    uint32_t requiredCount = 0;
+    SwappyVk_determineDeviceExtensions(physicalDevice, 0, nullptr, &requiredCount, nullptr);
+    SwappyVk_setQueueFamilyIndex(device, queue, 0);
+
+    uint64_t refreshDurationNs = 0;
+    ASSERT_TRUE(SwappyVk_initAndGetRefreshCycleDuration(nullptr, nullptr, physicalDevice, device,
+                                                        swapchainA, &refreshDurationNs));
+    SwappyVk_setWindow(device, swapchainA, &windowA);
+    ASSERT_TRUE(clock.waitForWorkersSettled());
+    SwappyVk_destroySwapchain(device, swapchainA);
+
+    ASSERT_TRUE(SwappyVk_initAndGetRefreshCycleDuration(nullptr, nullptr, physicalDevice, device,
+                                                        swapchainB, &refreshDurationNs));
+    SwappyVk_setWindow(device, swapchainB, &windowB);
+    ASSERT_TRUE(clock.waitForWorkersSettled());
+    SwappyVk_destroySwapchain(device, swapchainB);
+
+    const PlatformSnapshot snapshot = snapshotPlatformState(*state);
+    ASSERT_EQ(snapshot.acquiredWindows.size(), 2u);
+    EXPECT_EQ(snapshot.acquiredWindows[0], &windowA);
+    EXPECT_EQ(snapshot.acquiredWindows[1], &windowB);
+    ASSERT_EQ(snapshot.releasedWindows.size(), 2u);
+    EXPECT_EQ(snapshot.releasedWindows[0], &windowA);
+    EXPECT_EQ(snapshot.releasedWindows[1], &windowB);
+
+    SwappyVk_destroyDevice(device);
 }
 
 } // namespace

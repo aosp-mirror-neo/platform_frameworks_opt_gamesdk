@@ -94,6 +94,7 @@ SwappyCommon::~SwappyCommon() {
     // Remove the settings' listeners before destroying Choreographer objects
     // because the listeners may contain references to the objects
     Settings::getInstance()->removeAllListeners();
+    setANativeWindow(nullptr);
     // Destroy the platform first so its Choreographer thread stops invoking
     // mChoreographerFilter before the filter is destroyed.
     mPlatform.reset();
