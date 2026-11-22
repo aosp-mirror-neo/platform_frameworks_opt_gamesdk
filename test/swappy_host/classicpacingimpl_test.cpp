@@ -271,6 +271,40 @@ TEST(ClassicPacingImplTest, DisplayTimingChangeTreatsSubMicrosecond120HzMultiple
     EXPECT_NEAR(*undercutResult.vote.frameRateHz, 60.0f, 0.05f);
 }
 
+TEST(ClassicPacingImplTest, FramePacingResetClearsSamplesRestoresPipelineAndVotesFastestWhenUnset) {
+    ClassicPacingImplementation pacing;
+    const RefreshPeriodMap periods = makePhysical60And120HzPeriods();
+    const VotableRefreshPeriods votable{.periods = &periods, .usesSetFrameRate = true};
+
+    FrameDurations durations;
+    feed(durations, TimePoint{}, kFramesToFillWindow, k60Hz, 8ms);
+    ASSERT_TRUE(durations.hasEnoughSamples());
+
+    const PacingResult resetResult =
+            pacing.onFramePacingReset(durations, k60Hz, 0ns, k60Hz, votable);
+
+    EXPECT_TRUE(resetResult.configChanged);
+    EXPECT_EQ(resetResult.autoSwapInterval, 1);
+    EXPECT_EQ(resetResult.pipelineMode, PipelineMode::On);
+    EXPECT_FALSE(durations.hasEnoughSamples());
+    ASSERT_TRUE(resetResult.vote.frameRateHz.has_value());
+    EXPECT_NEAR(*resetResult.vote.frameRateHz, 120.0f, 0.05f);
+}
+
+TEST(ClassicPacingImplTest, FramePacingResetVotesMinSwapDurationFloorWhenCapped) {
+    ClassicPacingImplementation pacing;
+    FrameDurations durations;
+
+    const PacingResult resetResult =
+            pacing.onFramePacingReset(durations, k120Hz, k60Hz, k60Hz, kSetFrameRateVotable);
+
+    EXPECT_TRUE(resetResult.configChanged);
+    EXPECT_EQ(resetResult.autoSwapInterval, 2);
+    EXPECT_EQ(resetResult.pipelineMode, PipelineMode::On);
+    ASSERT_TRUE(resetResult.vote.frameRateHz.has_value());
+    EXPECT_NEAR(*resetResult.vote.frameRateHz, 60.0f, 0.05f);
+}
+
 TEST(ClassicPacingImplTest, PassiveTimingChangeRetainsSamplesAndClearsMissesFittingLoosenedBudget) {
     ClassicPacingImplementation pacing;
     FrameDurations durations;

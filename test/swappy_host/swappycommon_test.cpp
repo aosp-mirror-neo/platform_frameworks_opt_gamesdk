@@ -1327,4 +1327,211 @@ TEST_F(SwappyCommonHostTest,
     EXPECT_EQ(harness.swappy().getSwapDuration(), 50'000'000ns);
 }
 
+TEST_F(SwappyCommonHostTest, KeepsSwapDurationAcrossFramePacingReset) {
+    SimulatedSwappyHarness harness(makeSettings(k60HzPeriod), Clock::time_point{1s});
+    const auto targetFloor = 2 * k60HzPeriod;
+    Settings::getInstance()->setSwapDuration(targetFloor.count());
+    ANativeWindow window{201};
+    harness.swappy().setANativeWindow(&window);
+
+    harness.runFrames(4, 2ms, 2ms);
+    ASSERT_EQ(harness.swappy().getSwapDuration(), targetFloor);
+
+    // Reset applies at the end of the next frame. Light frames keep the 30 FPS floor.
+    harness.swappy().resetFramePacing();
+    harness.runFrame(2ms, 2ms);
+    const Clock::time_point firstPresent = harness.swappy().getPresentationTime();
+    harness.runFrame(2ms, 2ms);
+    const Clock::time_point secondPresent = harness.swappy().getPresentationTime();
+
+    EXPECT_EQ(harness.swappy().getSwapDuration(), targetFloor);
+    EXPECT_NEAR((secondPresent - firstPresent).count(), targetFloor.count(), 1'000'000);
+
+    // Re-applying the same swap duration stays at the 30 FPS floor.
+    Settings::getInstance()->setSwapDuration(targetFloor.count());
+    harness.runFrame(2ms, 2ms);
+    const Clock::time_point thirdPresent = harness.swappy().getPresentationTime();
+    EXPECT_EQ(harness.swappy().getSwapDuration(), targetFloor);
+    EXPECT_NEAR((thirdPresent - secondPresent).count(), targetFloor.count(), 1'000'000);
+}
+
+TEST_F(SwappyCommonHostTest, FramePacingResetKeepsActiveRefreshPeriodAfterDisplayRateChange) {
+    SimulatedSwappyHarness harness(makeSettings(k120HzPeriod, 36), Clock::time_point{1s});
+    const auto targetFloor = 2 * k60HzPeriod;
+    Settings::getInstance()->setSwapDuration(targetFloor.count());
+
+    harness.runFrames(2, 2ms, 2ms);
+    harness.triggerPassiveDisplayRateChange(k60HzPeriod);
+    harness.runFrames(2, 2ms, 2ms);
+    ASSERT_EQ(harness.swappy().getRefreshPeriod(), k60HzPeriod);
+    ASSERT_EQ(harness.swappy().getSwapDuration(), targetFloor);
+
+    harness.swappy().resetFramePacing();
+    harness.runFrame(2ms, 2ms);
+    const Clock::time_point firstPresent = harness.swappy().getPresentationTime();
+    harness.runFrame(2ms, 2ms);
+    const Clock::time_point secondPresent = harness.swappy().getPresentationTime();
+
+    EXPECT_EQ(harness.swappy().getRefreshPeriod(), k60HzPeriod);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), targetFloor);
+    EXPECT_NEAR((secondPresent - firstPresent).count(), targetFloor.count(), 1'000'000);
+}
+
+TEST_F(SwappyCommonHostTest, FramePacingResetPreservesHigherRateFloorWhenBootedAtSixtyHz) {
+    SimulatedSwappyHarness harness(makeSettings(k60HzPeriod, 36), Clock::time_point{1s},
+                                   DisplayPanelModel::discrete60And120Hz(2));
+    Settings::getInstance()->setSwapDuration(k120HzPeriod.count());
+    ANativeWindow window{210};
+    harness.swappy().setANativeWindow(&window);
+
+    harness.runFrames(4, 2ms, 2ms);
+    ASSERT_EQ(harness.displayPeriod(), k120HzPeriod);
+
+    // Downshift during a heavy loading scene, then reset: even though Swappy booted at
+    // 60Hz (mInitialRefreshPeriod == 16.67ms), reset votes the preserved 120Hz floor.
+    harness.runFrames(200, 4ms, 28ms);
+    ASSERT_EQ(harness.displayPeriod(), k60HzPeriod);
+
+    harness.swappy().resetFramePacing();
+    harness.runFrames(4, 2ms, 2ms);
+
+    EXPECT_EQ(harness.displayPeriod(), k120HzPeriod);
+    EXPECT_EQ(harness.swappy().getRefreshPeriod(), k120HzPeriod);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), k120HzPeriod);
+}
+
+TEST_F(SwappyCommonHostTest, FramePacingResetRestoresMaxRefreshRateWhenSwapDurationUnset) {
+    SimulatedSwappyHarness harness(makeSettings(k60HzPeriod, 36), Clock::time_point{1s},
+                                   DisplayPanelModel::continuousArr(24, 120, 2));
+    Settings::getInstance()->setSwapDuration(0);
+    ANativeWindow window{211};
+    harness.swappy().setANativeWindow(&window);
+
+    harness.runFrames(200, 4ms, 24ms);
+    ASSERT_EQ(harness.displayPeriod(), 25'000'000ns);
+
+    harness.swappy().resetFramePacing();
+    harness.runFrames(4, 2ms, 2ms);
+
+    EXPECT_EQ(harness.displayPeriod(), k120HzPeriod);
+    EXPECT_EQ(harness.swappy().getRefreshPeriod(), k120HzPeriod);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), k120HzPeriod);
+}
+
+TEST_F(SwappyCommonHostTest, DisablingFramePacingReleasesSwapDurationDisplayVoteCap) {
+    SimulatedSwappyHarness harness(makeSettings(k120HzPeriod, 36), Clock::time_point{1s},
+                                   DisplayPanelModel::continuousArr(24, 120, 2));
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_30FPS);
+    ANativeWindow window{212};
+    harness.swappy().setANativeWindow(&window);
+
+    harness.runFrames(4, 2ms, 2ms);
+    ASSERT_EQ(harness.displayPeriod(), 33'333'333ns);
+
+    harness.swappy().enableFramePacing(false);
+    harness.runFrames(20, 4ms, 2ms);
+    EXPECT_EQ(harness.displayPeriod(), k120HzPeriod);
+
+    harness.swappy().enableFramePacing(true);
+    harness.runFrames(4, 2ms, 2ms);
+    EXPECT_EQ(harness.displayPeriod(), 33'333'333ns);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), 33'333'333ns);
+}
+
+TEST_F(SwappyCommonHostTest, SameFrameSwapDurationUpdateAndResetVotesOnceAndRestoresPipelineMode) {
+    SimulatedSwappyHarness harness(makeSettings(k120HzPeriod, 36), Clock::time_point{1s},
+                                   DisplayPanelModel::continuousArr(24, 120, 2));
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    ANativeWindow window{213};
+    harness.swappy().setANativeWindow(&window);
+
+    // Light frames over >2s drop auto-pipeline mode to PipelineMode::Off.
+    harness.runFrames(150, 2ms, 2ms);
+    ASSERT_EQ(harness.swappy().getCurrentPipelineMode(), PipelineMode::Off);
+
+    struct ResetCallbackState {
+        SwappyCommon* swappy = nullptr;
+        int callCount = 0;
+        std::chrono::nanoseconds observedSwapDuration{0};
+        PipelineMode observedPipelineMode = PipelineMode::Off;
+    } callbackState{.swappy = &harness.swappy()};
+
+    SwappyTracer tracer{};
+    tracer.userData = &callbackState;
+    tracer.swapIntervalChanged = [](void* data) {
+        auto* state = static_cast<ResetCallbackState*>(data);
+        ++state->callCount;
+        state->observedSwapDuration = state->swappy->getSwapDuration();
+        state->observedPipelineMode = state->swappy->getCurrentPipelineMode();
+    };
+    harness.swappy().addTracerCallbacks(tracer);
+
+    const size_t votesBeforeReset =
+            snapshotPlatformState(*harness.platformState()).frameRateVotes.size();
+
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_30FPS);
+    harness.swappy().resetFramePacing();
+    harness.runFrame(2ms, 2ms);
+
+    EXPECT_EQ(callbackState.callCount, 1);
+    EXPECT_EQ(callbackState.observedSwapDuration, 2 * k60HzPeriod);
+    EXPECT_EQ(callbackState.observedPipelineMode, PipelineMode::On);
+    EXPECT_EQ(harness.swappy().getCurrentPipelineMode(), PipelineMode::On);
+
+    const auto snapshotAfterReset = snapshotPlatformState(*harness.platformState());
+    EXPECT_EQ(snapshotAfterReset.frameRateVotes.size(), votesBeforeReset + 1);
+    ASSERT_FALSE(snapshotAfterReset.frameRateVotes.empty());
+    EXPECT_NEAR(snapshotAfterReset.frameRateVotes.back().second, 30.0f, 0.05f);
+}
+
+TEST_F(SwappyCommonHostTest,
+       DisablingFramePacingReportsUnpacedIntervalToSwapIntervalChangedCallback) {
+    SimulatedSwappyHarness harness(makeSettings(k120HzPeriod, 36), Clock::time_point{1s});
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_30FPS);
+    ANativeWindow window{214};
+    harness.swappy().setANativeWindow(&window);
+
+    harness.runFrames(4, 2ms, 2ms);
+    ASSERT_EQ(harness.swappy().getSwapDuration(), 4 * k120HzPeriod);
+
+    struct DisableCallbackState {
+        SwappyCommon* swappy = nullptr;
+        int callCount = 0;
+        std::chrono::nanoseconds observedSwapDuration{0};
+    } callbackState{.swappy = &harness.swappy()};
+
+    SwappyTracer tracer{};
+    tracer.userData = &callbackState;
+    tracer.swapIntervalChanged = [](void* data) {
+        auto* state = static_cast<DisableCallbackState*>(data);
+        ++state->callCount;
+        state->observedSwapDuration = state->swappy->getSwapDuration();
+    };
+    harness.swappy().addTracerCallbacks(tracer);
+
+    harness.swappy().enableFramePacing(false);
+    harness.runFrame(2ms, 2ms);
+
+    EXPECT_EQ(callbackState.callCount, 1);
+    EXPECT_EQ(callbackState.observedSwapDuration, k120HzPeriod);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), k120HzPeriod);
+}
+
+TEST_F(SwappyCommonHostTest, FramePacingResetVotesPanelBackToAppFloorAfterArrDownshift) {
+    SimulatedSwappyHarness harness(makeSettings(k120HzPeriod, 36), Clock::time_point{1s},
+                                   DisplayPanelModel::continuousArr(24, 120, 2));
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    ANativeWindow window{202};
+    harness.swappy().setANativeWindow(&window);
+
+    harness.runFrames(200, 4ms, 19ms);
+    ASSERT_EQ(harness.displayPeriod(), 20'000'000ns);
+
+    harness.swappy().resetFramePacing();
+    harness.runFrames(4, 2ms, 2ms);
+
+    EXPECT_EQ(harness.displayPeriod(), k60HzPeriod);
+    EXPECT_EQ(harness.swappy().getRefreshPeriod(), k60HzPeriod);
+    EXPECT_EQ(harness.swappy().getSwapDuration(), k60HzPeriod);
+}
 } // namespace

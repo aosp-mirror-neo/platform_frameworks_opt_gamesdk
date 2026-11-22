@@ -234,13 +234,6 @@ void SwappyCommon::updateDisplayTimings() {
         mFramePacingEnabled = !mFramePacingEnabled;
         mFramePacingToggleRequested = false;
     }
-    if (mFramePacingResetRequested) {
-        // In case of reset, just issue the update for setting refresh period.
-        applyRefreshRateVote(mPacingImpl->voteRefreshPeriod(mInitialRefreshPeriod, mSwapDuration,
-                                                            votableRefreshPeriods()));
-        mFramePacingResetRequested = false;
-        return;
-    }
 
     if (!mFramePacingEnabled) {
         return;
@@ -397,15 +390,34 @@ void SwappyCommon::addFrameDuration(FrameDuration duration, PipelineMode swapPip
 bool SwappyCommon::updateSwapInterval() {
     std::lock_guard<std::mutex> lock(mMutex);
 
-    // A request to reset the frame-pacing is made, so reset the internal swap
-    // state to the initial state and clear the frame durations collected.
+    // A request to reset frame pacing is made, so apply any pending toggle or
+    // timing settings first, reset pacing state while keeping the app
+    // swap-duration floor and active display refresh period, and vote once.
     if (mFramePacingResetRequested) {
-        mAutoSwapInterval = 1;
+        if (mFramePacingToggleRequested) {
+            mFramePacingEnabled = !mFramePacingEnabled;
+            mFramePacingToggleRequested = false;
+        }
+        if (mTimingSettingsNeedUpdate) {
+            mCommonSettings.refreshPeriod = mNextTimingSettings.refreshPeriod;
+            mSwapDuration = mNextTimingSettings.swapDuration;
+            mTimingSettingsNeedUpdate = false;
+            TRACE_INT("mSwapDuration", mSwapDuration.count());
+            TRACE_INT("mCommonSettings.refreshPeriod", mCommonSettings.refreshPeriod.count());
+        }
+        mWindowChanged = false;
         mMeasuredSwapDuration = 0ns;
-        mSwapDuration = 0ns;
-        mCommonSettings.refreshPeriod = mInitialRefreshPeriod;
-        mFrameDurations.clear();
-        return true;
+
+        const nanoseconds effectiveMinSwapDuration = mFramePacingEnabled ? mSwapDuration : 0ns;
+        const PacingResult resetResult =
+                mPacingImpl->onFramePacingReset(mFrameDurations, mCommonSettings.refreshPeriod,
+                                                effectiveMinSwapDuration, mInitialRefreshPeriod,
+                                                votableRefreshPeriods());
+        mAutoSwapInterval = resetResult.autoSwapInterval;
+        mPipelineMode = resetResult.pipelineMode;
+        applyRefreshRateVote(resetResult.vote);
+        mFramePacingResetRequested = false;
+        return resetResult.configChanged;
     }
     if (!mAutoSwapIntervalEnabled) return false;
 

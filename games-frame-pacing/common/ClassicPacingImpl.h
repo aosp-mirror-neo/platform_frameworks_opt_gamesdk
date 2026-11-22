@@ -27,6 +27,7 @@
 #endif
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <optional>
@@ -63,6 +64,31 @@ public:
                 .displayModeId =
                         selection.changed ? std::optional<int>(selection.modeId) : std::nullopt,
                 .traceValue = selection.refreshPeriod.count(),
+        };
+    }
+
+    PacingResult onFramePacingReset(
+            FrameDurations& durations, std::chrono::nanoseconds refreshPeriod,
+            std::chrono::nanoseconds minSwapDuration,
+            std::chrono::nanoseconds fallbackRefreshPeriod,
+            const VotableRefreshPeriods& votableRefreshPeriods = {}) override {
+        using namespace std::chrono_literals;
+        durations.clear();
+        std::chrono::nanoseconds resetTarget = minSwapDuration;
+        if (resetTarget <= 0ns) {
+            resetTarget = std::min(fallbackRefreshPeriod, refreshPeriod);
+            if (votableRefreshPeriods.periods != nullptr) {
+                const auto fastestIt = votableRefreshPeriods.periods->upper_bound(0ns);
+                if (fastestIt != votableRefreshPeriods.periods->end()) {
+                    resetTarget = fastestIt->first;
+                }
+            }
+        }
+        return PacingResult{
+                .autoSwapInterval = calculateSwapInterval(minSwapDuration, refreshPeriod),
+                .pipelineMode = PipelineMode::On,
+                .configChanged = true,
+                .vote = voteRefreshPeriod(resetTarget, minSwapDuration, votableRefreshPeriods),
         };
     }
 
