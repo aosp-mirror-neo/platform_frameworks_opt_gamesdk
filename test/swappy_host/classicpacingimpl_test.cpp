@@ -30,6 +30,7 @@ using TimePoint = FrameDurations::TimePoint;
 namespace {
 
 constexpr nanoseconds k60Hz = 16666667ns;
+constexpr nanoseconds k40Hz = 25000000ns;
 constexpr nanoseconds k120Hz = 8333333ns;
 constexpr VotableRefreshPeriods kSetFrameRateVotable{.usesSetFrameRate = true};
 
@@ -230,4 +231,41 @@ TEST(ClassicPacingImplTest, PolymorphicInvocationThroughPacingImplementation) {
                                           emptyDurations, change);
     EXPECT_EQ(timingResult.autoSwapInterval, 2);
     EXPECT_EQ(timingResult.pipelineMode, PipelineMode::On);
+}
+
+TEST(ClassicPacingImplTest, DisplayTimingChangeTreatsSubMicrosecond120HzMultipleAsValidFloor) {
+    ClassicPacingImplementation pacing;
+    // Seed a prior vote (40 Hz) so hasVoted() is true and only !swapIntervalValid
+    // would emit a recovery vote to swapDuration (60 Hz).
+    ASSERT_TRUE(pacing.voteRefreshPeriod(k40Hz, k60Hz, kSetFrameRateVotable).emitted());
+
+    FrameDurations durations;
+    feed(durations, TimePoint{}, kFramesToFillWindow, k60Hz, 15ms);
+    ASSERT_TRUE(durations.hasEnoughSamples());
+
+    // 2 * 8,333,333ns = 16,666,666ns, 1ns shy of k60Hz (16,666,667ns) due to
+    // integer nanosecond truncation; DURATION_ROUNDING_MARGIN absorbs the 1ns gap.
+    const TimingChange changeTo120Hz{
+            .oldRefreshPeriod = k60Hz,
+            .newRefreshPeriod = k120Hz,
+            .swapDuration = k60Hz,
+    };
+    const PacingResult validResult =
+            pacing.onDisplayTimingsChanged(1, PipelineMode::On, durations, changeTo120Hz,
+                                           kSetFrameRateVotable);
+    EXPECT_EQ(validResult.autoSwapInterval, 2);
+    EXPECT_FALSE(validResult.vote.emitted());
+
+    // A genuine undercut (6ms -> interval 1 = 8.33ms < 16.67ms) still clamps to
+    // floorInterval (2) and votes back to the 60 Hz floor.
+    FrameDurations fastDurations;
+    feed(fastDurations, TimePoint{}, kFramesToFillWindow, k60Hz, 6ms);
+    ASSERT_TRUE(fastDurations.hasEnoughSamples());
+
+    const PacingResult undercutResult =
+            pacing.onDisplayTimingsChanged(1, PipelineMode::On, fastDurations, changeTo120Hz,
+                                           kSetFrameRateVotable);
+    EXPECT_EQ(undercutResult.autoSwapInterval, 2);
+    ASSERT_TRUE(undercutResult.vote.frameRateHz.has_value());
+    EXPECT_NEAR(*undercutResult.vote.frameRateHz, 60.0f, 0.05f);
 }

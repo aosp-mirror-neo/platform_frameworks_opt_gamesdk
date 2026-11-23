@@ -162,7 +162,8 @@ public:
         int32_t autoSwapInterval = calculateSwapInterval(targetDuration, change.newRefreshPeriod);
 
         const bool swapIntervalValid =
-                change.newRefreshPeriod * autoSwapInterval >= change.swapDuration;
+                change.newRefreshPeriod * autoSwapInterval + DURATION_ROUNDING_MARGIN >=
+                change.swapDuration;
         if (!swapIntervalValid) {
             autoSwapInterval = calculateSwapInterval(change.swapDuration, change.newRefreshPeriod);
         }
