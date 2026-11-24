@@ -30,7 +30,9 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
     private static final int NO_MODE_ID = -1;
     private static final int ANDROID_16_SDK_INT = 36;
     private static final Method sHasArrSupportMethod = resolveHasArrSupportMethod();
-    private static final Method sSetRenderAheadEnabledMethod = resolveSetRenderAheadEnabledMethod();
+    private static final Method sSetRenderAheadModeMethod = resolveSetRenderAheadModeMethod();
+    private static final Integer sRenderAheadModeDisabled =
+            resolveRenderAheadModeDisabled(sSetRenderAheadModeMethod);
 
     private long mCookie;
     // The Activity hosting Swappy, or null if Swappy is hosted by another kind
@@ -56,10 +58,22 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
         }
     }
 
-    private static Method resolveSetRenderAheadEnabledMethod() {
+    private static Method resolveSetRenderAheadModeMethod() {
         try {
-            return Window.class.getMethod("setRenderAheadEnabled", boolean.class);
+            return Window.class.getMethod("setRenderAheadMode", int.class);
         } catch (NoSuchMethodException e) {
+            return null;
+        }
+    }
+
+    private static Integer resolveRenderAheadModeDisabled(Method setRenderAheadModeMethod) {
+        if (setRenderAheadModeMethod == null) {
+            return null;
+        }
+        try {
+            return WindowManager.LayoutParams.class.getField("RENDER_AHEAD_MODE_DISABLED")
+                    .getInt(null);
+        } catch (ReflectiveOperationException | RuntimeException e) {
             return null;
         }
     }
@@ -301,7 +315,8 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
     public void disableRenderAhead() {
         // Only an Activity has a window to disable render-ahead on.
         final Activity activity = mActivity;
-        if (sSetRenderAheadEnabledMethod == null || activity == null) {
+        if (sSetRenderAheadModeMethod == null || sRenderAheadModeDisabled == null
+                || activity == null) {
             return;
         }
         activity.runOnUiThread(new Runnable() {
@@ -312,7 +327,7 @@ public class SwappyDisplayManager implements DisplayManager.DisplayListener {
                     return;
                 }
                 try {
-                    sSetRenderAheadEnabledMethod.invoke(w, false);
+                    sSetRenderAheadModeMethod.invoke(w, sRenderAheadModeDisabled);
                 } catch (ReflectiveOperationException | RuntimeException e) {
                     Log.w(LOG_TAG, "Failed to disable render-ahead", e);
                 }
