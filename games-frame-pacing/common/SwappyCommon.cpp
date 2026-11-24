@@ -169,17 +169,19 @@ bool SwappyCommon::waitForNextFrame(const SwapHandlers& h) {
     // just let the app run as fast as it can
     if (pacedPeriod <= mAutoSwapIntervalThreshold.load() || !localAutoSwapIntervalEnabled) {
         if (localFramePacingEnabled) {
+            TRACE_SCOPE("Swappy::WaitPhase");
             waitUntilTargetFrame();
             std::lock_guard<std::mutex> lock(mWaitingMutex);
             cpuMissed = mCurrentFrame > mTargetFrame;
         }
 
-        if (localBlockingWaitEnabled) {
+        if (localBlockingWaitEnabled && !h.lastFrameIsComplete()) {
+            TRACE_SCOPE("Swappy::GpuFenceWait");
             // wait for the previous frame to be rendered
-            while (!h.lastFrameIsComplete()) {
+            do {
                 lateFrames++;
                 waitOneFrame();
-            }
+            } while (!h.lastFrameIsComplete());
         }
 
         if (lateFrames > 0) {
@@ -277,6 +279,7 @@ void SwappyCommon::applyNextTimingSettings() {
     TRACE_INT("mAutoSwapInterval", mAutoSwapInterval);
     TRACE_INT("mCommonSettings.refreshPeriod", mCommonSettings.refreshPeriod.count());
     TRACE_INT("mPipelineMode", static_cast<int>(mPipelineMode));
+    TRACE_INT("Swappy.TargetPeriodNs", (mAutoSwapInterval * mCommonSettings.refreshPeriod).count());
 }
 
 void SwappyCommon::onPreSwap(const SwapHandlers& h) {
@@ -407,7 +410,6 @@ bool SwappyCommon::updateSwapInterval() {
         }
         mWindowChanged = false;
         mMeasuredSwapDuration = 0ns;
-
         const nanoseconds effectiveMinSwapDuration = mFramePacingEnabled ? mSwapDuration : 0ns;
         const PacingResult resetResult =
                 mPacingImpl->onFramePacingReset(mFrameDurations, mCommonSettings.refreshPeriod,
@@ -415,6 +417,8 @@ bool SwappyCommon::updateSwapInterval() {
                                                 votableRefreshPeriods());
         mAutoSwapInterval = resetResult.autoSwapInterval;
         mPipelineMode = resetResult.pipelineMode;
+        TRACE_INT("Swappy.TargetPeriodNs",
+                  (mAutoSwapInterval * mCommonSettings.refreshPeriod).count());
         applyRefreshRateVote(resetResult.vote);
         mFramePacingResetRequested = false;
         return resetResult.configChanged;
@@ -427,6 +431,14 @@ bool SwappyCommon::updateSwapInterval() {
                                             mAutoSwapIntervalThreshold.load(),
                                             mPipelineModeAutoMode, votableRefreshPeriods());
 
+    if (result.autoSwapInterval != mAutoSwapInterval) {
+        TRACE_INT("Swappy.TargetPeriodNs",
+                  (result.autoSwapInterval * mCommonSettings.refreshPeriod).count());
+    }
+    // onPostSwap() emits mPipelineMode when the config changes.
+    if (!result.configChanged && result.pipelineMode != mPipelineMode) {
+        TRACE_INT("mPipelineMode", static_cast<int>(result.pipelineMode));
+    }
     // Applied unconditionally: swapSlower() can restore pipelining without
     // reporting a config change.
     mAutoSwapInterval = result.autoSwapInterval;

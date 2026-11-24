@@ -25,6 +25,7 @@
 
 #define LOG_TAG "SwappyVk"
 #include "SwappyLog.h"
+#include "Trace.h"
 
 /* For tracking tracers internally within vulkan instance, we cannot store the
  * pointers as there is no requirement for the life of the object once the
@@ -324,6 +325,7 @@ void SwappyVk::SetSwapDuration(VkDevice device, VkSwapchainKHR swapchain, uint64
  * Generic/Singleton implementation of swappyVkQueuePresent.
  */
 VkResult SwappyVk::QueuePresent(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
+    TRACE_SCOPE("Swappy::Frame");
     auto queueIt = perQueueFamilyIndex.find(queue);
     if (queueIt == perQueueFamilyIndex.end()) {
         SWAPPY_LOGE("Unknown queue %p. Did you call SwappyVkSetQueueFamilyIndex ?", queue);

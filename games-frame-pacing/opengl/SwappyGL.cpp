@@ -100,6 +100,7 @@ bool SwappyGL::lastFrameIsComplete(EGLDisplay display) {
 }
 
 bool SwappyGL::swapInternal(EGLDisplay display, EGLSurface surface) {
+    TRACE_SCOPE("Swappy::Frame");
     const SwappyCommon::SwapHandlers handlers = {
             .lastFrameIsComplete = [&]() { return lastFrameIsComplete(display); },
             .getPrevFrameGpuTime = [&]() { return getEgl()->getFencePendingTime(); },

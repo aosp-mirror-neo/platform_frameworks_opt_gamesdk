@@ -150,6 +150,7 @@ set(SWAPPY_HOST_COMMON_SOURCES
 set(SWAPPY_HOST_TEST_SOURCES
   ${SWAPPY_HOST_COMMON_SOURCES}
   ../common/trace_test.cpp
+  swappycommon_trace_test.cpp
 )
 
 set(SWAPPY_HOST_TRACE_OFF_TEST_SOURCES

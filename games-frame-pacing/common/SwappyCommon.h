@@ -102,10 +102,10 @@ public:
     }
 
     std::chrono::nanoseconds getFenceTimeout() const {
-        return mFenceTimeout;
+        return mFenceTimeout.load(std::memory_order_relaxed);
     }
     void setFenceTimeout(std::chrono::nanoseconds t) {
-        mFenceTimeout = t;
+        mFenceTimeout.store(t, std::memory_order_relaxed);
     }
 
     void setANativeWindow(ANativeWindow* window);
@@ -212,7 +212,7 @@ private:
 
     bool mValid;
 
-    std::chrono::nanoseconds mFenceTimeout = std::chrono::nanoseconds(50ms);
+    std::atomic<std::chrono::nanoseconds> mFenceTimeout{std::chrono::nanoseconds(50ms)};
 
     std::shared_ptr<RefreshPeriodMap> mSupportedRefreshPeriods GUARDED_BY(mMutex);
 
