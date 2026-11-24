@@ -117,7 +117,7 @@ public:
     void setANativeWindow(ANativeWindow* window);
 
     void setBufferStuffingFixWait(int32_t nFrames) {
-        mBufferStuffingFixWait = std::max(0, nFrames);
+        mBufferStuffingFixWait.store(std::max(0, nFrames), std::memory_order_relaxed);
     }
 
     int getSupportedRefreshPeriodsNS(uint64_t* out_refreshrates, int allocated_entries);
@@ -262,7 +262,7 @@ private:
 
     // If zero, don't apply the double buffering fix. If non-zero, apply
     // the fix after this number of bad frames.
-    int mBufferStuffingFixWait = 0;
+    std::atomic<int32_t> mBufferStuffingFixWait{0};
     // When zero, buffer stuffing fixing may occur.
     // After a fix has been applied, this is non-zero and counts down to avoid
     // consecutive fixes.

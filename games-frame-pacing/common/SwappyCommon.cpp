@@ -364,7 +364,7 @@ TraceSettingsSnapshot SwappyCommon::buildTraceSettingsSnapshot() {
     snap.autoSwapIntervalThresholdNs =
             mAutoSwapIntervalThreshold.load(std::memory_order_relaxed).count();
     snap.fenceTimeoutNs = mFenceTimeout.load(std::memory_order_relaxed).count();
-    snap.bufferStuffingFixWait = mBufferStuffingFixWait;
+    snap.bufferStuffingFixWait = mBufferStuffingFixWait.load(std::memory_order_relaxed);
     snap.useAffinity = Settings::getInstance()->getUseAffinity();
     return snap;
 }
@@ -643,7 +643,8 @@ void SwappyCommon::startFrame() {
     const int intervals = (pipelineMode == PipelineMode::On) ? 2 : 1;
 
     // Use frame statistics to fix any buffer stuffing
-    if (mBufferStuffingFixWait > 0 && mLastLatencyRecorded) {
+    const int32_t bufferStuffingFixWait = mBufferStuffingFixWait.load(std::memory_order_relaxed);
+    if (bufferStuffingFixWait > 0 && mLastLatencyRecorded) {
         int32_t lastLatency = mLastLatencyRecorded();
         int expectedLatency = autoSwapInterval * intervals;
         if (sfToVsyncDelay && refreshPeriod > 0ns) {
@@ -653,7 +654,7 @@ void SwappyCommon::startFrame() {
         if (mBufferStuffingFixCounter == 0) {
             if (lastLatency > expectedLatency) {
                 mMissedFrameCounter++;
-                if (mMissedFrameCounter >= mBufferStuffingFixWait) {
+                if (mMissedFrameCounter >= bufferStuffingFixWait) {
                     waitFrame = true;
                     mBufferStuffingFixCounter = 2 * lastLatency;
                     TRACE_INT("BufferStuffingFix", mBufferStuffingFixCounter);
