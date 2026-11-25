@@ -444,8 +444,7 @@ TEST(ClassicPacingImplTest, FramePacingResetClearsSamplesRestoresPipelineAndVote
     feed(durations, TimePoint{}, kFramesToFillWindow, k60Hz, 8ms);
     ASSERT_TRUE(durations.hasEnoughSamples());
 
-    const PacingResult resetResult =
-            pacing.onFramePacingReset(durations, k60Hz, 0ns, k60Hz, votable);
+    const PacingResult resetResult = pacing.onFramePacingReset(durations, k60Hz, 0ns, votable);
 
     EXPECT_TRUE(resetResult.configChanged);
     EXPECT_EQ(resetResult.autoSwapInterval, 1);
@@ -460,7 +459,7 @@ TEST(ClassicPacingImplTest, FramePacingResetVotesMinSwapDurationFloorWhenCapped)
     FrameDurations durations;
 
     const PacingResult resetResult =
-            pacing.onFramePacingReset(durations, k120Hz, k60Hz, k60Hz, kSetFrameRateVotable);
+            pacing.onFramePacingReset(durations, k120Hz, k60Hz, kSetFrameRateVotable);
 
     EXPECT_TRUE(resetResult.configChanged);
     EXPECT_EQ(resetResult.autoSwapInterval, 2);
@@ -477,13 +476,28 @@ TEST(ClassicPacingImplTest, FramePacingResetWithoutFloorVotesFastestWithinTwoPer
     ASSERT_TRUE(pacing.voteRefreshPeriod(8'474'576ns, k120Hz, votable).frameRateHz.has_value());
 
     FrameDurations durations;
-    const PacingResult resetResult =
-            pacing.onFramePacingReset(durations, k120Hz, 0ns, k120Hz, votable);
+    const PacingResult resetResult = pacing.onFramePacingReset(durations, k120Hz, 0ns, votable);
 
     // The 120 Hz reset target is exact, so the 2% measured-frame-time margin of the
     // 118 Hz vote must not absorb it.
     ASSERT_TRUE(resetResult.vote.frameRateHz.has_value());
     EXPECT_NEAR(*resetResult.vote.frameRateHz, 120.0f, 0.05f);
+}
+
+TEST(ClassicPacingImplTest,
+     FramePacingResetWithoutFloorOrSupportedPeriodsVotesActiveRefreshPeriod) {
+    ClassicPacingImplementation pacing;
+    FrameDurations durations;
+
+    // No app floor and no reported refresh periods: vote the active 60 Hz period.
+    const PacingResult resetResult =
+            pacing.onFramePacingReset(durations, k60Hz, 0ns, kSetFrameRateVotable);
+
+    EXPECT_TRUE(resetResult.configChanged);
+    EXPECT_EQ(resetResult.autoSwapInterval, 1);
+    EXPECT_EQ(resetResult.pipelineMode, PipelineMode::On);
+    ASSERT_TRUE(resetResult.vote.frameRateHz.has_value());
+    EXPECT_NEAR(*resetResult.vote.frameRateHz, 60.0f, 0.05f);
 }
 
 TEST(ClassicPacingImplTest, PassiveTimingChangeRetainsSamplesAndClearsMissesFittingLoosenedBudget) {

@@ -1388,7 +1388,7 @@ TEST_F(SwappyCommonHostTest, FramePacingResetPreservesHigherRateFloorWhenBootedA
     ASSERT_EQ(harness.displayPeriod(), k120HzPeriod);
 
     // Downshift during a heavy loading scene, then reset: even though Swappy booted at
-    // 60Hz (mInitialRefreshPeriod == 16.67ms), reset votes the preserved 120Hz floor.
+    // 60Hz, reset votes the preserved 120Hz floor.
     harness.runFrames(200, 4ms, 28ms);
     ASSERT_EQ(harness.displayPeriod(), k60HzPeriod);
 

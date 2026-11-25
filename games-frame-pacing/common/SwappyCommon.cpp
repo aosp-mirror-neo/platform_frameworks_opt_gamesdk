@@ -83,7 +83,6 @@ SwappyCommon::SwappyCommon(std::unique_ptr<SwappyPlatform> platform, const Clock
                                                 mCommonSettings.appVsyncOffset,
                                                 mCommonSettings.sfVsyncOffset});
 
-    mInitialRefreshPeriod = mCommonSettings.refreshPeriod;
     SWAPPY_LOGI("Initialized Swappy with vsyncPeriod=%lld, appOffset=%lld, "
                 "sfOffset=%lld",
                 (long long)mCommonSettings.refreshPeriod.count(),
@@ -457,8 +456,7 @@ bool SwappyCommon::updateSwapInterval() {
         const nanoseconds effectiveMinSwapDuration = mFramePacingEnabled ? mSwapDuration : 0ns;
         const PacingResult resetResult =
                 mPacingImpl->onFramePacingReset(mFrameDurations, mCommonSettings.refreshPeriod,
-                                                effectiveMinSwapDuration, mInitialRefreshPeriod,
-                                                votableRefreshPeriods());
+                                                effectiveMinSwapDuration, votableRefreshPeriods());
         mAutoSwapInterval = resetResult.autoSwapInterval;
         mPipelineMode = resetResult.pipelineMode;
         TRACE_INT("Swappy.TargetPeriodNs",
