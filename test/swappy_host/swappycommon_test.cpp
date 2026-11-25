@@ -1707,4 +1707,35 @@ TEST_F(SwappyCommonHostTest, TighteningMaxAutoSwapDurationReclampsIntervalAndNot
     EXPECT_EQ(harness.swappy().getSwapDuration(), 2 * k120HzPeriod);
 }
 
+TEST_F(SwappyCommonHostTest, JitteredSteadyStateFramesDoNotStormFrameRateVotes) {
+    SimulatedSwappyHarness harness(makeSettings(k60HzPeriod, 36), Clock::time_point{1s});
+    Settings::getInstance()->setSwapDuration(SWAPPY_SWAP_60FPS);
+    ANativeWindow window{215};
+    harness.swappy().setANativeWindow(&window);
+
+    // 19-23 ms CPU frames settle at interval 2 (30 FPS) on 60 Hz and then take no ladder
+    // action. Frame-to-frame jitter moves the 2 s rolling mean by a few tenths of a hertz,
+    // which previously re-voted ANativeWindow_setFrameRate several times a second.
+    uint32_t seed = 12345;
+    const auto jitteredCpu = [&seed]() {
+        seed = seed * 1664525u + 1013904223u;
+        return std::chrono::nanoseconds(19ms) + std::chrono::microseconds((seed >> 8) % 4000);
+    };
+    for (int i = 0; i < 300; ++i) {
+        harness.runFrame(jitteredCpu(), 4ms);
+    }
+    ASSERT_EQ(harness.swappy().getSwapDuration(), 2 * k60HzPeriod);
+    const size_t settledVotes =
+            snapshotPlatformState(*harness.platformState()).frameRateVotes.size();
+
+    // 60 s of steady state. Previously 325 votes; now a handful as the mean drifts.
+    for (int i = 0; i < 1800; ++i) {
+        harness.runFrame(jitteredCpu(), 4ms);
+    }
+    EXPECT_EQ(harness.swappy().getSwapDuration(), 2 * k60HzPeriod);
+    const size_t steadyVotes =
+            snapshotPlatformState(*harness.platformState()).frameRateVotes.size() - settledVotes;
+    EXPECT_LE(steadyVotes, 10u);
+}
+
 } // namespace

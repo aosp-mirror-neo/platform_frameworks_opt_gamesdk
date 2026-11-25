@@ -84,11 +84,13 @@ public:
                 }
             }
         }
+        // The reset target is exact even without an app floor, so it is passed as its
+        // own floor to keep the 0.1 Hz vote margin rather than the measured 2%.
         return PacingResult{
                 .autoSwapInterval = calculateSwapInterval(minSwapDuration, refreshPeriod),
                 .pipelineMode = PipelineMode::On,
                 .configChanged = true,
-                .vote = voteRefreshPeriod(resetTarget, minSwapDuration, votableRefreshPeriods),
+                .vote = voteRefreshPeriod(resetTarget, resetTarget, votableRefreshPeriods),
         };
     }
 

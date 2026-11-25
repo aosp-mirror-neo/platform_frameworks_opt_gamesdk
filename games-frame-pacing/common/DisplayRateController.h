@@ -43,9 +43,26 @@ namespace swappy {
 // and legacy WindowManager preferredDisplayModeId (API 28-29).
 class DisplayRateController {
 public:
-    // 0.1 Hz absorbs 1 ns period rounding while still voting sub-20 Hz ARR
-    // transitions (e.g. 16 vs 15 Hz and 11 vs 10 Hz).
+    // A new frameRate vote for a measured frame time must differ from the last
+    // vote by more than voteMarginMillihertz(): max(0.1 Hz, 2%). Swappy votes
+    // its 2 s rolling-mean frame time on every frame, and frame jitter moves that
+    // mean by a few tenths of a hertz, so a fixed 0.1 Hz deadband re-voted
+    // several times a second while the game held a steady rate. 2% still lets
+    // 1 Hz ARR steps below 50 Hz through (e.g. 16 vs 15 Hz). The 1 ms
+    // FRAME_MARGIN in a measured frame time absorbs a 2% slowdown only for
+    // periods up to ~49 ms, so a held vote is also dropped once its period no
+    // longer covers the frame time without FRAME_MARGIN.
+    //
+    // Votes clamped to minSwapDuration keep the 0.1 Hz margin, which only
+    // absorbs 1 ns period rounding. The app floor is an exact target: a TE
+    // divisor panel serves a 59 Hz vote at 48 Hz, so recovery must reach the
+    // 60 Hz floor exactly.
     static constexpr int64_t kVoteMarginMillihertz = 100;
+    static constexpr int64_t kVoteMarginPerMille = 20;
+
+    [[nodiscard]] static constexpr int64_t voteMarginMillihertz(int64_t lastVotedMillihertz) {
+        return std::max(kVoteMarginMillihertz, lastVotedMillihertz * kVoteMarginPerMille / 1000);
+    }
 
     struct ModeSelection {
         std::chrono::nanoseconds refreshPeriod{0};
@@ -62,7 +79,8 @@ public:
     }
 
     // Returns a new frameRate (in Hz) to pass to ANativeWindow_setFrameRate when
-    // the clamped target period moves outside the 0.1 Hz deadband.
+    // the clamped target period moves outside the vote margin of the last vote
+    // (see voteMarginMillihertz()).
     [[nodiscard]] std::optional<float> voteFrameRateHz(std::chrono::nanoseconds targetPeriod,
                                                        std::chrono::nanoseconds minSwapDuration) {
         const auto effectivePeriod = std::max(targetPeriod, minSwapDuration);
@@ -70,8 +88,15 @@ public:
         if (millihertz <= 0) {
             return std::nullopt;
         }
-        if (mLastVotedMillihertz > 0 &&
-            std::abs(millihertz - mLastVotedMillihertz) <= kVoteMarginMillihertz) {
+        const bool clampedToFloor = targetPeriod <= minSwapDuration;
+        const int64_t margin =
+                clampedToFloor ? kVoteMarginMillihertz : voteMarginMillihertz(mLastVotedMillihertz);
+        // A held vote must also still cover the frame time without FRAME_MARGIN, which
+        // the 2% margin stops guaranteeing above ~49 ms.
+        const bool heldVoteCoversFrame = clampedToFloor ||
+                mLastVotedMillihertz <= periodToMillihertz(targetPeriod - FRAME_MARGIN);
+        if (mLastVotedMillihertz > 0 && std::abs(millihertz - mLastVotedMillihertz) <= margin &&
+            heldVoteCoversFrame) {
             return std::nullopt;
         }
         mLastVotedMillihertz = millihertz;

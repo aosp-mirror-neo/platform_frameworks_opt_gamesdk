@@ -469,6 +469,23 @@ TEST(ClassicPacingImplTest, FramePacingResetVotesMinSwapDurationFloorWhenCapped)
     EXPECT_NEAR(*resetResult.vote.frameRateHz, 60.0f, 0.05f);
 }
 
+TEST(ClassicPacingImplTest, FramePacingResetWithoutFloorVotesFastestWithinTwoPercentOfLastVote) {
+    ClassicPacingImplementation pacing;
+    const RefreshPeriodMap periods = makePhysical60And120HzPeriods();
+    const VotableRefreshPeriods votable{.periods = &periods, .usesSetFrameRate = true};
+    // A measured 118 Hz vote under a 120 Hz floor, before frame pacing is disabled.
+    ASSERT_TRUE(pacing.voteRefreshPeriod(8'474'576ns, k120Hz, votable).frameRateHz.has_value());
+
+    FrameDurations durations;
+    const PacingResult resetResult =
+            pacing.onFramePacingReset(durations, k120Hz, 0ns, k120Hz, votable);
+
+    // The 120 Hz reset target is exact, so the 2% measured-frame-time margin of the
+    // 118 Hz vote must not absorb it.
+    ASSERT_TRUE(resetResult.vote.frameRateHz.has_value());
+    EXPECT_NEAR(*resetResult.vote.frameRateHz, 120.0f, 0.05f);
+}
+
 TEST(ClassicPacingImplTest, PassiveTimingChangeRetainsSamplesAndClearsMissesFittingLoosenedBudget) {
     ClassicPacingImplementation pacing;
     FrameDurations durations;

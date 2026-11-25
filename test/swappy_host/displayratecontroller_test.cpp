@@ -61,11 +61,11 @@ TEST(DisplayRateControllerTest, VoteFrameRateGuardsZeroAndVotesArrRates) {
     EXPECT_TRUE(controller.hasVoted());
     EXPECT_EQ(controller.lastVotedMillihertz(), 60'000);
 
-    // 1ns rounding noise stays within the 0.1 Hz deadband and is suppressed.
+    // 1ns rounding noise stays within the vote margin and is suppressed.
     EXPECT_FALSE(controller.voteFrameRateHz(16'666'666ns, 0ns).has_value());
     EXPECT_EQ(controller.lastVotedMillihertz(), 60'000);
 
-    // Sub-20 Hz ARR steps with <= 1.0 Hz spacing still emit votes outside 0.1 Hz.
+    // Sub-20 Hz ARR steps with 1.0 Hz spacing still emit votes outside the 2% margin.
     const auto vote16 = controller.voteFrameRateHz(62'500'000ns, 0ns);
     ASSERT_TRUE(vote16.has_value());
     EXPECT_FLOAT_EQ(*vote16, 16.0f);
@@ -95,19 +95,84 @@ TEST(DisplayRateControllerTest, VoteFrameRateGuardsZeroAndVotesArrRates) {
     EXPECT_FLOAT_EQ(*revoted30, 30.0f);
 }
 
-TEST(DisplayRateControllerTest, SuppressesVotesWithinPointOneHzDeadbandAndVotesOutsideIt) {
+TEST(DisplayRateControllerTest, SuppressesVotesWithinTwoPercentMarginAndVotesOutsideIt) {
+    EXPECT_EQ(DisplayRateController::voteMarginMillihertz(50'000), 1'000);
+    EXPECT_EQ(DisplayRateController::voteMarginMillihertz(16'000), 320);
+    // Below 5 Hz the 0.1 Hz floor applies.
+    EXPECT_EQ(DisplayRateController::voteMarginMillihertz(4'000), 100);
+
     DisplayRateController controller;
-    ASSERT_TRUE(controller.voteFrameRateHz(62'500'000ns, 0ns).has_value()); // 16,000 mHz
+    ASSERT_TRUE(controller.voteFrameRateHz(20'000'000ns, 0ns).has_value()); // 50,000 mHz
 
-    // 100 mHz delta (15,900 mHz -> 62,893,082 ns) stays within kVoteMarginMillihertz (100 mHz).
-    EXPECT_FALSE(controller.voteFrameRateHz(62'893'082ns, 0ns).has_value());
-    EXPECT_EQ(controller.lastVotedMillihertz(), 16'000);
+    // 1,000 mHz below (49,000 mHz -> 20,408,163 ns) and above (51,000 mHz -> 19,607,843 ns)
+    // stay within the 2% margin.
+    EXPECT_FALSE(controller.voteFrameRateHz(20'408'163ns, 0ns).has_value());
+    EXPECT_FALSE(controller.voteFrameRateHz(19'607'843ns, 0ns).has_value());
+    EXPECT_EQ(controller.lastVotedMillihertz(), 50'000);
 
-    // 101 mHz delta (15,899 mHz -> 62,897,038 ns) crosses kVoteMarginMillihertz and emits a vote.
-    const auto vote = controller.voteFrameRateHz(62'897'038ns, 0ns);
+    // 1,001 mHz below (48,999 mHz -> 20,408,580 ns) crosses the margin and emits a vote.
+    const auto vote = controller.voteFrameRateHz(20'408'580ns, 0ns);
     ASSERT_TRUE(vote.has_value());
-    EXPECT_FLOAT_EQ(*vote, 15.899f);
-    EXPECT_EQ(controller.lastVotedMillihertz(), 15'899);
+    EXPECT_FLOAT_EQ(*vote, 48.999f);
+    EXPECT_EQ(controller.lastVotedMillihertz(), 48'999);
+}
+
+TEST(DisplayRateControllerTest, JitteringSteadyTargetVotesOnce) {
+    DisplayRateController controller;
+    // A rolling-mean frame time wandering +/-0.2 ms around 22 ms (45.0-45.9 Hz)
+    // re-voted on most calls with a 0.1 Hz deadband.
+    int votes = 0;
+    for (int i = 0; i < 600; ++i) {
+        const auto jitter = std::chrono::microseconds((i * 37) % 401 - 200);
+        if (controller.voteFrameRateHz(22ms + jitter, 16'666'667ns).has_value()) {
+            ++votes;
+        }
+    }
+    EXPECT_EQ(votes, 1);
+
+    // A real rate change still votes: 22 ms -> 25 ms (40 Hz).
+    const auto vote40 = controller.voteFrameRateHz(25ms, 16'666'667ns);
+    ASSERT_TRUE(vote40.has_value());
+    EXPECT_FLOAT_EQ(*vote40, 40.0f);
+}
+
+TEST(DisplayRateControllerTest, VotesAppFloorExactlyWithinTwoPercentOfLastVote) {
+    DisplayRateController controller;
+    // A recovering frame time approaches the 60 Hz app floor: 59.0 Hz votes.
+    const auto vote59 = controller.voteFrameRateHz(16'949'153ns, 16'666'667ns);
+    ASSERT_TRUE(vote59.has_value());
+    EXPECT_FLOAT_EQ(*vote59, 59.0f);
+
+    // 59.5 Hz is still a measured frame time and stays within the 2% margin.
+    EXPECT_FALSE(controller.voteFrameRateHz(16'806'723ns, 16'666'667ns).has_value());
+
+    // Once the frame time is clamped to the floor, the vote reaches 60 Hz exactly even though
+    // it is within 2% of 59.0 Hz; a TE divisor panel would otherwise stay at 48 Hz.
+    const auto vote60 = controller.voteFrameRateHz(12ms, 16'666'667ns);
+    ASSERT_TRUE(vote60.has_value());
+    EXPECT_FLOAT_EQ(*vote60, 60.0f);
+
+    // Further frames under the floor repeat the same 60 Hz target and stay suppressed, and a
+    // measured 59.5 Hz frame time stays within the 2% margin of 60 Hz.
+    EXPECT_FALSE(controller.voteFrameRateHz(10ms, 16'666'667ns).has_value());
+    EXPECT_FALSE(controller.voteFrameRateHz(16'806'723ns, 16'666'667ns).has_value());
+}
+
+TEST(DisplayRateControllerTest, RevotesSlowTargetOnceHeldVoteNoLongerCoversFrame) {
+    DisplayRateController controller;
+    // 66 ms (15,152 mHz) is reachable when the app raises the auto-swap threshold.
+    ASSERT_TRUE(controller.voteFrameRateHz(66ms, 16'666'667ns).has_value());
+
+    // 66.6 ms (15,015 mHz) is within the 2% margin (303 mHz), and its frame time without
+    // FRAME_MARGIN (65.6 ms) still fits the held 66 ms period.
+    EXPECT_FALSE(controller.voteFrameRateHz(66'600'000ns, 16'666'667ns).has_value());
+
+    // 67.3 ms (14,859 mHz) is also within the 2% margin, but its frame time without
+    // FRAME_MARGIN (66.3 ms) no longer fits the held 66 ms period.
+    const auto vote = controller.voteFrameRateHz(67'300'000ns, 16'666'667ns);
+    ASSERT_TRUE(vote.has_value());
+    EXPECT_FLOAT_EQ(*vote, 14.859f);
+    EXPECT_EQ(controller.lastVotedMillihertz(), 14'859);
 }
 
 TEST(DisplayRateControllerTest, LegacyModeSelectionSkipsArrAndNonPositiveEntries) {
