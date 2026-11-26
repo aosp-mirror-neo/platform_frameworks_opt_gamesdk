@@ -16,7 +16,10 @@
 
 #include "SwappyVkBase.h"
 
+#include <array>
+#include <cstdint>
 #include <utility>
+#include <vector>
 
 #include "Trace.h"
 
@@ -362,14 +365,28 @@ VkResult SwappyVkBase::injectFence(VkQueue queue, const VkPresentInfoKHR* pPrese
     }
     vkResetFences(mDevice, 1, &sync.fence);
 
-    VkPipelineStageFlags pipe_stage_flags;
-    VkSubmitInfo submit_info;
+    constexpr uint32_t kInlineWaitStageCount = 8;
+    std::array<VkPipelineStageFlags, kInlineWaitStageCount> inlineWaitDstStageMasks;
+    std::vector<VkPipelineStageFlags> dynamicWaitDstStageMasks;
+    const VkPipelineStageFlags* pWaitDstStageMask = nullptr;
+    const uint32_t waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;
+    if (waitSemaphoreCount > 0) {
+        if (waitSemaphoreCount <= kInlineWaitStageCount) {
+            inlineWaitDstStageMasks.fill(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+            pWaitDstStageMask = inlineWaitDstStageMasks.data();
+        } else {
+            dynamicWaitDstStageMasks.assign(waitSemaphoreCount,
+                                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+            pWaitDstStageMask = dynamicWaitDstStageMasks.data();
+        }
+    }
+
+    VkSubmitInfo submit_info{};
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.pNext = NULL;
-    submit_info.pWaitDstStageMask = &pipe_stage_flags;
-    pipe_stage_flags = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    submit_info.waitSemaphoreCount = pPresentInfo->waitSemaphoreCount;
-    submit_info.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
+    submit_info.pNext = nullptr;
+    submit_info.waitSemaphoreCount = waitSemaphoreCount;
+    submit_info.pWaitSemaphores = waitSemaphoreCount > 0 ? pPresentInfo->pWaitSemaphores : nullptr;
+    submit_info.pWaitDstStageMask = pWaitDstStageMask;
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &sync.command;
     submit_info.signalSemaphoreCount = 1;
