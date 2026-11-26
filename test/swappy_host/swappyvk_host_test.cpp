@@ -107,6 +107,16 @@ SwappyCommonSettings makeVkSettings(std::chrono::nanoseconds refreshPeriod = k60
     return makeTestSwappySettings(refreshPeriod, sdkInt);
 }
 
+struct RecordedSubmit {
+    std::vector<VkSemaphore> waitSemaphores;
+    std::vector<VkPipelineStageFlags> waitDstStageMasks;
+    uint32_t commandBufferCount = 0;
+    std::vector<VkSemaphore> signalSemaphores;
+    VkFence fence = VK_NULL_HANDLE;
+    bool hadNullWaitSemaphores = false;
+    bool hadNullWaitDstStageMask = false;
+};
+
 struct RecordedPresent {
     uint32_t imageIndex = 0;
     bool hasDisplayTiming = false;
@@ -114,6 +124,7 @@ struct RecordedPresent {
     uint64_t desiredPresentTimeNs = 0;
     uint64_t actualPresentTimeNs = 0;
     VkSemaphore waitedSemaphore = VK_NULL_HANDLE;
+    std::vector<VkSemaphore> waitedSemaphores;
 };
 
 class ScopedVkTracer {
@@ -165,6 +176,11 @@ public:
     void setExtraPresentDelay(std::chrono::nanoseconds extraDelay) {
         std::lock_guard<std::mutex> lock(mMutex);
         mExtraPresentDelay = extraDelay;
+    }
+
+    [[nodiscard]] std::vector<RecordedSubmit> recordedSubmits() const {
+        std::lock_guard<std::mutex> lock(mMutex);
+        return mRecordedSubmits;
     }
 
     [[nodiscard]] std::vector<RecordedPresent> recordedPresents() const {
@@ -262,8 +278,49 @@ private:
         return allSignaled ? VK_SUCCESS : VK_TIMEOUT;
     }
 
-    VkResult queueSubmit(VkFence fence) {
+    VkResult queueSubmit(uint32_t submitCount, const VkSubmitInfo* submits, VkFence fence) {
+        if (submitCount > 0) {
+            EXPECT_NE(submits, nullptr);
+        }
         std::lock_guard<std::mutex> lock(mMutex);
+        if (submits != nullptr) {
+            for (uint32_t i = 0; i < submitCount; ++i) {
+                const VkSubmitInfo& submit = submits[i];
+                EXPECT_EQ(submit.sType, VK_STRUCTURE_TYPE_SUBMIT_INFO);
+                RecordedSubmit recorded{};
+                recorded.commandBufferCount = submit.commandBufferCount;
+                recorded.fence = fence;
+                recorded.hadNullWaitSemaphores = (submit.pWaitSemaphores == nullptr);
+                recorded.hadNullWaitDstStageMask = (submit.pWaitDstStageMask == nullptr);
+                if (submit.waitSemaphoreCount > 0) {
+                    EXPECT_NE(submit.pWaitSemaphores, nullptr);
+                    EXPECT_NE(submit.pWaitDstStageMask, nullptr);
+                    if (submit.pWaitSemaphores != nullptr) {
+                        recorded.waitSemaphores.assign(submit.pWaitSemaphores,
+                                                       submit.pWaitSemaphores +
+                                                               submit.waitSemaphoreCount);
+                    }
+                    if (submit.pWaitDstStageMask != nullptr) {
+                        recorded.waitDstStageMasks.assign(submit.pWaitDstStageMask,
+                                                          submit.pWaitDstStageMask +
+                                                                  submit.waitSemaphoreCount);
+                        for (VkPipelineStageFlags stageMask : recorded.waitDstStageMasks) {
+                            EXPECT_NE(stageMask, 0u);
+                        }
+                    }
+                }
+                if (submit.signalSemaphoreCount > 0) {
+                    EXPECT_NE(submit.pSignalSemaphores, nullptr);
+                    if (submit.pSignalSemaphores != nullptr) {
+                        recorded.signalSemaphores.assign(submit.pSignalSemaphores,
+                                                         submit.pSignalSemaphores +
+                                                                 submit.signalSemaphoreCount);
+                    }
+                }
+                mRecordedSubmits.push_back(std::move(recorded));
+            }
+        }
+
         const Clock::time_point now = mClock.now();
         const Clock::time_point start =
                 mHasQueueSubmission ? std::max(now, mLastQueueCompletion) : now;
@@ -282,8 +339,14 @@ private:
         std::lock_guard<std::mutex> lock(mMutex);
         RecordedPresent record{};
         record.imageIndex = presentInfo->pImageIndices[0];
-        if (presentInfo->waitSemaphoreCount > 0 && presentInfo->pWaitSemaphores != nullptr) {
-            record.waitedSemaphore = presentInfo->pWaitSemaphores[0];
+        if (presentInfo->waitSemaphoreCount > 0) {
+            EXPECT_NE(presentInfo->pWaitSemaphores, nullptr);
+            if (presentInfo->pWaitSemaphores != nullptr) {
+                record.waitedSemaphores.assign(presentInfo->pWaitSemaphores,
+                                               presentInfo->pWaitSemaphores +
+                                                       presentInfo->waitSemaphoreCount);
+                record.waitedSemaphore = record.waitedSemaphores.front();
+            }
         }
 
         const Clock::time_point gpuDone = mHasQueueSubmission ? mLastQueueCompletion : mClock.now();
@@ -460,11 +523,10 @@ private:
         return VK_SUCCESS;
     }
 
-    static VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmitHook(VkQueue /*queue*/,
-                                                            uint32_t /*submitCount*/,
-                                                            const VkSubmitInfo* /*submits*/,
+    static VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmitHook(VkQueue /*queue*/, uint32_t submitCount,
+                                                            const VkSubmitInfo* submits,
                                                             VkFence fence) {
-        return sActiveDriver->queueSubmit(fence);
+        return sActiveDriver->queueSubmit(submitCount, submits, fence);
     }
 
     static VKAPI_ATTR VkResult VKAPI_CALL
@@ -571,6 +633,7 @@ private:
     bool mHasQueueSubmission GUARDED_BY(mMutex) = false;
     std::chrono::nanoseconds mNextGpuWork GUARDED_BY(mMutex){2ms};
     std::chrono::nanoseconds mExtraPresentDelay GUARDED_BY(mMutex){0ns};
+    std::vector<RecordedSubmit> mRecordedSubmits GUARDED_BY(mMutex);
     std::vector<RecordedPresent> mRecordedPresents GUARDED_BY(mMutex);
     std::deque<VkPastPresentationTimingGOOGLE> mPendingTimingHistory GUARDED_BY(mMutex);
     std::map<uint32_t, Clock::time_point> mImageReleaseTimes GUARDED_BY(mMutex);
@@ -651,8 +714,11 @@ public:
         return mDriver;
     }
 
-    VkResult presentFrame(uint32_t imageIndex, std::chrono::nanoseconds cpuWork,
-                          std::chrono::nanoseconds gpuWork, bool recordStart = false) {
+    VkResult presentFrameWithRawSemaphores(uint32_t imageIndex, uint32_t waitSemaphoreCount,
+                                           const VkSemaphore* pWaitSemaphores,
+                                           std::chrono::nanoseconds cpuWork,
+                                           std::chrono::nanoseconds gpuWork,
+                                           bool recordStart = false) {
         if (recordStart) {
             SwappyVk_recordFrameStart(mQueue, mSwapchain, imageIndex);
         }
@@ -661,12 +727,30 @@ public:
 
         VkPresentInfoKHR presentInfo{};
         presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-        presentInfo.waitSemaphoreCount = 1;
-        presentInfo.pWaitSemaphores = &mAppRenderSemaphore;
+        presentInfo.waitSemaphoreCount = waitSemaphoreCount;
+        presentInfo.pWaitSemaphores = pWaitSemaphores;
         presentInfo.swapchainCount = 1;
         presentInfo.pSwapchains = &mSwapchain;
         presentInfo.pImageIndices = &imageIndex;
         return SwappyVk_queuePresent(mQueue, &presentInfo);
+    }
+
+    VkResult presentFrameWithSemaphores(uint32_t imageIndex,
+                                        const std::vector<VkSemaphore>& waitSemaphores,
+                                        std::chrono::nanoseconds cpuWork,
+                                        std::chrono::nanoseconds gpuWork,
+                                        bool recordStart = false) {
+        return presentFrameWithRawSemaphores(imageIndex,
+                                             static_cast<uint32_t>(waitSemaphores.size()),
+                                             waitSemaphores.empty() ? nullptr
+                                                                    : waitSemaphores.data(),
+                                             cpuWork, gpuWork, recordStart);
+    }
+
+    VkResult presentFrame(uint32_t imageIndex, std::chrono::nanoseconds cpuWork,
+                          std::chrono::nanoseconds gpuWork, bool recordStart = false) {
+        return presentFrameWithRawSemaphores(imageIndex, 1, &mAppRenderSemaphore, cpuWork, gpuWork,
+                                             recordStart);
     }
 
     void presentFrames(int frameCount, std::chrono::nanoseconds cpuWork,
@@ -764,6 +848,136 @@ TEST_F(SwappyVkHostTest, PendingImageFencePresentsUnpacedWithAppSemaphore) {
     // Re-presenting image 0 while its pendingFence is unsignaled bypasses Swappy's per-image
     // semaphore and forwards the app's own render-complete semaphore directly.
     EXPECT_EQ(unpacedPresents[1].waitedSemaphore, harness.appSemaphore());
+}
+
+TEST_F(SwappyVkHostTest, MultipleWaitSemaphoresPopulateAllWaitDstStageMasksInGoogleDisplayTiming) {
+    SimulatedSwappyVkHarness harness(/*advertiseGoogleDisplayTiming=*/true);
+
+    // 3 wait semaphores exercises the inline stack stage-mask buffer (<= 8).
+    const std::vector<VkSemaphore> threeSemaphores = {
+            makeVkHandle<VkSemaphore>(50),
+            makeVkHandle<VkSemaphore>(51),
+            makeVkHandle<VkSemaphore>(52),
+    };
+    ASSERT_EQ(harness.presentFrameWithSemaphores(0, threeSemaphores, 3ms, 3ms), VK_SUCCESS);
+
+    // 10 wait semaphores exercises the dynamic stage-mask fallback (> 8).
+    std::vector<VkSemaphore> tenSemaphores;
+    for (uintptr_t i = 0; i < 10; ++i) {
+        tenSemaphores.push_back(makeVkHandle<VkSemaphore>(60 + i));
+    }
+    ASSERT_EQ(harness.presentFrameWithSemaphores(1, tenSemaphores, 3ms, 3ms), VK_SUCCESS);
+
+    const auto submits = harness.driver().recordedSubmits();
+    ASSERT_EQ(submits.size(), 2u);
+    EXPECT_EQ(submits[0].waitSemaphores, threeSemaphores);
+    EXPECT_EQ(submits[0].waitDstStageMasks,
+              std::vector<VkPipelineStageFlags>(3, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT));
+    ASSERT_EQ(submits[0].signalSemaphores.size(), 1u);
+
+    EXPECT_EQ(submits[1].waitSemaphores, tenSemaphores);
+    EXPECT_EQ(submits[1].waitDstStageMasks,
+              std::vector<VkPipelineStageFlags>(10, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT));
+    ASSERT_EQ(submits[1].signalSemaphores.size(), 1u);
+
+    const auto presents = harness.driver().recordedPresents();
+    ASSERT_EQ(presents.size(), 2u);
+    EXPECT_EQ(presents[0].waitedSemaphores,
+              std::vector<VkSemaphore>{submits[0].signalSemaphores[0]});
+    EXPECT_EQ(presents[1].waitedSemaphores,
+              std::vector<VkSemaphore>{submits[1].signalSemaphores[0]});
+}
+
+TEST_F(SwappyVkHostTest, MultipleWaitSemaphoresPopulateAllWaitDstStageMasksInFallbackBackend) {
+    SimulatedSwappyVkHarness harness(/*advertiseGoogleDisplayTiming=*/false);
+
+    const std::vector<VkSemaphore> threeSemaphores = {
+            makeVkHandle<VkSemaphore>(70),
+            makeVkHandle<VkSemaphore>(71),
+            makeVkHandle<VkSemaphore>(72),
+    };
+    std::vector<VkSemaphore> tenSemaphores;
+    for (uintptr_t i = 0; i < 10; ++i) {
+        tenSemaphores.push_back(makeVkHandle<VkSemaphore>(80 + i));
+    }
+
+    ASSERT_EQ(harness.presentFrameWithSemaphores(0, threeSemaphores, 3ms, 3ms), VK_SUCCESS);
+    ASSERT_EQ(harness.presentFrameWithSemaphores(1, tenSemaphores, 3ms, 3ms), VK_SUCCESS);
+
+    const auto submits = harness.driver().recordedSubmits();
+    ASSERT_EQ(submits.size(), 2u);
+    EXPECT_EQ(submits[0].waitSemaphores, threeSemaphores);
+    EXPECT_EQ(submits[0].waitDstStageMasks,
+              std::vector<VkPipelineStageFlags>(3, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT));
+    EXPECT_EQ(submits[1].waitSemaphores, tenSemaphores);
+    EXPECT_EQ(submits[1].waitDstStageMasks,
+              std::vector<VkPipelineStageFlags>(10, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT));
+
+    const auto presents = harness.driver().recordedPresents();
+    ASSERT_EQ(presents.size(), 2u);
+    EXPECT_FALSE(presents[0].hasDisplayTiming);
+    EXPECT_FALSE(presents[1].hasDisplayTiming);
+    EXPECT_EQ(presents[0].waitedSemaphores,
+              std::vector<VkSemaphore>{submits[0].signalSemaphores[0]});
+    EXPECT_EQ(presents[1].waitedSemaphores,
+              std::vector<VkSemaphore>{submits[1].signalSemaphores[0]});
+}
+
+TEST_F(SwappyVkHostTest, PendingImageFenceForwardsAllMultipleAppWaitSemaphoresUnpaced) {
+    SimulatedSwappyVkHarness harness(/*advertiseGoogleDisplayTiming=*/true);
+    SwappyVk_setFenceTimeoutNS(500'000'000);
+    SwappyVk_setMaxAutoSwapIntervalNS(0);
+
+    const std::vector<VkSemaphore> firstSemaphores = {
+            makeVkHandle<VkSemaphore>(90),
+            makeVkHandle<VkSemaphore>(91),
+            makeVkHandle<VkSemaphore>(92),
+    };
+    const std::vector<VkSemaphore> unpacedSemaphores = {
+            makeVkHandle<VkSemaphore>(93),
+            makeVkHandle<VkSemaphore>(94),
+            makeVkHandle<VkSemaphore>(95),
+    };
+
+    ASSERT_EQ(harness.presentFrameWithSemaphores(0, firstSemaphores, 2ms, 120ms), VK_SUCCESS);
+    ASSERT_EQ(harness.presentFrameWithSemaphores(0, unpacedSemaphores, 2ms, 2ms), VK_SUCCESS);
+
+    const auto submits = harness.driver().recordedSubmits();
+    ASSERT_EQ(submits.size(), 1u);
+    EXPECT_EQ(submits[0].waitSemaphores, firstSemaphores);
+    EXPECT_EQ(submits[0].waitDstStageMasks,
+              std::vector<VkPipelineStageFlags>(3, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT));
+
+    const auto presents = harness.driver().recordedPresents();
+    ASSERT_EQ(presents.size(), 2u);
+    EXPECT_EQ(presents[0].waitedSemaphores,
+              std::vector<VkSemaphore>{submits[0].signalSemaphores[0]});
+    EXPECT_EQ(presents[1].waitedSemaphores, unpacedSemaphores);
+}
+
+TEST_F(SwappyVkHostTest, ZeroWaitSemaphoresSubmitsNullWaitPointersAndSignalsSwappySemaphore) {
+    SimulatedSwappyVkHarness harness(/*advertiseGoogleDisplayTiming=*/true);
+
+    const VkSemaphore unusedSemaphore = makeVkHandle<VkSemaphore>(99);
+    ASSERT_EQ(harness.presentFrameWithRawSemaphores(0, 0, nullptr, 3ms, 3ms), VK_SUCCESS);
+    ASSERT_EQ(harness.presentFrameWithRawSemaphores(1, 0, &unusedSemaphore, 3ms, 3ms), VK_SUCCESS);
+
+    const auto submits = harness.driver().recordedSubmits();
+    ASSERT_EQ(submits.size(), 2u);
+    for (const auto& submit : submits) {
+        EXPECT_TRUE(submit.waitSemaphores.empty());
+        EXPECT_TRUE(submit.waitDstStageMasks.empty());
+        EXPECT_TRUE(submit.hadNullWaitSemaphores);
+        EXPECT_TRUE(submit.hadNullWaitDstStageMask);
+        ASSERT_EQ(submit.signalSemaphores.size(), 1u);
+    }
+
+    const auto presents = harness.driver().recordedPresents();
+    ASSERT_EQ(presents.size(), 2u);
+    EXPECT_EQ(presents[0].waitedSemaphores,
+              std::vector<VkSemaphore>{submits[0].signalSemaphores[0]});
+    EXPECT_EQ(presents[1].waitedSemaphores,
+              std::vector<VkSemaphore>{submits[1].signalSemaphores[0]});
 }
 
 TEST_F(SwappyVkHostTest, SwapchainAcquireBackpressureInflatesMeasuredCpuTime) {
