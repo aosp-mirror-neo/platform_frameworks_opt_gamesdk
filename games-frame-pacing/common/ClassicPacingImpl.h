@@ -70,13 +70,12 @@ public:
     PacingResult onFramePacingReset(
             FrameDurations& durations, std::chrono::nanoseconds refreshPeriod,
             std::chrono::nanoseconds minSwapDuration,
-            std::chrono::nanoseconds fallbackRefreshPeriod,
             const VotableRefreshPeriods& votableRefreshPeriods = {}) override {
         using namespace std::chrono_literals;
         durations.clear();
         std::chrono::nanoseconds resetTarget = minSwapDuration;
         if (resetTarget <= 0ns) {
-            resetTarget = std::min(fallbackRefreshPeriod, refreshPeriod);
+            resetTarget = refreshPeriod;
             if (votableRefreshPeriods.periods != nullptr) {
                 const auto fastestIt = votableRefreshPeriods.periods->upper_bound(0ns);
                 if (fastestIt != votableRefreshPeriods.periods->end()) {

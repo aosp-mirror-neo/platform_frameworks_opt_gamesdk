@@ -75,13 +75,12 @@ public:
 
     // Resets pacing state and evaluates the reset refresh-rate vote. Votes
     // minSwapDuration when positive, or the fastest period in
-    // votableRefreshPeriods (falling back to the faster of refreshPeriod and
-    // fallbackRefreshPeriod). votableRefreshPeriods.periods must stay valid for
-    // the duration of the call.
+    // votableRefreshPeriods (falling back to refreshPeriod).
+    // votableRefreshPeriods.periods must stay valid for the duration of the
+    // call.
     virtual PacingResult onFramePacingReset(
             FrameDurations& durations, std::chrono::nanoseconds refreshPeriod,
             std::chrono::nanoseconds minSwapDuration,
-            std::chrono::nanoseconds fallbackRefreshPeriod,
             const VotableRefreshPeriods& votableRefreshPeriods = {}) = 0;
 
     // Sets configChanged when an auto-swap threshold change re-clamps the swap

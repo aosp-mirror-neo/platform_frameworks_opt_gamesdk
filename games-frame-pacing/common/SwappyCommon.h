@@ -274,8 +274,6 @@ private:
 
     bool mFramePacingResetRequested GUARDED_BY(mMutex) = false;
 
-    std::chrono::nanoseconds mInitialRefreshPeriod;
-
     bool mFramePacingToggleRequested GUARDED_BY(mMutex) = false;
     bool mFramePacingEnabled GUARDED_BY(mMutex) = true;
     bool mBlockingWaitEnabled GUARDED_BY(mMutex) = true;
